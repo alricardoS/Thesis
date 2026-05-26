@@ -1,0 +1,61 @@
+ # Build directories
+build/
+cmake-cache/
+cmake-build-*/
+CMakeFiles/
+src/
+
+# ns-3 generated files
+*.o
+*.obj
+*.so
+*.a
+*.out
+*.exe
+*.dll
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+
+# Coverage / testing
+coverage/
+*.gcda
+*.gcno
+*.gcov
+
+# Documentation builds
+doc/html/
+doc/latex/
+
+# Bake
+bake/
+
+#My Outputs
+OLD/
+results/
+results_multi_sta_mlo_priority_suite/
+results_multi_sta_mlo_priority_with_scheduler_suite/
+results_multi_sta_priority_suite/
+results_multi_sta_priority_suite_base/
+results_multi_sta_scaling/
+results_single_link_scaling/

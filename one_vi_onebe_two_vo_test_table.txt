@@ -1,0 +1,54 @@
+========================================================================================================================
+MLO Link Traffic Distribution - results_multi_sta_priority_suite/one_vi_onebe_two_vo/plots_30Mbps_4stas_test
+========================================================================================================================
+
+Scenario: results_multi_sta_priority_suite/one_vi_onebe_two_vo/plots_30Mbps_4stas_test
+Role filtered: AP only
+
+Traffic Distribution by Priority Class and Link (per experiment):
+------------------------------------------------------------------------------------------------------------------------
+Experience: 2+5|UDP
+------------------------------------------------------------------------------------------------------------------------
+ STA AC   Link  Packets Pct_Packets    Bytes Pct_Bytes Avg_Bytes_Per_Pkt
+   2 BE 2.4GHz      240        0.4%   362834      0.4%              1512
+   3 BK 2.4GHz        0        0.0%        0      0.0%                 0
+   1 VI 2.4GHz       51        0.1%    77032      0.1%              1510
+   0 VO 2.4GHz    57252       99.5% 86222902     99.5%              1506
+   2 BE   5GHz      253        0.4%   381195      0.4%              1507
+   3 BK   5GHz        0        0.0%        0      0.0%                 0
+   1 VI   5GHz       53        0.1%    80930      0.1%              1527
+   0 VO   5GHz    60150       99.5% 90586115     99.5%              1506
+
+Experience: 2+6|UDP
+------------------------------------------------------------------------------------------------------------------------
+ STA AC   Link  Packets Pct_Packets    Bytes Pct_Bytes Avg_Bytes_Per_Pkt
+   2 BE 2.4GHz      181        0.3%   273266      0.3%              1510
+   3 BK 2.4GHz        0        0.0%        0      0.0%                 0
+   1 VI 2.4GHz       82        0.1%   124212      0.1%              1515
+   0 VO 2.4GHz    60667       99.6% 91364606     99.6%              1506
+   2 BE   6GHz      169        0.3%   255542      0.3%              1512
+   3 BK   6GHz        0        0.0%        0      0.0%                 0
+   1 VI   6GHz       77        0.1%   116155      0.1%              1509
+   0 VO   6GHz    56732       99.6% 85438675     99.6%              1506
+
+Experience: 5+6|UDP
+------------------------------------------------------------------------------------------------------------------------
+ STA AC Link  Packets Pct_Packets     Bytes Pct_Bytes Avg_Bytes_Per_Pkt
+   2 BE 5GHz    67466       62.8% 101333968     62.7%              1502
+   3 BK 5GHz        0        0.0%         0      0.0%                 0
+   1 VI 5GHz     9598        8.9%  14388245      8.9%              1499
+   0 VO 5GHz    30442       28.3%  45846128     28.4%              1506
+   2 BE 6GHz    71537       62.8% 107447486     62.7%              1502
+   3 BK 6GHz        0        0.0%         0      0.0%                 0
+   1 VI 6GHz    10178        8.9%  15256293      8.9%              1499
+   0 VO 6GHz    32278       28.3%  48612043     28.4%              1506
+
+Legend:
+- STA: Source station index inferred from the traffic type mapping
+- AC: Access Category (VO=Voice, VI=Video, BE=Best Effort, BK=Background)
+- Link: Frequency band
+- Packets: Estimated number of packets transmitted on this link for this AC
+- Pct_Packets: Percentage of total packets for this AC
+- Bytes: Total bytes transmitted
+- Pct_Bytes: Percentage of total bytes for this AC
+- Avg_Bytes_Per_Pkt: Average packet size for this AC on this link

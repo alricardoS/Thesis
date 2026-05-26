@@ -1,0 +1,40 @@
+[0/2] Re-checking globbed directories...
+[1/2] Building CXX object scratch/CMakeFiles/scratch_wifi7-mlo-multi-sta-priority.dir/wifi7-mlo-multi-sta-priority.cc.o
+[2/2] Linking CXX executable /home/ricardosantos/ns-3.47/build/scratch/ns3.47-wifi7-mlo-multi-sta-priority-default
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+wifi7-mlo-multi-sta: freq1=5 freq2=6 proto=UDP rate=30Mbps numSTAs=2 distance=5m staticSetup=yes staTrafficTypesCsv=voice,besteffort
+STA_PRIORITY_CLASS: Sta=0 Class=3 AC=VO TOS=192
+STA_PRIORITY_CLASS: Sta=1 Class=1 AC=BE TOS=0
+Granular packet loss tracing enabled for MLO (PHY/MAC/Queue drops on both links)
+Using WifiStaticSetupHelper for static ML association...
+Static ML association and Block ACK configured for 2 STAs on both links
+===== MLO CUSTOM SCHEDULER ENABLED =====
+Policy: VO/VI traffic prefers fastest link, BE/BK uses all links
+Link speed ranking: 6GHz(320MHz) > 5GHz(160MHz) > 2.4GHz(20MHz)
+MLO Scheduler: STA 00:00:00:00:00:04 link speeds initialized: Link0[5GHz rank=1] Link1[6GHz rank=2]
+MLO Scheduler: STA 00:00:00:00:00:04 AC=VO blocked link 0 (prefer link 1)
+MLO Scheduler: STA 00:00:00:00:00:04 AC=VI blocked link 0 (prefer link 1)
+MLO Scheduler: STA 00:00:00:00:00:04 AC=BE,BK not blocked (can use all links)
+MLO Scheduler: STA 00:00:00:00:00:07 link speeds initialized: Link0[5GHz rank=1] Link1[6GHz rank=2]
+MLO Scheduler: STA 00:00:00:00:00:07 AC=VO blocked link 0 (prefer link 1)
+MLO Scheduler: STA 00:00:00:00:00:07 AC=VI blocked link 0 (prefer link 1)
+MLO Scheduler: STA 00:00:00:00:00:07 AC=BE,BK not blocked (can use all links)
+MLO scheduler initialization complete
+AP position: (0, 0, 0) - MLO with links at 5GHz + 6GHz
+STAs positioned in circle at distance 5m from AP:
+  STA0: (5, 0, 0)
+  STA1: (-5, 6.12323e-16, 0)
+Traffic Control layer drop tracing enabled for MLO
+Static ARP cache populated
+App configured: AP -> STA0 (port 5001) AC=VO TOS=192
+App configured: AP -> STA1 (port 5002) AC=BE TOS=0
+TIME_STATS: Time=2s TotalThroughput=14Mbps AvgDelay=0.0725694ms AvgJitter=0.00316316ms ActiveSTAs=1
+FLOW_SUMMARY_STA1: pair=5+6 proto=UDP Throughput_Mbps=30.5896 Delay_ms=0.0726045 Jitter_ms=0.00301361 LostPackets=0 LossRate_pct=0 TX_Packets=3880 RX_Packets=3880
+FLOW_SUMMARY_TOTAL: pair=5+6 proto=UDP numSTAs=2 Throughput_Mbps=30.5896 AvgThroughputPerSTA_Mbps=30.5896 AvgDelay_ms=0.0726045 AvgJitter_ms=0.00301361 TotalLostPackets=0 LossRate_pct=0 TX_Packets=3880 RX_Packets=3880
+PACKET_LOSS_BREAKDOWN: pair=5+6 proto=UDP PhyTxDrop=0 PhyRxDrop=0 MacTxDrop=0 MacRxDrop=0 WifiQueueDrop=0 TcDropBeforeEnqueue=0 TcDropAfterDequeue=0 TcDrop=0 TotalGranularDrops=0 E2E_LostPackets=0
+MLO_LINK_ACTIVITY: pair=5+6 proto=UDP Link=0 TxTime_s=0.161183 Duty_pct=5.37277 OverlapTime_s=0.00218442 Overlap_pct=0.0728139 MuTxCount=0 SuTxCount=2612
+MLO_LINK_ACTIVITY: pair=5+6 proto=UDP Link=1 TxTime_s=0.166115 Duty_pct=5.53717 OverlapTime_s=0.00218442 Overlap_pct=0.0728139 MuTxCount=0 SuTxCount=2629
+CONTROL_LINK_SUMMARY: pair=5+6 proto=UDP ResponseType=ACK Matched=3879 SameLink=3879 CrossLink=0 Unmatched=0 SameLink_pct=100
+CONTROL_LINK_SUMMARY_TOTAL: pair=5+6 proto=UDP Matched=3879 SameLink=3879 CrossLink=0 Unmatched=0 SameLink_pct=100
+CONTROL_LINK_DEBUG: pair=5+6 proto=UDP TxRequestsRegistered=3880 RxControlSeen=3879 PendingRequests=3880

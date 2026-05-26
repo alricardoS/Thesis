@@ -1,0 +1,33 @@
+[0/2] Re-checking globbed directories...
+[1/2] Building CXX object scratch/CMakeFiles/scratch_wifi7-mlo-multi-sta-priority.dir/wifi7-mlo-multi-sta-priority.cc.o
+/home/ricardosantos/ns-3.47/scratch/wifi7-mlo-multi-sta-priority.cc: In function ‘void ApplyMloSchedulerLogicForSta(ns3::Ptr<ns3::WifiMac>, ns3::Mac48Address, int, int)’:
+/home/ricardosantos/ns-3.47/scratch/wifi7-mlo-multi-sta-priority.cc:1112:17: warning: unused variable ‘links’ [-Wunused-variable]
+ 1112 |     const auto& links = it->second;
+      |                 ^~~~~
+[2/2] Linking CXX executable /home/ricardosantos/ns-3.47/build/scratch/ns3.47-wifi7-mlo-multi-sta-priority-default
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+wifi7-mlo-multi-sta: freq1=5 freq2=6 proto=UDP rate=30Mbps numSTAs=2 distance=5m staticSetup=yes staTrafficTypesCsv=voice,besteffort
+STA_PRIORITY_CLASS: Sta=0 Class=3 AC=VO TOS=192
+STA_PRIORITY_CLASS: Sta=1 Class=1 AC=BE TOS=0
+Granular packet loss tracing enabled for MLO (PHY/MAC/Queue drops on both links)
+Using WifiStaticSetupHelper for static ML association...
+Static ML association and Block ACK configured for 2 STAs on both links
+===== MLO CUSTOM SCHEDULER ENABLED =====
+Policy: VO/VI traffic prefers fastest link, BE/BK uses all links
+Link speed ranking: 6GHz(320MHz) > 5GHz(160MHz) > 2.4GHz(20MHz)
+MLO Scheduler: STA 00:00:00:00:00:04 link speeds initialized: Link0[5GHz rank=1] Link1[6GHz rank=2]
+NS_ASSERT failed, cond="rxAddr.IsGroup() || GetMac()->GetMldAddress(rxAddr) == rxAddr", msg="Address 1 (00:00:00:00:00:04) is not an MLD address", +0.000000000s -1 file=/home/ricardosantos/ns-3.47/src/wifi/model/wifi-mac-queue-scheduler-impl.h, line=386
+NS_FATAL, terminating
+   0# ns3::WifiMacQueueSchedulerImpl<ns3::FcfsPrio, std::less<ns3::FcfsPrio> >::InitQueueInfo(ns3::AcIndex, ns3::Ptr<ns3::WifiMpdu const>) at /home/ricardosantos/ns-3.47/src/wifi/model/wifi-mac-queue-scheduler-impl.h:386
+   1# ns3::WifiMacQueueSchedulerImpl<ns3::FcfsPrio, std::less<ns3::FcfsPrio> >::DoBlockQueues(bool, ns3::WifiQueueBlockedReason, ns3::AcIndex, std::__cxx11::list<ns3::WifiContainerQueueType, std::allocator<ns3::WifiContainerQueueType> > const&, ns3::Mac48Address const&, ns3::Mac48Address const&, std::set<unsigned char, std::less<unsigned char>, std::allocator<unsigned char> > const&, std::set<unsigned char, std::less<unsigned char>, std::allocator<unsigned char> > const&) at /home/ricardosantos/ns-3.47/src/wifi/model/wifi-mac-queue-scheduler-impl.h:571
+   2# ns3::WifiMacQueueSchedulerImpl<ns3::FcfsPrio, std::less<ns3::FcfsPrio> >::BlockQueues(ns3::WifiQueueBlockedReason, ns3::AcIndex, std::__cxx11::list<ns3::WifiContainerQueueType, std::allocator<ns3::WifiContainerQueueType> > const&, ns3::Mac48Address const&, ns3::Mac48Address const&, std::set<unsigned char, std::less<unsigned char>, std::allocator<unsigned char> > const&, std::set<unsigned char, std::less<unsigned char>, std::allocator<unsigned char> > const&) at /home/ricardosantos/ns-3.47/src/wifi/model/wifi-mac-queue-scheduler-impl.h:593
+   3# ApplyMloSchedulerLogicForSta(ns3::Ptr<ns3::WifiMac>, ns3::Mac48Address, int, int) at /home/ricardosantos/ns-3.47/scratch/wifi7-mlo-multi-sta-priority.cc:1156
+   4# main at /home/ricardosantos/ns-3.47/scratch/wifi7-mlo-multi-sta-priority.cc:1542
+   5# __libc_start_call_main at ../sysdeps/nptl/libc_start_call_main.h:58
+   6# __libc_start_main_impl at ../csu/libc-start.c:360
+   7# _start at :0
+   8# 
+
+terminate called without an active exception
+Command 'build/scratch/ns3.47-wifi7-mlo-multi-sta-priority-default --freq1=5 --freq2=6 --protocol=UDP --dataRate=30Mbps --simTime=2 --staticSetup=true --enablePcaps=false --numStas=2 --staTrafficTypes=voice,besteffort --useCustomMloScheduler=true' died with <Signals.SIGABRT: 6>.

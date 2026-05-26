@@ -1,0 +1,42 @@
+Plano de scheduler
+
+Manter regras duras por AC.
+VO e VI nunca podem ficar atrás de BE em qualidade efetiva. Isso significa que o scheduler não deve escolher o link “mais favorável” para BE se esse mesmo link ainda for necessário para cumprir VI. O BE só pode usar o excedente.
+
+Trocar a regra fixa por um score por link e por AC.
+Em vez de VO/VI -> fast e BE/BK -> slow, calcula um score dinâmico por link usando métricas do momento, por exemplo:
+
+ocupação da fila
+taxa de retry / drops
+throughput recente
+delay recente
+jitter recente
+taxa de ocupação do link
+condições PHY, se adicionares SNR/RSSI/MCS
+Introduzir prioridades com estrangulamento.
+O scheduler deve funcionar assim:
+
+VO tem prioridade absoluta
+VI tem prioridade forte e pode “roubar” qualidade ao BE
+BE só usa links com folga
+BK só usa o que sobrar
+Usar thresholds e hysteresis.
+Não mudes de link a cada amostra. Define:
+
+limiares para mudar de link
+janela móvel para métricas
+tempo mínimo antes de voltar a trocar
+Isto evita flapping e torna o comportamento mais realista.
+Separar “seleção” de “bloqueio”.
+Em vez de forçar sempre um único link, o scheduler pode:
+
+manter vários links elegíveis para VI/VO
+bloquear links degradados apenas para BE/BK
+desbloquear quando a qualidade volta ao normal
+Validar com objetivo explícito.
+O critério não pode ser só throughput total. Tens de verificar:
+
+VI não piora em delay/jitter face ao BE
+VO mantém-se acima de VI
+BE melhora sem ultrapassar VI em qualidade
+o ganho global não destrói a hierarquia dos ACs

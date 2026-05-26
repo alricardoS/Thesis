@@ -1,0 +1,1572 @@
+/*
+ * wifi7-single-link-multi-sta.cc
+ * 802.11be Single Link Test with Multiple STAs (2 STAs)
+ * 
+ * Layout (AP no centro, STAs nos lados):
+ *    STA0 (esq) --AP-- STA1 (dir)
+ * 
+ * Usa WifiStaticSetupHelper para evitar colisões durante associação
+ */
+#include "ns3/core-module.h"
+#include "ns3/mobility-helper.h"
+#include "ns3/ssid.h"
+#include "ns3/spectrum-wifi-helper.h"
+#include "ns3/multi-model-spectrum-channel.h"
+#include "ns3/propagation-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/flow-monitor-module.h"
+#include "ns3/wifi-mac.h"
+#include "ns3/wifi-static-setup-helper.h"
+#include "ns3/neighbor-cache-helper.h"
+#include "ns3/frame-exchange-manager.h"
+#include "ns3/wifi-ru.h"
+#include "ns3/wifi-mac-queue.h"
+#include "ns3/wifi-phy.h"
+#include "ns3/wifi-mac-header.h"
+#include "ns3/qos-txop.h"
+#include "ns3/traffic-control-module.h"
+
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <vector>
+#include <set>
+#include <tuple>
+#include <cmath>
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("wifi7-single-link-multi-sta");
+
+// ========== GRANULAR PACKET LOSS COUNTERS ==========
+// PHY Layer Drops
+uint64_t g_phyTxDrop = 0;   // Packets dropped during TX at PHY (e.g., interference during TX)
+uint64_t g_phyRxDrop = 0;   // Packets dropped during RX at PHY (e.g., low SNR, collision)
+std::map<std::string, uint64_t> g_phyRxDropReasons; // PHY RX drops by reason
+std::map<std::string, uint64_t> g_phyRxDropMacTypeByReason; // PHY RX drops by (reason, MAC frame type)
+std::map<uint32_t, uint64_t> g_phyRxDropPacketSizes; // PHY RX drops by packet size
+std::map<uint32_t, uint64_t> g_phyRxDropBySecond; // PHY RX drops timeline (second -> count)
+uint32_t g_phyRxDropSamplesPrinted = 0;
+const uint32_t g_phyRxDropSampleLimit = 30;
+
+// MAC Layer Drops  
+uint64_t g_macTxDrop = 0;   // Packets dropped at MAC TX (e.g., exceeded retry limit)
+uint64_t g_macRxDrop = 0;   // Packets dropped at MAC RX (e.g., CRC error after PHY decode)
+
+// WiFi Queue Drops
+uint64_t g_wifiQueueDrop = 0;   // Packets dropped due to full WiFi MAC queue
+
+// IP/Traffic Control Layer Drops
+uint64_t g_tcDropBeforeEnqueue = 0;  // Packets dropped before entering TC queue (queue full)
+uint64_t g_tcDropAfterDequeue = 0;   // Packets dropped after dequeue (policy decision)
+uint64_t g_tcDrop = 0;               // TC layer drops (no queue disc installed)
+std::map<std::string, uint64_t> g_tcDropBeforeReasons; // TC drops by reason (before enqueue)
+std::map<std::string, uint64_t> g_tcDropAfterReasons;  // TC drops by reason (after dequeue)
+
+// ========== LINK / RU USAGE & FRAME DISTRIBUTION (single-link adaptation) ==========
+std::map<uint8_t, uint32_t> g_linkTxDepth;
+std::map<uint8_t, double> g_linkTxTimeSec;
+std::map<uint8_t, uint64_t> g_linkMuTxCount;
+std::map<uint8_t, uint64_t> g_linkSuTxCount;
+std::map<uint8_t, std::map<std::string, uint64_t>> g_linkRuTypeCount;
+
+double g_overlapBothLinksSec = 0.0;
+double g_anyTxSec = 0.0;
+double g_lastTxStateUpdateSec = 0.0;
+bool g_txStateInitialized = false;
+
+// CONTROL RETURN-LINK TRACKING (AP side)
+struct PendingCtrlRequest
+{
+    Mac48Address peer;
+    uint8_t txLink;
+    double timeSec;
+    std::string expectedResponse; // CTS | BLOCKACK | ACK_OR_BLOCKACK
+};
+
+struct ControlResponseStats
+{
+    uint64_t matched{0};
+    uint64_t sameLink{0};
+    uint64_t crossLink{0};
+    uint64_t unmatched{0};
+};
+
+std::vector<PendingCtrlRequest> g_pendingCtrlRequests;
+std::map<std::string, ControlResponseStats> g_ctrlResponseStats;
+Mac48Address g_apAddress;
+std::set<Mac48Address> g_apRxAddresses;
+uint64_t g_ctrlTxRequestsRegistered = 0;
+uint64_t g_ctrlRxControlSeen = 0;
+
+// FRAME DISTRIBUTION TRACKING
+struct FrameDistributionBucket
+{
+    uint64_t frame_count = 0;
+    uint64_t bytes = 0;
+};
+
+// Map: (time_bucket, link_id, link_name, ac, frame_type) -> FrameDistributionBucket
+std::map<std::tuple<double, uint8_t, std::string, std::string, std::string>, FrameDistributionBucket>
+    g_frameDistributionData;
+std::ofstream g_frameDistributionStream;
+std::string g_frameDistributionCsvPath;
+std::string g_frameDistributionRunLabel;
+std::string g_linkFrequencyPair; // e.g., "2.4" - set by main()
+double g_frameDistributionSampleInterval = 1.0; // Aggregate every 1 second
+Time g_frameDistributionEndTime;
+
+std::string
+GetLinkName(uint8_t linkId, const std::string& freqPair)
+{
+    // For single-link, just return the freqPair (e.g., "2.4" or "5")
+    return freqPair;
+}
+
+std::string
+GetFrameType(const WifiMacHeader& hdr)
+{
+    if (hdr.IsData())
+        return std::string("Data");
+    if (hdr.IsCts() || hdr.IsAck() || hdr.IsRts() || hdr.IsBlockAck() || hdr.IsBlockAckReq())
+        return std::string("Control");
+    if (hdr.IsBeacon() || hdr.IsAssocReq() || hdr.IsAssocResp() || hdr.IsProbeReq() || hdr.IsProbeResp())
+        return std::string("Management");
+    return std::string("Other");
+}
+
+AcIndex
+GetAcFromPsdu(Ptr<const WifiPsdu> psdu)
+{
+    // Best-effort fallback when PSDA metadata not available
+    if (!psdu || psdu->GetNMpdus() == 0)
+        return AC_BE;
+    const WifiMacHeader& hdr = psdu->GetHeader(0);
+    if (hdr.IsData())
+    {
+        if (hdr.IsQosData())
+        {
+            return static_cast<AcIndex>(hdr.GetQosTid() % 4);
+        }
+    }
+    return AC_BE;
+}
+
+// forward declaration (defined later)
+std::string AcIndexToShortName(AcIndex ac);
+
+void
+RecordFrameDistribution(uint8_t linkId, Ptr<const WifiPsdu> psdu)
+{
+    if (!psdu)
+        return;
+
+    const double now = Simulator::Now().GetSeconds();
+    const double timeBucket = std::floor(now / g_frameDistributionSampleInterval) *
+                              g_frameDistributionSampleInterval;
+
+    const WifiMacHeader& hdr = psdu->GetHeader(0);
+    std::string frameType = GetFrameType(hdr);
+    AcIndex ac = GetAcFromPsdu(psdu);
+    std::ostringstream ac_name;
+    ac_name << AcIndexToShortName(ac);
+    std::string ac_str = ac_name.str();
+    std::string linkName = GetLinkName(linkId, g_linkFrequencyPair);
+
+    uint32_t bytes = psdu->GetSize();
+    uint32_t frameCount = psdu->GetNMpdus();
+
+    auto key = std::make_tuple(timeBucket, linkId, linkName, ac_str, frameType);
+    g_frameDistributionData[key].frame_count += frameCount;
+    g_frameDistributionData[key].bytes += bytes;
+}
+
+void
+FlushFrameDistributionData()
+{
+    if (!g_frameDistributionStream.is_open())
+        return;
+
+    for (const auto& kv : g_frameDistributionData)
+    {
+        const auto& key = kv.first;
+        const auto& bucket = kv.second;
+
+        double timeBucket = std::get<0>(key);
+        uint8_t linkId = std::get<1>(key);
+        const std::string& linkName = std::get<2>(key);
+        const std::string& ac_str = std::get<3>(key);
+        const std::string& frameType = std::get<4>(key);
+
+        g_frameDistributionStream << g_frameDistributionRunLabel << ',' << timeBucket << ','
+                                  << static_cast<int>(linkId) << ',' << linkName << ','
+                                  << ac_str << ',' << frameType << ','
+                                  << bucket.frame_count << ',' << bucket.bytes << '\n';
+    }
+
+    g_frameDistributionStream.flush();
+    g_frameDistributionData.clear(); // Clear buffer after flushing
+}
+
+void
+ScheduleFrameDistributionFlush()
+{
+    FlushFrameDistributionData();
+    if (Simulator::Now() + Seconds(g_frameDistributionSampleInterval) <= g_frameDistributionEndTime)
+    {
+        Simulator::Schedule(Seconds(g_frameDistributionSampleInterval), &ScheduleFrameDistributionFlush);
+    }
+}
+
+void
+RegisterPendingCtrlRequest(uint8_t linkId,
+                           Mac48Address peer,
+                           const std::string& expectedResponse)
+{
+    g_pendingCtrlRequests.push_back(
+        PendingCtrlRequest{peer, linkId, Simulator::Now().GetSeconds(), expectedResponse});
+}
+
+bool
+ResponseMatchesExpectation(const std::string& expectedResponse, const std::string& responseType)
+{
+    if (expectedResponse == responseType)
+    {
+        return true;
+    }
+    if (expectedResponse == "ACK_OR_BLOCKACK" &&
+        (responseType == "ACK" || responseType == "BLOCKACK"))
+    {
+        return true;
+    }
+    return false;
+}
+
+bool
+IsAddressedToAp(const Mac48Address& ra)
+{
+    return g_apRxAddresses.find(ra) != g_apRxAddresses.end();
+}
+
+void
+UpdateLinkActivityAccounting()
+{
+    const double now = Simulator::Now().GetSeconds();
+    if (!g_txStateInitialized)
+    {
+        g_lastTxStateUpdateSec = now;
+        g_txStateInitialized = true;
+        return;
+    }
+
+    const double dt = std::max(0.0, now - g_lastTxStateUpdateSec);
+    uint32_t activeLinks = 0;
+    for (const auto& kv : g_linkTxDepth)
+    {
+        if (kv.second > 0)
+        {
+            activeLinks++;
+            g_linkTxTimeSec[kv.first] += dt;
+        }
+    }
+
+    if (activeLinks > 0)
+    {
+        g_anyTxSec += dt;
+    }
+    if (activeLinks > 1)
+    {
+        g_overlapBothLinksSec += dt;
+    }
+
+    g_lastTxStateUpdateSec = now;
+}
+
+void
+LinkPhyTxBeginCallback(uint8_t linkId, Ptr<const Packet> packet, double txPowerW)
+{
+    UpdateLinkActivityAccounting();
+    g_linkTxDepth[linkId]++;
+}
+
+void
+LinkPhyTxEndCallback(uint8_t linkId, Ptr<const Packet> packet)
+{
+    UpdateLinkActivityAccounting();
+    if (g_linkTxDepth[linkId] > 0)
+    {
+        g_linkTxDepth[linkId]--;
+    }
+}
+
+void
+LinkPhyTxPsduBeginCallback(uint8_t linkId,
+                           WifiConstPsduMap psduMap,
+                           WifiTxVector txVector,
+                           double txPowerW)
+{
+    for (const auto& kv : psduMap)
+    {
+        RecordFrameDistribution(linkId, kv.second);
+    }
+
+    if (txVector.IsDlMu() || txVector.IsUlMu())
+    {
+        g_linkMuTxCount[linkId]++;
+
+        const auto& userMap = txVector.GetHeMuUserInfoMap();
+        for (const auto& kv : userMap)
+        {
+            std::ostringstream ruName;
+            ruName << WifiRu::GetRuType(txVector.GetRu(kv.first));
+            g_linkRuTypeCount[linkId][ruName.str()]++;
+        }
+    }
+    else
+    {
+        g_linkSuTxCount[linkId]++;
+    }
+}
+
+void
+ApControlTxPsduBeginCallback(uint8_t linkId,
+                             WifiConstPsduMap psduMap,
+                             WifiTxVector txVector,
+                             double txPowerW)
+{
+    for (const auto& kv : psduMap)
+    {
+        Ptr<const WifiPsdu> psdu = kv.second;
+        if (!psdu || psdu->GetNMpdus() == 0)
+        {
+            continue;
+        }
+
+        const WifiMacHeader& hdr = psdu->GetHeader(0);
+        const Mac48Address peer = hdr.GetAddr1();
+
+        if (peer.IsGroup())
+        {
+            continue;
+        }
+
+        if (hdr.IsRts())
+        {
+            RegisterPendingCtrlRequest(linkId, peer, "CTS");
+            g_ctrlTxRequestsRegistered++;
+        }
+        else if (hdr.IsBlockAckReq())
+        {
+            RegisterPendingCtrlRequest(linkId, peer, "BLOCKACK");
+            g_ctrlTxRequestsRegistered++;
+        }
+        else if (hdr.IsData())
+        {
+            RegisterPendingCtrlRequest(linkId, peer, "ACK_OR_BLOCKACK");
+            g_ctrlTxRequestsRegistered++;
+        }
+    }
+}
+
+void
+ApControlRxMacHeaderEndCallback(uint8_t linkId,
+                                const WifiMacHeader& hdr,
+                                const WifiTxVector& txVector,
+                                Time psduDuration)
+{
+    std::string responseType;
+    if (hdr.IsCts())
+    {
+        responseType = "CTS";
+    }
+    else if (hdr.IsAck())
+    {
+        responseType = "ACK";
+    }
+    else if (hdr.IsBlockAck())
+    {
+        responseType = "BLOCKACK";
+    }
+    else
+    {
+        return;
+    }
+    g_ctrlRxControlSeen++;
+
+    // response must be addressed to AP
+    if (!IsAddressedToAp(hdr.GetAddr1()))
+    {
+        return;
+    }
+
+    auto& stats = g_ctrlResponseStats[responseType];
+    const bool requiresPeerMatch = (responseType == "BLOCKACK");
+    const Mac48Address peer = hdr.GetAddr2();
+
+    // Find latest unmatched pending request from the same peer
+    // and compatible expected response, within a short time window.
+    const double nowSec = Simulator::Now().GetSeconds();
+    const double maxDeltaSec = 0.02;
+    for (auto it = g_pendingCtrlRequests.rbegin(); it != g_pendingCtrlRequests.rend(); ++it)
+    {
+        if (requiresPeerMatch && !(it->peer == peer))
+        {
+            continue;
+        }
+        if (!ResponseMatchesExpectation(it->expectedResponse, responseType))
+        {
+            continue;
+        }
+        if ((nowSec - it->timeSec) > maxDeltaSec)
+        {
+            continue;
+        }
+
+        stats.matched++;
+        if (it->txLink == linkId)
+        {
+            stats.sameLink++;
+        }
+        else
+        {
+            stats.crossLink++;
+        }
+        it->expectedResponse = "MATCHED";
+        return;
+    }
+
+    stats.unmatched++;
+}
+
+// PHY Drop Callbacks
+std::string
+GetMacTypeFromPacket(Ptr<const Packet> packet)
+{
+    if (!packet)
+    {
+        return "NULL_PACKET";
+    }
+
+    WifiMacHeader hdr;
+    Ptr<Packet> copy = packet->Copy();
+    if (copy->PeekHeader(hdr) > 0)
+    {
+        return std::string(hdr.GetTypeString());
+    }
+
+    return "UNPARSED";
+}
+
+void PhyTxDropCallback(Ptr<const Packet> packet)
+{
+    g_phyTxDrop++;
+}
+
+void PhyRxDropCallback(Ptr<const Packet> packet, WifiPhyRxfailureReason reason)
+{
+    g_phyRxDrop++;
+    std::ostringstream oss;
+    oss << reason;
+    std::string reasonStr = oss.str();
+    g_phyRxDropReasons[reasonStr]++;
+
+    const std::string macType = GetMacTypeFromPacket(packet);
+    g_phyRxDropMacTypeByReason[reasonStr + "|" + macType]++;
+
+    uint32_t size = packet ? packet->GetSize() : 0;
+    g_phyRxDropPacketSizes[size]++;
+
+    uint32_t sec = static_cast<uint32_t>(Simulator::Now().GetSeconds());
+    g_phyRxDropBySecond[sec]++;
+
+    if (g_phyRxDropSamplesPrinted < g_phyRxDropSampleLimit)
+    {
+        NS_LOG_UNCOND("PHY_RX_DROP_SAMPLE: Time_s=" << Simulator::Now().GetSeconds()
+                                                    << " Reason=" << reasonStr << " MacType=" << macType
+                                                    << " PacketSize=" << size
+                                                    << " Uid=" << (packet ? packet->GetUid() : 0));
+        g_phyRxDropSamplesPrinted++;
+    }
+}
+
+// MAC Drop Callbacks
+void MacTxDropCallback(Ptr<const Packet> packet)
+{
+    g_macTxDrop++;
+}
+
+void MacRxDropCallback(Ptr<const Packet> packet)
+{
+    g_macRxDrop++;
+}
+
+// WiFi Queue Drop Callback
+void WifiQueueDropCallback(Ptr<const WifiMpdu> mpdu)
+{
+    g_wifiQueueDrop++;
+}
+
+// Traffic Control Drop Callbacks
+void TcDropBeforeEnqueueCallback(Ptr<const QueueDiscItem> item, const char* reason)
+{
+    g_tcDropBeforeEnqueue++;
+    g_tcDropBeforeReasons[(reason != nullptr) ? std::string(reason) : std::string("UNKNOWN")]++;
+}
+
+void TcDropAfterDequeueCallback(Ptr<const QueueDiscItem> item, const char* reason)
+{
+    g_tcDropAfterDequeue++;
+    g_tcDropAfterReasons[(reason != nullptr) ? std::string(reason) : std::string("UNKNOWN")]++;
+}
+
+void TcDropCallback(Ptr<const Packet> packet)
+{
+    g_tcDrop++;
+}
+
+// Número de STAs (configurável via linha de comando)
+uint32_t g_numStas = 2;
+
+// Distância dos STAs ao AP (em metros)
+const double STA_DISTANCE = 5.0;
+
+/* global variable for easier access (cumulative delay/jitter) - per STA */
+std::vector<double> g_delaySumMs;
+std::vector<uint64_t> g_delaySamples;
+std::vector<double> g_jitterSumMs;
+std::vector<uint64_t> g_jitterSamples;
+std::vector<double> g_lastDelayMs;
+std::vector<bool> g_firstPacket;
+
+// Per-STA throughput tracking
+std::vector<uint64_t> g_lastTotalRx;
+std::vector<uint32_t> g_staPriorityClasses;
+std::vector<uint64_t> g_staTxPackets;
+std::vector<uint64_t> g_staTxBytes;
+std::vector<uint64_t> g_staRxPackets;
+std::vector<uint64_t> g_staRxBytes;
+
+struct QueueOccupancyTarget
+{
+    std::string role;
+    uint32_t nodeId;
+    Ptr<WifiMac> mac;
+};
+
+std::vector<QueueOccupancyTarget> g_queueOccupancyTargets;
+std::ofstream g_queueOccupancyStream;
+std::string g_queueOccupancyCsvPath;
+std::string g_queueOccupancyRunLabel;
+double g_queueSampleInterval = 0.1;
+Time g_queueOccupancyEndTime;
+
+std::ofstream g_staLinkMetricsStream;
+std::string g_staLinkMetricsCsvPath;
+std::string g_staLinkMetricsRunLabel;
+double g_staLinkMetricsSampleInterval = 0.1;
+Time g_staLinkMetricsEndTime;
+
+std::string
+AcIndexToShortName(AcIndex ac)
+{
+    switch (ac)
+    {
+    case AC_BE:
+        return "BE";
+    case AC_BK:
+        return "BK";
+    case AC_VI:
+        return "VI";
+    case AC_VO:
+        return "VO";
+    default:
+        return "UNDEF";
+    }
+}
+
+std::string PriorityClassToAcName(uint32_t priorityClass);
+
+/**
+ * PrintNodes - mostra configuração de dispositivos/PHY
+ */
+void PrintNodes(NodeContainer nodes, const std::string type) {
+    for(uint32_t nodeIdx = 0; nodeIdx < nodes.GetN(); ++nodeIdx) {
+        Ptr<Node> node = nodes.Get(nodeIdx);
+        NS_LOG_UNCOND(type << " Node " << nodeIdx);
+        uint32_t numDevices = node->GetNDevices(); 
+        Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();  
+        for(uint32_t i = 0; i < numDevices; ++i) {
+            Ptr<NetDevice> netDevice = node->GetDevice(i);
+            Ptr<WifiNetDevice> wifiDevice = DynamicCast<WifiNetDevice>(netDevice);
+            if(wifiDevice) {
+                Mac48Address upperMacAddress = wifiDevice->GetMac()->GetAddress();
+                NS_LOG_UNCOND("  Standard: " << wifiDevice->GetStandard());    
+                Ipv4Address ipv4Address = Ipv4Address::GetAny();
+                int32_t interfaceIndex = ipv4->GetInterfaceForDevice(netDevice);
+                if(interfaceIndex != -1) {
+                    ipv4Address = ipv4->GetAddress(interfaceIndex, 0).GetLocal();
+                }
+                NS_LOG_UNCOND("    Interface " << i << ":");
+                NS_LOG_UNCOND("      IPv4 Address = " << ipv4Address);
+                NS_LOG_UNCOND("      Upper MAC Address = " << upperMacAddress);
+                NS_LOG_UNCOND("      Number of PHYs = " << wifiDevice->GetNPhys());
+            }
+        }
+        NS_LOG_UNCOND("----------------------------");
+    }
+}
+
+void MonitorAppTx(uint32_t staIdx, Ptr<const Packet> packet, const Address &from, const Address &to, const SeqTsSizeHeader &header)
+{
+    (void)from;
+    (void)to;
+    (void)header;
+    if (staIdx >= g_staTxPackets.size())
+    {
+        return;
+    }
+
+    g_staTxPackets[staIdx]++;
+    g_staTxBytes[staIdx] += packet->GetSize();
+}
+
+// Callback para monitorizar recepção de pacotes no sink (usa SeqTsSizeHeader)
+// staIdx é o índice da STA (0-3)
+void MonitorPacketSinkRx(uint32_t staIdx, Ptr<const Packet> packet, const Address &address)
+{
+    (void)address;
+    if (staIdx < g_staRxPackets.size())
+    {
+        g_staRxPackets[staIdx]++;
+        g_staRxBytes[staIdx] += packet->GetSize();
+    }
+
+    SeqTsSizeHeader header;
+    packet->PeekHeader(header);
+    Time txTime = header.GetTs();
+    Time delay = Simulator::Now() - txTime;
+
+    double delayMs = delay.GetSeconds() * 1000.0;
+    g_delaySumMs[staIdx] += delayMs;
+    g_delaySamples[staIdx]++;
+
+    if (!g_firstPacket[staIdx]) {
+        double jitter = std::fabs(delayMs - g_lastDelayMs[staIdx]);
+        g_jitterSumMs[staIdx] += jitter;
+        g_jitterSamples[staIdx]++;
+    } else {
+        g_firstPacket[staIdx] = false;
+    }
+    g_lastDelayMs[staIdx] = delayMs;
+}
+
+void RecordStaLinkMetricsSample()
+{
+    const double now = Simulator::Now().GetSeconds();
+
+    if (g_staLinkMetricsStream.is_open())
+    {
+        for (uint32_t i = 0; i < g_numStas; ++i)
+        {
+            uint64_t backlogPackets = (g_staTxPackets[i] >= g_staRxPackets[i]) ? (g_staTxPackets[i] - g_staRxPackets[i]) : 0;
+            uint64_t backlogBytes = (g_staTxBytes[i] >= g_staRxBytes[i]) ? (g_staTxBytes[i] - g_staRxBytes[i]) : 0;
+            double avgDelay = (g_delaySamples[i] > 0) ? (g_delaySumMs[i] / g_delaySamples[i]) : 0.0;
+            double avgJitter = (g_jitterSamples[i] > 0) ? (g_jitterSumMs[i] / g_jitterSamples[i]) : 0.0;
+
+            g_staLinkMetricsStream << g_staLinkMetricsRunLabel << ',' << now << ',' << i << ','
+                                   << PriorityClassToAcName(g_staPriorityClasses[i]) << ','
+                                   << g_staTxPackets[i] << ',' << g_staTxBytes[i] << ','
+                                   << g_staRxPackets[i] << ',' << g_staRxBytes[i] << ','
+                                   << backlogPackets << ',' << backlogBytes << ','
+                                   << avgDelay << ',' << avgJitter << '\n';
+        }
+
+        g_staLinkMetricsStream.flush();
+    }
+
+    if (Simulator::Now() + Seconds(g_staLinkMetricsSampleInterval) <= g_staLinkMetricsEndTime)
+    {
+        Simulator::Schedule(Seconds(g_staLinkMetricsSampleInterval), &RecordStaLinkMetricsSample);
+    }
+}
+
+// Impressão periódica de estatísticas (por segundo) - agregada para todas as STAs
+void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
+{
+    uint64_t currentTime = Simulator::Now().GetSeconds();
+    double totalThroughput = 0.0;
+    double totalDelay = 0.0;
+    double totalJitter = 0.0;
+    uint32_t validStas = 0;
+
+    for (uint32_t i = 0; i < g_numStas; ++i) {
+        uint64_t currentTotalRx = sinks[i]->GetTotalRx();
+        double throughput = ((currentTotalRx - g_lastTotalRx[i]) * 8.0) / (1.0 * 1e6);
+        g_lastTotalRx[i] = currentTotalRx;
+
+        if (throughput > 0) {
+            totalThroughput += throughput;
+            validStas++;
+
+            double avgDelay = (g_delaySamples[i] > 0) ? (g_delaySumMs[i] / g_delaySamples[i]) : 0.0;
+            double avgJitter = (g_jitterSamples[i] > 0) ? (g_jitterSumMs[i] / g_jitterSamples[i]) : 0.0;
+
+            totalDelay += avgDelay;
+            totalJitter += avgJitter;
+        }
+    }
+
+    double avgDelay = (validStas > 0) ? totalDelay / validStas : 0.0;
+    double avgJitter = (validStas > 0) ? totalJitter / validStas : 0.0;
+
+    NS_LOG_UNCOND("TIME_STATS: Time=" << currentTime << "s TotalThroughput=" << static_cast<int>(totalThroughput)
+                  << "Mbps AvgDelay=" << avgDelay << "ms AvgJitter=" << avgJitter << "ms ActiveSTAs=" << validStas);
+
+    Simulator::Schedule(Seconds(1), &CalculateStats, sinks);
+}
+
+void
+RecordQueueOccupancySample()
+{
+    const double now = Simulator::Now().GetSeconds();
+
+    if (g_queueOccupancyStream.is_open())
+    {
+        for (const auto& target : g_queueOccupancyTargets)
+        {
+            if (!target.mac)
+            {
+                continue;
+            }
+
+            for (const auto ac : {AC_BE, AC_BK, AC_VI, AC_VO})
+            {
+                Ptr<QosTxop> qosTxop = target.mac->GetQosTxop(ac);
+                if (!qosTxop)
+                {
+                    continue;
+                }
+
+                Ptr<WifiMacQueue> queue = qosTxop->GetWifiMacQueue();
+                if (!queue)
+                {
+                    continue;
+                }
+
+                g_queueOccupancyStream << g_queueOccupancyRunLabel << ',' << now << ',' << target.role << ','
+                                       << target.nodeId << ',' << AcIndexToShortName(ac) << ','
+                                       << queue->GetNPackets() << ',' << queue->GetNBytes() << '\n';
+            }
+        }
+
+        g_queueOccupancyStream.flush();
+    }
+
+    if (Simulator::Now() + Seconds(g_queueSampleInterval) <= g_queueOccupancyEndTime)
+    {
+        Simulator::Schedule(Seconds(g_queueSampleInterval), &RecordQueueOccupancySample);
+    }
+}
+
+uint8_t
+PriorityClassToTos(uint32_t priorityClass)
+{
+    switch (priorityClass)
+    {
+    case 0:
+        return 0x20; // CS1 -> BK
+    case 1:
+        return 0x00; // BE
+    case 2:
+        return 0xA0; // AF41 -> VI
+    case 3:
+        return 0xC0; // CS6 -> VO
+    default:
+        return 0x00;
+    }
+}
+
+std::string
+PriorityClassToAcName(uint32_t priorityClass)
+{
+    switch (priorityClass)
+    {
+    case 0:
+        return "BK";
+    case 1:
+        return "BE";
+    case 2:
+        return "VI";
+    case 3:
+        return "VO";
+    default:
+        return "BE";
+    }
+}
+
+std::vector<uint32_t>
+ParseStaTrafficTypes(const std::string& csv, uint32_t numStas)
+{
+    std::vector<uint32_t> priorities(numStas, 1);
+    if (csv.empty() || numStas == 0)
+    {
+        return priorities;
+    }
+
+    std::stringstream ss(csv);
+    std::string token;
+    uint32_t idx = 0;
+    while (std::getline(ss, token, ',') && idx < numStas)
+    {
+        auto begin = token.find_first_not_of(" \t\n\r");
+        auto end = token.find_last_not_of(" \t\n\r");
+        if (begin == std::string::npos)
+        {
+            continue;
+        }
+        token = token.substr(begin, end - begin + 1);
+        std::transform(token.begin(), token.end(), token.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        if (token == "background" || token == "bk" || token == "bulk" || token == "cs1")
+        {
+            priorities[idx] = 0;
+        }
+        else if (token == "best-effort" || token == "best_effort" || token == "besteffort" || token == "be" ||
+                 token == "data" || token == "default")
+        {
+            priorities[idx] = 1;
+        }
+        else if (token == "video" || token == "vi" || token == "af41" || token == "streaming")
+        {
+            priorities[idx] = 2;
+        }
+        else if (token == "voice" || token == "vo" || token == "ef" || token == "realtime" || token == "real-time")
+        {
+            priorities[idx] = 3;
+        }
+        else
+        {
+            try
+            {
+                int parsed = std::stoi(token);
+                if (parsed < 0)
+                {
+                    parsed = 0;
+                }
+                if (parsed > 3)
+                {
+                    parsed = 3;
+                }
+                priorities[idx] = static_cast<uint32_t>(parsed);
+            }
+            catch (...)
+            {
+                priorities[idx] = 1;
+            }
+        }
+        idx++;
+    }
+
+    uint32_t fillValue = (idx > 0) ? priorities[idx - 1] : 1;
+    for (; idx < numStas; ++idx)
+    {
+        priorities[idx] = fillValue;
+    }
+
+    return priorities;
+}
+
+int main(int argc, char* argv[])
+{
+    int freq = 2; // 2, 5, or 6
+    std::string dataRateStr = "30Mbps"; // Per-STA data rate (reduzido para evitar saturação)
+    double simTime = 12.0;
+    std::string protocol = "UDP";
+    double staDistance = STA_DISTANCE;
+    bool useStaticSetup = true; // Usar WifiStaticSetupHelper
+    double queueSampleInterval = 0.1;
+    std::string queueOccupancyCsvPath;
+    std::string queueOccupancyLabel;
+    double staLinkMetricsSampleInterval = 0.1;
+    std::string staLinkMetricsCsvPath;
+    std::string staLinkMetricsLabel;
+    // block ack window size (512 or 1024 for 802.11be)
+    uint16_t baw = 512;
+    // A-MPDU max byte size per Access Category (0 = disabled)
+    uint32_t beMaxAmpduBytes = 65535;  // Best Effort - enabled by default
+    uint32_t viMaxAmpduBytes = 65535;  // Video - enabled by default
+    uint32_t voMaxAmpduBytes = 65535;  // Voice - enabled by default
+    uint32_t bkMaxAmpduBytes = 0;      // Background - disabled by default
+
+    uint32_t numStas = 4; // Number of STAs (configurable)
+    std::string staTrafficTypesCsv = "best-effort,voice,video,video"; // CSV por STA
+
+    CommandLine cmd;
+    cmd.AddValue("freq", "Frequency (2, 5, 6)", freq);
+    cmd.AddValue("dataRate", "Per-STA data rate", dataRateStr);
+    cmd.AddValue("protocol", "TCP or UDP", protocol);
+    cmd.AddValue("simTime", "Simulation time (s)", simTime);
+    cmd.AddValue("distance", "Distance from STAs to AP (m)", staDistance);
+    cmd.AddValue("staticSetup", "Use WifiStaticSetupHelper (avoids association collisions)", useStaticSetup);
+    cmd.AddValue("numStas", "Number of STAs (2, 4, 8, 16, etc.)", numStas);
+    cmd.AddValue("staTrafficTypes", "CSV por STA (voice,video,besteffort,background) ou classes 0..3", staTrafficTypesCsv);
+    cmd.AddValue("queueSampleInterval", "Queue occupancy sampling interval (s)", queueSampleInterval);
+    cmd.AddValue("queueOccupancyCsv", "CSV file for MAC queue occupancy samples", queueOccupancyCsvPath);
+    cmd.AddValue("queueOccupancyLabel", "Label prefix for MAC queue occupancy samples", queueOccupancyLabel);
+    cmd.AddValue("staLinkMetricsCsv", "CSV file for per-STA application-layer backlog samples", staLinkMetricsCsvPath);
+    cmd.AddValue("staLinkMetricsLabel", "Label prefix for per-STA application-layer backlog samples", staLinkMetricsLabel);
+    cmd.AddValue("staLinkMetricsSampleInterval", "Per-STA application-layer backlog sampling interval (s)", staLinkMetricsSampleInterval);
+    cmd.AddValue("beMaxAmpdu", "BE A-MPDU max bytes (0=disabled)", beMaxAmpduBytes);
+    cmd.AddValue("viMaxAmpdu", "VI A-MPDU max bytes (0=disabled)", viMaxAmpduBytes);
+    cmd.AddValue("voMaxAmpdu", "VO A-MPDU max bytes (0=disabled, default)", voMaxAmpduBytes);
+    cmd.AddValue("bkMaxAmpdu", "BK A-MPDU max bytes (0=disabled)", bkMaxAmpduBytes);
+    std::string frameDistributionCsvPath;
+    cmd.AddValue("frameDistributionCsv", "CSV file for link frame distribution samples", frameDistributionCsvPath);
+    cmd.Parse(argc, argv);
+
+    if (queueSampleInterval <= 0.0)
+    {
+        queueSampleInterval = 0.1;
+    }
+
+    // Set global numStas and initialize vectors
+    g_numStas = numStas;
+    g_delaySumMs.resize(g_numStas, 0.0);
+    g_delaySamples.resize(g_numStas, 0);
+    g_jitterSumMs.resize(g_numStas, 0.0);
+    g_jitterSamples.resize(g_numStas, 0);
+    g_lastDelayMs.resize(g_numStas, 0.0);
+    g_firstPacket.resize(g_numStas, true);
+    g_lastTotalRx.resize(g_numStas, 0);
+    g_staPriorityClasses.clear();
+    g_staTxPackets.assign(g_numStas, 0);
+    g_staTxBytes.assign(g_numStas, 0);
+    g_staRxPackets.assign(g_numStas, 0);
+    g_staRxBytes.assign(g_numStas, 0);
+    g_queueOccupancyCsvPath = queueOccupancyCsvPath;
+    g_queueSampleInterval = queueSampleInterval;
+    g_staLinkMetricsCsvPath = staLinkMetricsCsvPath;
+    g_staLinkMetricsSampleInterval = staLinkMetricsSampleInterval;
+    g_frameDistributionCsvPath = frameDistributionCsvPath;
+    g_frameDistributionRunLabel = std::to_string(freq) + "GHz|" + protocol;
+    g_frameDistributionEndTime = Seconds(simTime);
+    g_linkFrequencyPair = std::to_string(freq) + (freq == 2 ? ".4" : "");
+
+    const std::vector<uint32_t> staPriorities = ParseStaTrafficTypes(staTrafficTypesCsv, g_numStas);
+    g_staPriorityClasses = staPriorities;
+    g_staLinkMetricsRunLabel = staLinkMetricsLabel.empty()
+                                   ? (queueOccupancyLabel.empty() ? (std::to_string(freq) + "GHz|" + protocol)
+                                                                  : (queueOccupancyLabel + "|" + std::to_string(freq) + "GHz|" + protocol))
+                                   : staLinkMetricsLabel;
+
+    // Timing
+    Time APP_START_TIME(Seconds(1));
+    Time SIMULATION_END_TIME(Seconds(simTime));
+
+    DataRate dataRate(dataRateStr);
+    uint32_t payloadSize = 1440;
+    uint32_t maxBytes = 0; // unlimited
+
+    std::string appSocketType = (protocol == "TCP") ? "ns3::TcpSocketFactory" : "ns3::UdpSocketFactory";
+
+    // Global defaults
+    if (protocol == "TCP") {
+        Config::SetDefault("ns3::TcpL4Protocol::SocketType", TypeIdValue(TypeId::LookupByName("ns3::TcpCubic")));
+        Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(payloadSize));
+    }
+    GlobalValue::Bind("ChecksumEnabled", BooleanValue(true));
+    ns3::Packet::EnablePrinting();
+    ns3::Packet::EnableChecking();
+
+    NS_LOG_UNCOND("wifi7-single-link-multi-sta: freq=" << freq << " proto=" << protocol
+                  << " rate=" << dataRateStr << " numSTAs=" << g_numStas << " distance=" << staDistance << "m"
+                  << " staticSetup=" << (useStaticSetup ? "yes" : "no")
+                  << " staTrafficTypesCsv=" << staTrafficTypesCsv);
+
+    for (uint32_t i = 0; i < g_numStas; ++i)
+    {
+        NS_LOG_UNCOND("STA_PRIORITY_CLASS: Sta=" << i
+                      << " Class=" << staPriorities[i]
+                      << " AC=" << PriorityClassToAcName(staPriorities[i])
+                      << " TOS=" << static_cast<uint32_t>(PriorityClassToTos(staPriorities[i])));
+    }
+
+    // Configuração de Canal
+    int channel = 15; int width = 160; 
+    FrequencyRange freqRange = WIFI_SPECTRUM_6_GHZ;
+    std::string band = "BAND_6GHZ";
+
+    if (freq == 2) { 
+        channel = 1; width = 20; band = "BAND_2_4GHZ"; freqRange = WIFI_SPECTRUM_2_4_GHZ;
+    } else if (freq == 5) {
+        channel = 50; width = 160; band = "BAND_5GHZ"; freqRange = WIFI_SPECTRUM_5_GHZ;
+    }
+
+    // Criar nós: 1 AP + N STAs
+    NodeContainer apNode;
+    apNode.Create(1);
+    NodeContainer staNodes;
+    staNodes.Create(g_numStas);
+
+    // WiFi Helper
+    WifiHelper wifi;
+    wifi.SetStandard(WIFI_STANDARD_80211be);
+    wifi.ConfigHeOptions("GuardInterval", TimeValue(NanoSeconds(800)));
+    wifi.ConfigEhtOptions("EmlsrActivated", BooleanValue(false));
+
+    // PHY Helper (1 link)
+    SpectrumWifiPhyHelper phy(1);
+    phy.Set("Antennas", UintegerValue(2));
+    phy.Set("MaxSupportedTxSpatialStreams", UintegerValue(2));
+    phy.Set("MaxSupportedRxSpatialStreams", UintegerValue(2));
+
+    // Canal único
+    Ptr<MultiModelSpectrumChannel> spectrumChannel = CreateObject<MultiModelSpectrumChannel>();
+    spectrumChannel->AddPropagationLossModel(CreateObject<LogDistancePropagationLossModel>());
+    spectrumChannel->SetPropagationDelayModel(CreateObject<ConstantSpeedPropagationDelayModel>());
+    
+    phy.AddChannel(spectrumChannel, freqRange);
+    std::string chanSettings = "{" + std::to_string(channel) + ", " + std::to_string(width) + ", " + band + ", 0}";
+    phy.Set(0, "ChannelSettings", StringValue(chanSettings));
+    phy.AddPhyToFreqRangeMapping(0, freqRange);
+
+    // Rate manager
+    wifi.SetRemoteStationManager(0, std::string("ns3::IdealWifiManager"));
+    // Configure MACs
+    Ssid ssid = Ssid("wifi7-multi-sta");
+    
+    WifiMacHelper apMac;
+    
+    apMac.SetType("ns3::ApWifiMac",
+                  "Ssid", SsidValue(ssid),
+                  "BeaconGeneration", BooleanValue(true),
+                  "BeaconInterval", TimeValue(MicroSeconds(102400)),
+                  "QosSupported", BooleanValue(true));
+
+    WifiMacHelper staMac;
+    staMac.SetType("ns3::StaWifiMac",
+                   "Ssid", SsidValue(ssid),
+                   "QosSupported", BooleanValue(true),
+                   "ActiveProbing", BooleanValue(false));
+
+    // Instalar devices
+    NetDeviceContainer apDev = wifi.Install(phy, apMac, apNode);
+    NetDeviceContainer staDev = wifi.Install(phy, staMac, staNodes);
+
+    // ===== CONFIGURAR A-MPDU PARA CADA ACCESS CATEGORY =====
+    Ptr<WifiNetDevice> apWifiNetDev = DynamicCast<WifiNetDevice>(apDev.Get(0));
+    apWifiNetDev->GetMac()->SetAttribute("BE_MaxAmpduSize", UintegerValue(beMaxAmpduBytes));
+    apWifiNetDev->GetMac()->SetAttribute("VI_MaxAmpduSize", UintegerValue(viMaxAmpduBytes));
+    apWifiNetDev->GetMac()->SetAttribute("VO_MaxAmpduSize", UintegerValue(voMaxAmpduBytes));
+    apWifiNetDev->GetMac()->SetAttribute("BK_MaxAmpduSize", UintegerValue(bkMaxAmpduBytes));
+
+    for (uint32_t i = 0; i < staDev.GetN(); ++i) {
+        Ptr<WifiNetDevice> staWifiNetDev = DynamicCast<WifiNetDevice>(staDev.Get(i));
+        staWifiNetDev->GetMac()->SetAttribute("BE_MaxAmpduSize", UintegerValue(beMaxAmpduBytes));
+        staWifiNetDev->GetMac()->SetAttribute("VI_MaxAmpduSize", UintegerValue(viMaxAmpduBytes));
+        staWifiNetDev->GetMac()->SetAttribute("VO_MaxAmpduSize", UintegerValue(voMaxAmpduBytes));
+        staWifiNetDev->GetMac()->SetAttribute("BK_MaxAmpduSize", UintegerValue(bkMaxAmpduBytes));
+    }
+
+    // ===== CONECTAR TRACE SOURCES PARA PACKET LOSS GRANULAR =====
+    
+    // PHY traces (AP) and link/RU accounting (single-link)
+    for (uint8_t linkId = 0; linkId < apWifiNetDev->GetNPhys(); ++linkId) {
+        g_linkTxDepth[linkId] = 0;
+        g_linkTxTimeSec[linkId] = 0.0;
+        g_linkMuTxCount[linkId] = 0;
+        g_linkSuTxCount[linkId] = 0;
+
+        apWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext(
+            "PhyTxBegin",
+            MakeBoundCallback(&LinkPhyTxBeginCallback, linkId));
+        apWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext(
+            "PhyTxEnd",
+            MakeBoundCallback(&LinkPhyTxEndCallback, linkId));
+        apWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext(
+            "PhyTxPsduBegin",
+            MakeBoundCallback(&LinkPhyTxPsduBeginCallback, linkId));
+        apWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext(
+            "PhyTxPsduBegin",
+            MakeBoundCallback(&ApControlTxPsduBeginCallback, linkId));
+        apWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext(
+            "PhyRxMacHeaderEnd",
+            MakeBoundCallback(&ApControlRxMacHeaderEndCallback, linkId));
+
+        apWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext("PhyTxDrop", MakeCallback(&PhyTxDropCallback));
+        apWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext("PhyRxDrop", MakeCallback(&PhyRxDropCallback));
+    }
+    
+    // MAC traces (AP) - Queue drops
+    Ptr<WifiMac> apMacPtr = apWifiNetDev->GetMac();
+    // Get all AC queues and connect drop traces
+    for (auto ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
+        Ptr<QosTxop> qosTxop = apMacPtr->GetQosTxop(ac);
+        if (qosTxop) {
+            Ptr<WifiMacQueue> queue = qosTxop->GetWifiMacQueue();
+            if (queue) {
+                queue->TraceConnectWithoutContext("DropBeforeEnqueue", MakeCallback(&WifiQueueDropCallback));
+                queue->TraceConnectWithoutContext("Expired", MakeCallback(&WifiQueueDropCallback));
+            }
+        }
+    }
+    
+    // STA device traces
+    for (uint32_t i = 0; i < staDev.GetN(); ++i) {
+        Ptr<WifiNetDevice> staWifiNetDev = DynamicCast<WifiNetDevice>(staDev.Get(i));
+        
+        // PHY traces (STA)
+        for (uint8_t linkId = 0; linkId < staWifiNetDev->GetNPhys(); ++linkId) {
+            staWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext(
+                "PhyTxPsduBegin",
+                MakeBoundCallback(&LinkPhyTxPsduBeginCallback, linkId));
+            staWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext("PhyTxDrop", MakeCallback(&PhyTxDropCallback));
+            staWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext("PhyRxDrop", MakeCallback(&PhyRxDropCallback));
+        }
+        
+        // MAC traces (STA) - Queue drops
+        Ptr<WifiMac> staMacPtr = staWifiNetDev->GetMac();
+        for (auto ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
+            Ptr<QosTxop> qosTxop = staMacPtr->GetQosTxop(ac);
+            if (qosTxop) {
+                Ptr<WifiMacQueue> queue = qosTxop->GetWifiMacQueue();
+                if (queue) {
+                    queue->TraceConnectWithoutContext("DropBeforeEnqueue", MakeCallback(&WifiQueueDropCallback));
+                    queue->TraceConnectWithoutContext("Expired", MakeCallback(&WifiQueueDropCallback));
+                }
+            }
+        }
+    }
+    NS_LOG_UNCOND("Granular packet loss tracing enabled (PHY/MAC/Queue drops)");
+
+    g_queueOccupancyTargets.clear();
+    g_queueOccupancyTargets.push_back({"AP", 0, apMacPtr});
+    for (uint32_t i = 0; i < staDev.GetN(); ++i)
+    {
+        Ptr<WifiNetDevice> staWifiNetDev = DynamicCast<WifiNetDevice>(staDev.Get(i));
+        if (staWifiNetDev)
+        {
+            g_queueOccupancyTargets.push_back({"STA", i, staWifiNetDev->GetMac()});
+        }
+    }
+
+    if (!g_queueOccupancyCsvPath.empty())
+    {
+        g_queueOccupancyStream.open(g_queueOccupancyCsvPath, std::ios::out | std::ios::app);
+        if (!g_queueOccupancyStream.is_open())
+        {
+            NS_FATAL_ERROR("Could not open queue occupancy CSV: " << g_queueOccupancyCsvPath);
+        }
+        if (g_queueOccupancyStream.tellp() == std::streampos(0))
+        {
+            g_queueOccupancyStream << "run_label,time_s,role,node_id,ac,packets,bytes\n";
+        }
+        g_queueOccupancyRunLabel = queueOccupancyLabel.empty()
+                                       ? std::to_string(freq) + "GHz|" + protocol
+                                       : queueOccupancyLabel + "|" + std::to_string(freq) + "GHz|" + protocol;
+        g_queueOccupancyEndTime = SIMULATION_END_TIME;
+    }
+
+    if (!g_frameDistributionCsvPath.empty())
+    {
+        g_frameDistributionStream.open(g_frameDistributionCsvPath, std::ios::out | std::ios::trunc);
+        if (!g_frameDistributionStream.is_open())
+        {
+            NS_FATAL_ERROR("Could not open frame distribution CSV: " << g_frameDistributionCsvPath);
+        }
+        g_frameDistributionStream << "run_label,time_bucket_s,link_id,link_name,ac,frame_type,frame_count,bytes\n";
+        g_frameDistributionStream.flush();
+        if (!g_queueOccupancyRunLabel.empty())
+        {
+            g_frameDistributionRunLabel = g_queueOccupancyRunLabel;
+        }
+        g_frameDistributionEndTime = SIMULATION_END_TIME;
+        Simulator::Schedule(Seconds(g_frameDistributionSampleInterval), &ScheduleFrameDistributionFlush);
+    }
+
+    if (!g_staLinkMetricsCsvPath.empty())
+    {
+        g_staLinkMetricsStream.open(g_staLinkMetricsCsvPath, std::ios::out | std::ios::app);
+        if (!g_staLinkMetricsStream.is_open())
+        {
+            NS_FATAL_ERROR("Could not open per-STA metrics CSV: " << g_staLinkMetricsCsvPath);
+        }
+        if (g_staLinkMetricsStream.tellp() == std::streampos(0))
+        {
+            g_staLinkMetricsStream << "run_label,time_s,sta_id,ac,tx_packets,tx_bytes,rx_packets,rx_bytes,backlog_packets,backlog_bytes,avg_delay_ms,avg_jitter_ms\n";
+            g_staLinkMetricsStream.flush();
+        }
+        g_staLinkMetricsEndTime = SIMULATION_END_TIME;
+    }
+
+    // ===== CONFIGURAÇÃO ESTÁTICA (WifiStaticSetupHelper) =====
+    // Evita colisões durante a associação quando múltiplas STAs tentam associar-se simultaneamente
+    if (useStaticSetup) {
+        NS_LOG_UNCOND("Using WifiStaticSetupHelper for static association...");
+        
+        // Configurar associação estática (salta scanning e troca de frames de gestão)
+        Ptr<WifiNetDevice> apWifiDev = DynamicCast<WifiNetDevice>(apDev.Get(0));
+        WifiStaticSetupHelper::SetStaticAssociation(apWifiDev, staDev);
+        
+        // Configurar Block ACK agreements estaticamente para TID 0 (Best Effort)
+        // Isto evita a troca de ADDBA Request/Response
+        WifiStaticSetupHelper::SetStaticBlockAck(apWifiDev, staDev, {0});
+        
+        NS_LOG_UNCOND("Static association and Block ACK configured for " << g_numStas << " STAs");
+    }
+
+    // ===== MOBILIDADE (Layout linear) =====
+    // AP no centro (0,0,0)
+    // STAs distribuídas em círculo em volta do AP
+    MobilityHelper mobility;
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    
+    // Posicionar AP no centro
+    mobility.Install(apNode);
+    apNode.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(0.0, 0.0, 0.0));
+    NS_LOG_UNCOND("AP position: (0, 0, 0)");
+    
+    // Posicionar STAs em círculo em volta do AP
+    mobility.Install(staNodes);
+    NS_LOG_UNCOND("STAs positioned in circle at distance " << staDistance << "m from AP:");
+    for (uint32_t i = 0; i < g_numStas; ++i) {
+        double angle = 2.0 * M_PI * i / g_numStas;
+        double x = staDistance * std::cos(angle);
+        double y = staDistance * std::sin(angle);
+        staNodes.Get(i)->GetObject<MobilityModel>()->SetPosition(Vector(x, y, 0.0));
+        NS_LOG_UNCOND("  STA" << i << ": (" << x << ", " << y << ", 0)");
+    }
+
+    // ===== INTERNET STACK =====
+    InternetStackHelper stack;
+    stack.Install(apNode);
+    stack.Install(staNodes);
+    
+    Ipv4AddressHelper address;
+    address.SetBase("192.168.1.0", "255.255.255.0");
+    
+    // Combinar todos os devices para atribuir IPs
+    NetDeviceContainer allDevices;
+    allDevices.Add(apDev);
+    allDevices.Add(staDev);
+    Ipv4InterfaceContainer ifaces = address.Assign(allDevices);
+    // ifaces[0] = AP, ifaces[1..4] = STAs
+
+    // ===== TRAFFIC CONTROL LAYER DROP TRACES =====
+    // Conectar aos traces de drop do Traffic Control Layer no AP
+    Ptr<TrafficControlLayer> tcAp = apNode.Get(0)->GetObject<TrafficControlLayer>();
+    if (tcAp) {
+        tcAp->TraceConnectWithoutContext("TcDrop", MakeCallback(&TcDropCallback));
+        
+        // Get root queue disc for AP WiFi device and connect drop traces
+        Ptr<QueueDisc> rootQdAp = tcAp->GetRootQueueDiscOnDevice(apDev.Get(0));
+        if (rootQdAp) {
+            rootQdAp->TraceConnectWithoutContext("DropBeforeEnqueue", MakeCallback(&TcDropBeforeEnqueueCallback));
+            rootQdAp->TraceConnectWithoutContext("DropAfterDequeue", MakeCallback(&TcDropAfterDequeueCallback));
+        }
+    }
+    
+    // Conectar aos traces de drop nas STAs também
+    for (uint32_t i = 0; i < g_numStas; ++i) {
+        Ptr<TrafficControlLayer> tcSta = staNodes.Get(i)->GetObject<TrafficControlLayer>();
+        if (tcSta) {
+            tcSta->TraceConnectWithoutContext("TcDrop", MakeCallback(&TcDropCallback));
+            
+            Ptr<QueueDisc> rootQdSta = tcSta->GetRootQueueDiscOnDevice(staDev.Get(i));
+            if (rootQdSta) {
+                rootQdSta->TraceConnectWithoutContext("DropBeforeEnqueue", MakeCallback(&TcDropBeforeEnqueueCallback));
+                rootQdSta->TraceConnectWithoutContext("DropAfterDequeue", MakeCallback(&TcDropAfterDequeueCallback));
+            }
+        }
+    }
+    NS_LOG_UNCOND("Traffic Control layer drop tracing enabled");
+
+    // ===== CONFIGURAÇÃO ARP ESTÁTICA (NeighborCacheHelper) =====
+    // Evita troca de ARP Request/Response
+    if (useStaticSetup) {
+        NeighborCacheHelper neighborCache;
+        neighborCache.PopulateNeighborCache();
+        NS_LOG_UNCOND("Static ARP cache populated");
+    }
+
+    // ===== APLICAÇÕES =====
+    // Tráfego downlink: AP envia para cada STA
+    uint16_t basePort = 9;
+    std::vector<Ptr<PacketSink>> sinks(g_numStas);
+    
+    for (uint32_t i = 0; i < g_numStas; ++i) {
+        uint16_t port = basePort + i;
+        
+        // Sink na STA
+        Address sinkAddr(InetSocketAddress(ifaces.GetAddress(1 + i), port));
+        PacketSinkHelper sinkHelper(appSocketType, sinkAddr);
+        ApplicationContainer sinkApp = sinkHelper.Install(staNodes.Get(i));
+        sinkApp.Start(APP_START_TIME);
+        sinkApp.Stop(SIMULATION_END_TIME - Seconds(1));
+        sinks[i] = DynamicCast<PacketSink>(sinkApp.Get(0));
+        
+        // Conectar callback de RX (captura staIdx)
+        uint32_t staIdx = i;
+        sinks[i]->TraceConnectWithoutContext("Rx", 
+            MakeBoundCallback(&MonitorPacketSinkRx, staIdx));
+        
+        // OnOff sender no AP
+        OnOffHelper client(appSocketType, sinkAddr);
+        client.SetAttribute("PacketSize", UintegerValue(payloadSize));
+        client.SetAttribute("MaxBytes", UintegerValue(maxBytes));
+        client.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
+        client.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+        client.SetAttribute("DataRate", DataRateValue(dataRate));
+        client.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
+        client.SetAttribute("Tos", UintegerValue(PriorityClassToTos(staPriorities[i])));
+
+        ApplicationContainer clientApp = client.Install(apNode.Get(0));
+        clientApp.Get(0)->TraceConnectWithoutContext("TxWithSeqTsSize", MakeBoundCallback(&MonitorAppTx, i));
+        // Escalonar início ligeiramente diferente para cada STA para evitar burst inicial
+        clientApp.Start(APP_START_TIME + Seconds(1) + MilliSeconds(i * 10));
+        clientApp.Stop(SIMULATION_END_TIME - Seconds(2));
+        
+        NS_LOG_UNCOND("App configured: AP -> STA" << i << " (port " << port << ")"
+                      << " PriorityClass=" << staPriorities[i]
+                      << " AC=" << PriorityClassToAcName(staPriorities[i])
+                      << " TOS=" << static_cast<uint32_t>(PriorityClassToTos(staPriorities[i])));
+    }
+
+    // Flow monitor
+    FlowMonitorHelper flowmon;
+    Ptr<FlowMonitor> monitor = flowmon.InstallAll();
+
+    // Estatísticas periódicas
+    Simulator::Schedule(Seconds(2), &CalculateStats, sinks);
+    if (!g_queueOccupancyCsvPath.empty())
+    {
+        Simulator::Schedule(Seconds(0), &RecordQueueOccupancySample);
+    }
+    if (!g_staLinkMetricsCsvPath.empty())
+    {
+        Simulator::Schedule(Seconds(0), &RecordStaLinkMetricsSample);
+    }
+
+    // Print node info
+    PrintNodes(apNode, "AP");
+    PrintNodes(staNodes, "STA");
+
+    Simulator::Stop(SIMULATION_END_TIME + Seconds(1));
+    Simulator::Run();
+
+    // ===== RESULTADOS FINAIS =====
+    monitor->CheckForLostPackets();
+    Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
+    auto stats = monitor->GetFlowStats();
+    
+    double totalThroughput = 0.0;
+    uint64_t totalRxBytes = 0;
+    uint64_t totalTxPackets = 0;
+    uint64_t totalRxPackets = 0;
+    
+    Ipv4Address apAddr = ifaces.GetAddress(0);
+    
+    double totalDelay = 0.0;
+    double totalJitter = 0.0;
+    uint64_t totalLostPackets = 0;
+    uint32_t validStas = 0;
+    
+    for (const auto &kv : stats) {
+        FlowId id = kv.first;
+        const FlowMonitor::FlowStats &st = kv.second;
+        Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(id);
+        
+        // Apenas fluxos downlink do AP
+        if (t.sourceAddress == apAddr) {
+            double duration = st.timeLastRxPacket.GetSeconds() - st.timeFirstTxPacket.GetSeconds();
+            double tp = (duration > 0) ? (st.rxBytes * 8.0) / (duration * 1e6) : 0.0;
+            
+            // Calcular delay e jitter médios do fluxo
+            double delayMs = (st.rxPackets > 0) ? (st.delaySum.GetSeconds() * 1000.0 / st.rxPackets) : 0.0;
+            double jitterMs = (st.rxPackets > 1) ? (st.jitterSum.GetSeconds() * 1000.0 / (st.rxPackets - 1)) : 0.0;
+            uint64_t lostPackets = st.txPackets - st.rxPackets;
+            double lossRate = (st.txPackets > 0) ? (lostPackets * 100.0 / st.txPackets) : 0.0;
+            
+            // Identificar qual STA é o destino
+            for (uint32_t i = 0; i < g_numStas; ++i) {
+                if (t.destinationAddress == ifaces.GetAddress(1 + i)) {
+                    NS_LOG_UNCOND("FLOW_SUMMARY_STA" << i << ": freq=" << freq << " proto=" << protocol 
+                                  << " Throughput_Mbps=" << tp 
+                                  << " Delay_ms=" << delayMs 
+                                  << " Jitter_ms=" << jitterMs
+                                  << " LostPackets=" << lostPackets
+                                  << " LossRate_pct=" << lossRate
+                                  << " TX_Packets=" << st.txPackets << " RX_Packets=" << st.rxPackets);
+                    break;
+                }
+            }
+            
+            totalThroughput += tp;
+            totalDelay += delayMs;
+            totalJitter += jitterMs;
+            totalRxBytes += st.rxBytes;
+            totalTxPackets += st.txPackets;
+            totalRxPackets += st.rxPackets;
+            totalLostPackets += lostPackets;
+            validStas++;
+        }
+    }
+    
+    double avgDelay = (validStas > 0) ? totalDelay / validStas : 0.0;
+    double avgJitter = (validStas > 0) ? totalJitter / validStas : 0.0;
+    double avgThroughputPerSta = (validStas > 0) ? totalThroughput / validStas : 0.0;
+    double totalLossRate = (totalTxPackets > 0) ? (totalLostPackets * 100.0 / totalTxPackets) : 0.0;
+    
+    NS_LOG_UNCOND("FLOW_SUMMARY_TOTAL: freq=" << freq << " proto=" << protocol << " numSTAs=" << g_numStas
+                  << " Throughput_Mbps=" << totalThroughput 
+                  << " AvgThroughputPerSTA_Mbps=" << avgThroughputPerSta
+                  << " AvgDelay_ms=" << avgDelay 
+                  << " AvgJitter_ms=" << avgJitter
+                  << " TotalLostPackets=" << totalLostPackets
+                  << " LossRate_pct=" << totalLossRate
+                  << " TX_Packets=" << totalTxPackets << " RX_Packets=" << totalRxPackets);
+    
+    // ===== GRANULAR PACKET LOSS BREAKDOWN =====
+    uint64_t totalPhyDrops = g_phyTxDrop + g_phyRxDrop;
+    uint64_t totalMacDrops = g_macTxDrop + g_macRxDrop;
+    uint64_t totalTcDrops = g_tcDropBeforeEnqueue + g_tcDropAfterDequeue + g_tcDrop;
+    uint64_t totalGranularDrops = totalPhyDrops + totalMacDrops + g_wifiQueueDrop + totalTcDrops;
+    
+    NS_LOG_UNCOND("PACKET_LOSS_BREAKDOWN: freq=" << freq << " proto=" << protocol
+                  << " PhyTxDrop=" << g_phyTxDrop
+                  << " PhyRxDrop=" << g_phyRxDrop  
+                  << " MacTxDrop=" << g_macTxDrop
+                  << " MacRxDrop=" << g_macRxDrop
+                  << " WifiQueueDrop=" << g_wifiQueueDrop
+                  << " TcDropBeforeEnqueue=" << g_tcDropBeforeEnqueue
+                  << " TcDropAfterDequeue=" << g_tcDropAfterDequeue
+                  << " TcDrop=" << g_tcDrop
+                  << " TotalGranularDrops=" << totalGranularDrops
+                  << " E2E_LostPackets=" << totalLostPackets);
+    
+    // Percentagens por camada (relativas ao total de drops granulares)
+    if (totalGranularDrops > 0) {
+        double phyPct = (totalPhyDrops * 100.0) / totalGranularDrops;
+        double macPct = (totalMacDrops * 100.0) / totalGranularDrops;
+        double wifiQueuePct = (g_wifiQueueDrop * 100.0) / totalGranularDrops;
+        double tcPct = (totalTcDrops * 100.0) / totalGranularDrops;
+        double unaccountedPct = 100.0 - phyPct - macPct - wifiQueuePct - tcPct;
+        
+        NS_LOG_UNCOND("LOSS_ATTRIBUTION: PHY_pct=" << phyPct 
+                      << " MAC_pct=" << macPct 
+                      << " WifiQueue_pct=" << wifiQueuePct
+                      << " TC_pct=" << tcPct
+                      << " Unaccounted_pct=" << unaccountedPct);
+    }
+
+    // Breakdown de razões para Traffic Control drops
+    for (const auto& kv : g_tcDropBeforeReasons)
+    {
+        const std::string& reasonName = kv.first;
+        uint64_t reasonCount = kv.second;
+        double pctTcBefore = (g_tcDropBeforeEnqueue > 0) ? (reasonCount * 100.0 / g_tcDropBeforeEnqueue) : 0.0;
+        double pctTotalDrops = (totalGranularDrops > 0) ? (reasonCount * 100.0 / totalGranularDrops) : 0.0;
+
+        NS_LOG_UNCOND("TC_DROP_BEFORE_REASON: Reason=" << reasonName
+                      << " Count=" << reasonCount
+                      << " PctTcBefore=" << pctTcBefore
+                      << " PctTotalDrops=" << pctTotalDrops);
+    }
+
+    for (const auto& kv : g_tcDropAfterReasons)
+    {
+        const std::string& reasonName = kv.first;
+        uint64_t reasonCount = kv.second;
+        double pctTcAfter = (g_tcDropAfterDequeue > 0) ? (reasonCount * 100.0 / g_tcDropAfterDequeue) : 0.0;
+        double pctTotalDrops = (totalGranularDrops > 0) ? (reasonCount * 100.0 / totalGranularDrops) : 0.0;
+
+        NS_LOG_UNCOND("TC_DROP_AFTER_REASON: Reason=" << reasonName
+                      << " Count=" << reasonCount
+                      << " PctTcAfter=" << pctTcAfter
+                      << " PctTotalDrops=" << pctTotalDrops);
+    }
+
+    // Breakdown de razões para PhyRxDrop
+    for (auto it = g_phyRxDropReasons.begin(); it != g_phyRxDropReasons.end(); ++it)
+    {
+        const std::string& reasonName = it->first;
+        uint64_t reasonCount = it->second;
+        double pctPhyRx = (g_phyRxDrop > 0) ? (reasonCount * 100.0 / g_phyRxDrop) : 0.0;
+        double pctTotalDrops = (totalGranularDrops > 0) ? (reasonCount * 100.0 / totalGranularDrops) : 0.0;
+
+        NS_LOG_UNCOND("PHY_RX_DROP_REASON: Reason=" << reasonName
+                      << " Count=" << reasonCount
+                      << " PctPhyRx=" << pctPhyRx
+                      << " PctTotalDrops=" << pctTotalDrops);
+    }
+
+    // Breakdown por tipo de frame MAC dentro de cada razão de PHY RX drop
+    for (auto it = g_phyRxDropMacTypeByReason.begin(); it != g_phyRxDropMacTypeByReason.end(); ++it)
+    {
+        const std::string& key = it->first;
+        const uint64_t count = it->second;
+
+        std::size_t sep = key.find('|');
+        std::string reasonName = (sep == std::string::npos) ? key : key.substr(0, sep);
+        std::string macType = (sep == std::string::npos) ? std::string("UNKNOWN") : key.substr(sep + 1);
+
+        uint64_t reasonTotal = 0;
+        auto reasonIt = g_phyRxDropReasons.find(reasonName);
+        if (reasonIt != g_phyRxDropReasons.end())
+        {
+            reasonTotal = reasonIt->second;
+        }
+
+        double pctReason = (reasonTotal > 0) ? (count * 100.0 / reasonTotal) : 0.0;
+        double pctPhyRx = (g_phyRxDrop > 0) ? (count * 100.0 / g_phyRxDrop) : 0.0;
+
+        NS_LOG_UNCOND("PHY_RX_DROP_PKT_TYPE: Reason=" << reasonName << " MacType=" << macType
+                      << " Count=" << count << " PctReason=" << pctReason
+                      << " PctPhyRx=" << pctPhyRx);
+    }
+
+    // Breakdown por tamanho de pacote PHY RX drop (top 10)
+    std::vector<std::pair<uint32_t, uint64_t>> sizeCounts(g_phyRxDropPacketSizes.begin(),
+                                                          g_phyRxDropPacketSizes.end());
+    std::sort(sizeCounts.begin(),
+              sizeCounts.end(),
+              [](const auto& a, const auto& b) {
+                  if (a.second == b.second)
+                  {
+                      return a.first < b.first;
+                  }
+                  return a.second > b.second;
+              });
+
+    uint32_t topN = std::min<uint32_t>(10, sizeCounts.size());
+    for (uint32_t i = 0; i < topN; ++i)
+    {
+        uint32_t pktSize = sizeCounts[i].first;
+        uint64_t count = sizeCounts[i].second;
+        double pctPhyRx = (g_phyRxDrop > 0) ? (count * 100.0 / g_phyRxDrop) : 0.0;
+        NS_LOG_UNCOND("PHY_RX_DROP_PKT_SIZE: PacketSize=" << pktSize << " Count=" << count
+                      << " PctPhyRx=" << pctPhyRx);
+    }
+
+    // Timeline: PHY RX drops por segundo de simulação
+    for (auto it = g_phyRxDropBySecond.begin(); it != g_phyRxDropBySecond.end(); ++it)
+    {
+        NS_LOG_UNCOND("PHY_RX_DROP_BY_SECOND: Sec=" << it->first << " Count=" << it->second);
+    }
+
+    if (g_queueOccupancyStream.is_open())
+    {
+        g_queueOccupancyStream.close();
+    }
+
+    if (g_staLinkMetricsStream.is_open())
+    {
+        g_staLinkMetricsStream.close();
+    }
+
+    Simulator::Destroy();
+    return 0;
+}
