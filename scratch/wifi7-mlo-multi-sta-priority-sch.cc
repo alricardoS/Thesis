@@ -24,7 +24,7 @@
 #include "ns3/neighbor-cache-helper.h"
 #include "ns3/wifi-mac-queue.h"
 #include "ns3/qos-txop.h"
-#include "mlo-traffic-aware-queue-scheduler.h"
+#include "mlo-qos-weighted-scheduler.h"
 #include "ns3/traffic-control-module.h"
 #include "ns3/wifi-ru.h"
 
@@ -131,6 +131,16 @@ Time g_frameDistributionEndTime;
 
 // Global flag to enable/disable the traffic-aware link-selection wrapper.
 bool g_useCustomMloScheduler = true;
+
+Ptr<QosWeightedMloScheduler> g_apScheduler;
+std::vector<Ptr<QosWeightedMloScheduler>> g_staSchedulers;
+std::string g_schedulerDecisionCsvPath = "";
+
+// Default QoS Weights (Delay, Jitter, Loss, Throughput)
+double g_voDelayWeight = 0.40; double g_voJitterWeight = 0.30; double g_voLossWeight = 0.25; double g_voTpWeight = 0.05;
+double g_viDelayWeight = 0.25; double g_viJitterWeight = 0.15; double g_viLossWeight = 0.20; double g_viTpWeight = 0.40;
+double g_beDelayWeight = 0.10; double g_beJitterWeight = 0.05; double g_beLossWeight = 0.15; double g_beTpWeight = 0.70;
+double g_bkDelayWeight = 0.05; double g_bkJitterWeight = 0.05; double g_bkLossWeight = 0.10; double g_bkTpWeight = 0.80;
 
 std::string
 GetLinkName(uint8_t linkId, const std::string& freqPair)
@@ -442,6 +452,31 @@ UpdateLinkActivityAccounting()
     g_lastTxStateUpdateSec = now;
 }
 
+std::map<uint8_t, double> g_lastLinkTxTimeSec;
+void FeedLinkUtilizationToSchedulers()
+{
+    const double interval = 0.1; // 100ms
+    for (uint8_t linkId = 0; linkId < 2; ++linkId) {
+        double currentTxTime = g_linkTxTimeSec[linkId];
+        double lastTxTime = g_lastLinkTxTimeSec[linkId];
+        double dt = currentTxTime - lastTxTime;
+        double utilization = dt / interval;
+        if (utilization > 1.0) utilization = 1.0;
+        if (utilization < 0.0) utilization = 0.0;
+        
+        if (g_apScheduler) {
+            g_apScheduler->FeedLinkUtilization(linkId, utilization);
+        }
+        for (auto& staScheduler : g_staSchedulers) {
+            if (staScheduler) {
+                staScheduler->FeedLinkUtilization(linkId, utilization);
+            }
+        }
+        g_lastLinkTxTimeSec[linkId] = currentTxTime;
+    }
+    Simulator::Schedule(Seconds(interval), &FeedLinkUtilizationToSchedulers);
+}
+
 void
 LinkPhyTxBeginCallback(uint8_t linkId, Ptr<const Packet> packet, double txPowerW)
 {
@@ -491,6 +526,10 @@ LinkPhyTxPsduBeginCallback(uint8_t linkId,
             if (psdu && psdu->GetNMpdus() > 0)
             {
                 g_linkSuTxCount[linkId] += psdu->GetNMpdus();
+                if (g_apScheduler) {
+                    AcIndex ac = GetAcFromPsdu(psdu);
+                    g_apScheduler->FeedLinkMetrics(linkId, ac, psdu->GetSize(), psdu->GetNMpdus(), 0);
+                }
             }
         }
     }
@@ -963,7 +1002,7 @@ int main(int argc, char* argv[])
     // Default params
     int freq1 = 5;
     int freq2 = 6;
-    std::string dataRateStr = "30Mbps"; // Per-STA (reduzido para evitar saturação com 4 STAs)
+    std::string dataRateStr = "150Mbps"; // Per-STA (reduzido para evitar saturação com 4 STAs)
     double simTime = 12.0;
     bool enablePcaps = false;
     std::string protocol = "UDP";
@@ -1005,6 +1044,23 @@ int main(int argc, char* argv[])
     cmd.AddValue("linkTrafficCsv", "CSV file for per-link per-STA traffic samples", linkTrafficCsvPath);
     cmd.AddValue("frameDistributionCsv", "CSV file for link frame distribution samples", frameDistributionCsvPath);
     cmd.AddValue("useCustomMloScheduler", "Enable custom MLO scheduler (VO/VI prefer fast link, BE/BK prefer slow link)", g_useCustomMloScheduler);
+    cmd.AddValue("schedulerDecisionCsv", "CSV file for scheduler decisions", g_schedulerDecisionCsvPath);
+    cmd.AddValue("voDelayWeight", "VO Delay Weight", g_voDelayWeight);
+    cmd.AddValue("voJitterWeight", "VO Jitter Weight", g_voJitterWeight);
+    cmd.AddValue("voLossWeight", "VO Loss Weight", g_voLossWeight);
+    cmd.AddValue("voTpWeight", "VO Throughput Weight", g_voTpWeight);
+    cmd.AddValue("viDelayWeight", "VI Delay Weight", g_viDelayWeight);
+    cmd.AddValue("viJitterWeight", "VI Jitter Weight", g_viJitterWeight);
+    cmd.AddValue("viLossWeight", "VI Loss Weight", g_viLossWeight);
+    cmd.AddValue("viTpWeight", "VI Throughput Weight", g_viTpWeight);
+    cmd.AddValue("beDelayWeight", "BE Delay Weight", g_beDelayWeight);
+    cmd.AddValue("beJitterWeight", "BE Jitter Weight", g_beJitterWeight);
+    cmd.AddValue("beLossWeight", "BE Loss Weight", g_beLossWeight);
+    cmd.AddValue("beTpWeight", "BE Throughput Weight", g_beTpWeight);
+    cmd.AddValue("bkDelayWeight", "BK Delay Weight", g_bkDelayWeight);
+    cmd.AddValue("bkJitterWeight", "BK Jitter Weight", g_bkJitterWeight);
+    cmd.AddValue("bkLossWeight", "BK Loss Weight", g_bkLossWeight);
+    cmd.AddValue("bkTpWeight", "BK Throughput Weight", g_bkTpWeight);
     cmd.Parse(argc, argv);
 
     if (queueSampleInterval <= 0.0)
@@ -1305,16 +1361,28 @@ int main(int argc, char* argv[])
         NS_LOG_UNCOND("Static ML association and Block ACK configured for " << g_numStas << " STAs on both links");
     }
 
-    // ===== APPLY TRAFFIC-AWARE MLO SCHEDULER =====
+    // ===== APPLY QoS-AWARE WEIGHTED MLO SCHEDULER =====
     // Install the wrapper on both AP and STAs so the link is chosen per MPDU.
     if (g_useCustomMloScheduler)
     {
-        NS_LOG_UNCOND("===== MLO TRAFFIC-AWARE SCHEDULER ENABLED =====");
-        NS_LOG_UNCOND("Policy: VO/VI prefer fastest link, BE/BK prefer slowest link");
-        NS_LOG_UNCOND("Link speed ranking: 6GHz > 5GHz > 2.4GHz");
+        NS_LOG_UNCOND("===== MLO QoS-AWARE WEIGHTED SCHEDULER ENABLED =====");
+        NS_LOG_UNCOND("Policy: Dynamic weighted scoring per AC based on real-world requirements");
+        NS_LOG_UNCOND("Weights: VO(delay=0.45, jitter=0.30, loss=0.20, tp=0.05)");
+        NS_LOG_UNCOND("         VI(delay=0.25, jitter=0.20, loss=0.20, tp=0.35)");
+        NS_LOG_UNCOND("         BE(delay=0.10, jitter=0.05, loss=0.15, tp=0.70)");
+        NS_LOG_UNCOND("         BK(delay=0.05, jitter=0.05, loss=0.10, tp=0.80)");
         
         Ptr<WifiNetDevice> apWifiDev = DynamicCast<WifiNetDevice>(apDev.Get(0));
-        InstallTrafficAwareScheduler(apWifiDev->GetMac(), freq1, freq2);
+        g_apScheduler = InstallQosWeightedScheduler(apWifiDev->GetMac(), freq1, freq2);
+        if (g_apScheduler) {
+            g_apScheduler->SetWeights(AC_VO, g_voDelayWeight, g_voJitterWeight, g_voLossWeight, g_voTpWeight);
+            g_apScheduler->SetWeights(AC_VI, g_viDelayWeight, g_viJitterWeight, g_viLossWeight, g_viTpWeight);
+            g_apScheduler->SetWeights(AC_BE, g_beDelayWeight, g_beJitterWeight, g_beLossWeight, g_beTpWeight);
+            g_apScheduler->SetWeights(AC_BK, g_bkDelayWeight, g_bkJitterWeight, g_bkLossWeight, g_bkTpWeight);
+            if (!g_schedulerDecisionCsvPath.empty()) {
+                g_apScheduler->EnableDecisionCsv(g_schedulerDecisionCsvPath, "AP");
+            }
+        }
 
         // Apply the same policy to every STA MAC.
         for (uint32_t i = 0; i < staDev.GetN(); ++i)
@@ -1322,14 +1390,24 @@ int main(int argc, char* argv[])
             Ptr<WifiNetDevice> staWifiNetDev = DynamicCast<WifiNetDevice>(staDev.Get(i));
                 if (staWifiNetDev)
                 {
-                    InstallTrafficAwareScheduler(staWifiNetDev->GetMac(), freq1, freq2);
+                    Ptr<QosWeightedMloScheduler> staScheduler = InstallQosWeightedScheduler(staWifiNetDev->GetMac(), freq1, freq2);
+                    if (staScheduler) {
+                        staScheduler->SetWeights(AC_VO, g_voDelayWeight, g_voJitterWeight, g_voLossWeight, g_voTpWeight);
+                        staScheduler->SetWeights(AC_VI, g_viDelayWeight, g_viJitterWeight, g_viLossWeight, g_viTpWeight);
+                        staScheduler->SetWeights(AC_BE, g_beDelayWeight, g_beJitterWeight, g_beLossWeight, g_beTpWeight);
+                        staScheduler->SetWeights(AC_BK, g_bkDelayWeight, g_bkJitterWeight, g_bkLossWeight, g_bkTpWeight);
+                        if (!g_schedulerDecisionCsvPath.empty()) {
+                            staScheduler->EnableDecisionCsv(g_schedulerDecisionCsvPath, "STA" + std::to_string(i));
+                        }
+                        g_staSchedulers.push_back(staScheduler);
+                    }
                 }
         }
-        NS_LOG_UNCOND("Traffic-aware MLO scheduler installation complete (default static policy: VO/VI→fast, BE/BK→slow)");
+        NS_LOG_UNCOND("QoS-aware Weighted MLO scheduler installation complete (dynamic scoring with hysteresis)");
     }
     else
     {
-        NS_LOG_UNCOND("===== MLO TRAFFIC-AWARE SCHEDULER DISABLED =====");
+        NS_LOG_UNCOND("===== MLO QoS-AWARE WEIGHTED SCHEDULER DISABLED =====");
         NS_LOG_UNCOND("Using the default ns-3 FCFS scheduler");
     }
 
@@ -1471,6 +1549,7 @@ int main(int argc, char* argv[])
 
     // Estatísticas periódicas
     Simulator::Schedule(Seconds(2), &CalculateStats, sinks);
+    Simulator::Schedule(Seconds(1), &FeedLinkUtilizationToSchedulers);
     if (!g_queueOccupancyCsvPath.empty())
     {
         Simulator::Schedule(Seconds(0), &RecordQueueOccupancySample);
@@ -1757,6 +1836,10 @@ int main(int argc, char* argv[])
     if (g_frameDistributionStream.is_open())
     {
         g_frameDistributionStream.close();
+    }
+    
+    if (g_apScheduler) {
+        g_apScheduler->PrintFinalScores();
     }
 
     Simulator::Destroy();
