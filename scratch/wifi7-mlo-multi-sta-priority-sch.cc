@@ -293,6 +293,11 @@ RecordLinkTrafficFromMpdu(Ptr<const WifiMpdu> mpdu)
     auto key = std::make_tuple(timeBucket, linkId, linkName, staId, staAddress, acStr, frameType);
     g_linkTrafficData[key].frame_count += 1;
     g_linkTrafficData[key].bytes += mpdu->GetSize();
+
+    // Feed confirmed transmission to scheduler (real throughput + PER success)
+    if (g_apScheduler) {
+        g_apScheduler->FeedLinkMetrics(linkId, ac, mpdu->GetSize(), 1, 0);
+    }
 }
 
 void
@@ -452,36 +457,24 @@ UpdateLinkActivityAccounting()
     g_lastTxStateUpdateSec = now;
 }
 
-std::map<uint8_t, double> g_lastLinkTxTimeSec;
-void FeedLinkUtilizationToSchedulers()
-{
-    const double interval = 0.1; // 100ms
-    for (uint8_t linkId = 0; linkId < 2; ++linkId) {
-        double currentTxTime = g_linkTxTimeSec[linkId];
-        double lastTxTime = g_lastLinkTxTimeSec[linkId];
-        double dt = currentTxTime - lastTxTime;
-        double utilization = dt / interval;
-        if (utilization > 1.0) utilization = 1.0;
-        if (utilization < 0.0) utilization = 0.0;
-        
-        if (g_apScheduler) {
-            g_apScheduler->FeedLinkUtilization(linkId, utilization);
-        }
-        for (auto& staScheduler : g_staSchedulers) {
-            if (staScheduler) {
-                staScheduler->FeedLinkUtilization(linkId, utilization);
-            }
-        }
-        g_lastLinkTxTimeSec[linkId] = currentTxTime;
-    }
-    Simulator::Schedule(Seconds(interval), &FeedLinkUtilizationToSchedulers);
-}
+// FeedLinkUtilizationToSchedulers removed — utilization is now computed
+// internally by the scheduler from FeedLinkTxStart/FeedLinkTxEnd callbacks.
 
 void
 LinkPhyTxBeginCallback(uint8_t linkId, Ptr<const Packet> packet, double txPowerW)
 {
     UpdateLinkActivityAccounting();
     g_linkTxDepth[linkId]++;
+
+    // Feed airtime start to scheduler for real channel utilization
+    if (g_apScheduler) {
+        g_apScheduler->FeedLinkTxStart(linkId);
+    }
+    for (auto& staScheduler : g_staSchedulers) {
+        if (staScheduler) {
+            staScheduler->FeedLinkTxStart(linkId);
+        }
+    }
 }
 
 void
@@ -491,6 +484,16 @@ LinkPhyTxEndCallback(uint8_t linkId, Ptr<const Packet> packet)
     if (g_linkTxDepth[linkId] > 0)
     {
         g_linkTxDepth[linkId]--;
+    }
+
+    // Feed airtime end to scheduler for real channel utilization
+    if (g_apScheduler) {
+        g_apScheduler->FeedLinkTxEnd(linkId);
+    }
+    for (auto& staScheduler : g_staSchedulers) {
+        if (staScheduler) {
+            staScheduler->FeedLinkTxEnd(linkId);
+        }
     }
 }
 
@@ -526,9 +529,10 @@ LinkPhyTxPsduBeginCallback(uint8_t linkId,
             if (psdu && psdu->GetNMpdus() > 0)
             {
                 g_linkSuTxCount[linkId] += psdu->GetNMpdus();
+                // Feed TX attempt count to scheduler for real PER calculation
                 if (g_apScheduler) {
                     AcIndex ac = GetAcFromPsdu(psdu);
-                    g_apScheduler->FeedLinkMetrics(linkId, ac, psdu->GetSize(), psdu->GetNMpdus(), 0);
+                    g_apScheduler->FeedLinkTxAttempt(linkId, ac, psdu->GetNMpdus());
                 }
             }
         }
@@ -1549,7 +1553,7 @@ int main(int argc, char* argv[])
 
     // Estatísticas periódicas
     Simulator::Schedule(Seconds(2), &CalculateStats, sinks);
-    Simulator::Schedule(Seconds(1), &FeedLinkUtilizationToSchedulers);
+    // FeedLinkUtilizationToSchedulers removed — utilization computed internally by scheduler
     if (!g_queueOccupancyCsvPath.empty())
     {
         Simulator::Schedule(Seconds(0), &RecordQueueOccupancySample);
