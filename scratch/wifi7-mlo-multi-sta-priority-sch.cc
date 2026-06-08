@@ -40,7 +40,7 @@
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE("wifi7-mlo-multi-sta");
+NS_LOG_COMPONENT_DEFINE("wifi7-mlo-multi-sta-priority-sch");
 
 // ========== GRANULAR PACKET LOSS COUNTERS ==========
 // PHY Layer Drops
@@ -690,12 +690,13 @@ void PhyRxDropCallback(Ptr<const Packet> packet, WifiPhyRxfailureReason reason)
     uint32_t sec = static_cast<uint32_t>(Simulator::Now().GetSeconds());
     g_phyRxDropBySecond[sec]++;
 }
-
+/*
 // MAC Drop Callbacks
 void MacTxDropCallback(Ptr<const Packet> packet)
 {
     g_macTxDrop++;
 }
+*/
 
 void MacRxDropCallback(Ptr<const Packet> packet)
 {
@@ -706,6 +707,34 @@ void MacRxDropCallback(Ptr<const Packet> packet)
 void WifiQueueDropCallback(Ptr<const WifiMpdu> mpdu)
 {
     g_wifiQueueDrop++;
+}
+
+
+//NOVO
+
+void WifiQueueDropCallbackReal(AcIndex ac, Ptr<const WifiMpdu> mpdu)
+{
+    g_wifiQueueDrop++;
+    
+    // Alimenta as perdas reais para a categoria de acesso no escalonador do AP
+    if (g_apScheduler) {
+        g_apScheduler->FeedLinkDrop(0, ac);
+        g_apScheduler->FeedLinkDrop(1, ac);
+    }
+}
+
+void MacTxDropCallbackReal(uint8_t linkId, Ptr<const Packet> packet)
+{
+    g_macTxDrop++;
+    
+    // Descobre a Categoria de Acesso inspecionando o cabeçalho do pacote
+    WifiMacHeader hdr;
+    if (packet->PeekHeader(hdr) > 0 && hdr.IsQosData()) {
+        AcIndex ac = QosUtilsMapTidToAc(hdr.GetQosTid());
+        if (g_apScheduler) {
+            g_apScheduler->FeedLinkDrop(linkId, ac);
+        }
+    }
 }
 
 // Traffic Control Drop Callbacks
@@ -1263,7 +1292,8 @@ int main(int argc, char* argv[])
         apWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext("PhyTxDrop", MakeCallback(&PhyTxDropCallback));
         apWifiNetDev->GetPhy(linkId)->TraceConnectWithoutContext("PhyRxDrop", MakeCallback(&PhyRxDropCallback));
     }
-    
+
+    /*
     // MAC traces (AP) - Queue drops para cada AC
     Ptr<WifiMac> apMacPtr = apWifiNetDev->GetMac();
 
@@ -1276,6 +1306,31 @@ int main(int argc, char* argv[])
             if (queue) {
                 queue->TraceConnectWithoutContext("DropBeforeEnqueue", MakeCallback(&WifiQueueDropCallback));
                 queue->TraceConnectWithoutContext("Expired", MakeCallback(&WifiQueueDropCallback));
+            }
+        }
+    }*/
+
+    //NOVO
+    // MAC traces (AP)
+    Ptr<WifiMac> apMacPtr = apWifiNetDev->GetMac();
+    apMacPtr->TraceConnectWithoutContext("AckedMpdu", MakeCallback(&RecordLinkTrafficFromMpdu));
+
+    // Ligar o MAC TX Drop real (que faltava no teu script)
+    for (uint8_t linkId = 0; linkId < apWifiNetDev->GetNPhys(); ++linkId) {
+        apMacPtr->TraceConnectWithoutContext("MacTxDrop", 
+            MakeBoundCallback(&MacTxDropCallbackReal, linkId));
+    }
+
+    for (auto ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
+        Ptr<QosTxop> qosTxop = apMacPtr->GetQosTxop(ac);
+        if (qosTxop) {
+            Ptr<WifiMacQueue> queue = qosTxop->GetWifiMacQueue();
+            if (queue) {
+                // Passamos o 'ac' para a nova função com MakeBoundCallback
+                queue->TraceConnectWithoutContext("DropBeforeEnqueue", 
+                    MakeBoundCallback(&WifiQueueDropCallbackReal, ac));
+                queue->TraceConnectWithoutContext("Expired", 
+                    MakeBoundCallback(&WifiQueueDropCallbackReal, ac));
             }
         }
     }

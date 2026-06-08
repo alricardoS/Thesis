@@ -45,7 +45,7 @@ struct AcTargets {
     double minThroughputMbps; // Min desired throughput (Mbps)
 };
 
-const double MAX_QUEUE_LENGTH = 1000.0;
+const double MAX_QUEUE_LENGTH = 500.0;
 const double MAX_DELAY = 100.0;
 const double MAX_HOL_DELAY = 100.0;
 const double MAX_THROUGHPUT = 150.0;
@@ -163,6 +163,8 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
 
   private:
     static int GetFrequencyRank(int frequency);
+    //NOVO
+    std::map<uint64_t, double> m_packetEnqueueTimes;
     
     // QoS Evaluation Engine
     double ComputeLinkScore(uint8_t linkId, AcIndex ac) const;
@@ -504,6 +506,7 @@ QosWeightedMloScheduler::HasToDropBeforeEnqueue(AcIndex ac, Ptr<WifiMpdu> mpdu)
     return droppedMpdu;
 }
 
+/*
 inline void
 QosWeightedMloScheduler::NotifyEnqueue(AcIndex ac, Ptr<WifiMpdu> mpdu)
 {
@@ -529,7 +532,39 @@ QosWeightedMloScheduler::NotifyEnqueue(AcIndex ac, Ptr<WifiMpdu> mpdu)
         }
     }
 }
+*/
 
+inline void
+QosWeightedMloScheduler::NotifyEnqueue(AcIndex ac, Ptr<WifiMpdu> mpdu)
+{
+    EnsureDelegate();
+    m_delegate->NotifyEnqueue(ac, mpdu);
+    
+    double nowMs = Simulator::Now().GetMilliSeconds();
+    
+    // Guardar o tempo real de entrada através do UID único do pacote
+    if (mpdu && mpdu->GetPacket()) {
+        m_packetEnqueueTimes[mpdu->GetPacket()->GetUid()] = nowMs;
+    }
+    
+    Ptr<WifiMac> mac = GetMac();
+    if (mac) {
+        Ptr<QosTxop> qosTxop = mac->GetQosTxop(ac);
+        if (qosTxop) {
+            Ptr<WifiMacQueue> queue = qosTxop->GetWifiMacQueue();
+            if (queue) {
+                for (auto& [linkId, acMap] : m_metrics) {
+                    acMap[static_cast<uint8_t>(ac)].queueLength = queue->GetNPackets();
+                    acMap[static_cast<uint8_t>(ac)].queueBytes = queue->GetNBytes();
+                    acMap[static_cast<uint8_t>(ac)].enqueueCount++;
+                    acMap[static_cast<uint8_t>(ac)].lastEnqueueTimeMs = nowMs;
+                }
+            }
+        }
+    }
+}
+
+/*
 inline void
 QosWeightedMloScheduler::NotifyDequeue(AcIndex ac, const std::list<Ptr<WifiMpdu>>& mpdus)
 {
@@ -551,6 +586,45 @@ QosWeightedMloScheduler::NotifyDequeue(AcIndex ac, const std::list<Ptr<WifiMpdu>
             acState.packetsSent += 1;
             
             // Consume credit per packet transmitted
+            m_credits[static_cast<uint8_t>(ac)] = std::max(0.0, m_credits[static_cast<uint8_t>(ac)] - 1.0);
+        }
+    }
+}
+*/
+
+inline void
+QosWeightedMloScheduler::NotifyDequeue(AcIndex ac, const std::list<Ptr<WifiMpdu>>& mpdus)
+{
+    EnsureDelegate();
+    m_delegate->NotifyDequeue(ac, mpdus);
+    
+    double nowMs = Simulator::Now().GetMilliSeconds();
+    auto& acState = m_acStates[static_cast<uint8_t>(ac)];
+    
+    for (const auto& mpdu : mpdus) {
+        if (mpdu && mpdu->GetPacket()) {
+            uint64_t uid = mpdu->GetPacket()->GetUid();
+            auto it = m_packetEnqueueTimes.find(uid);
+            
+            // Se o pacote estava registado calculamos o atraso exato
+            if (it != m_packetEnqueueTimes.end()) {
+                double packetDelay = nowMs - it->second;
+                m_packetEnqueueTimes.erase(it);
+                
+                // Média Móvel (EWMA) para suavizar variações bruscas
+                acState.averageDelay = (acState.averageDelay == 0.0) ? packetDelay : 
+                                       (0.8 * acState.averageDelay + 0.2 * packetDelay);
+                
+                for (auto& [linkId, acMap] : m_metrics) {
+                    auto& metrics = acMap[static_cast<uint8_t>(ac)];
+                    metrics.lastDequeueTimeMs = nowMs;
+                    metrics.avgQueueDelay = (metrics.avgQueueDelay == 0.0) ? packetDelay : 
+                                            (0.8 * metrics.avgQueueDelay + 0.2 * packetDelay);
+                }
+            }
+            
+            acState.bytesSent += mpdu->GetSize();
+            acState.packetsSent += 1;
             m_credits[static_cast<uint8_t>(ac)] = std::max(0.0, m_credits[static_cast<uint8_t>(ac)] - 1.0);
         }
     }
@@ -625,6 +699,7 @@ QosWeightedMloScheduler::UtilityFunction(double value, double target, bool lower
     }
 }
 
+/*
 inline double
 QosWeightedMloScheduler::ComputeLinkScore(uint8_t linkId, AcIndex ac) const
 {
@@ -680,6 +755,67 @@ QosWeightedMloScheduler::ComputeLinkScore(uint8_t linkId, AcIndex ac) const
     } else {
         score = 0.40 * ThNorm + 0.25 * Qnorm + 0.20 * UtilNorm + 0.10 * PerNorm + 0.05 * DelayNorm; // Default to BE
         // Default doesn't apply fairness/starvation boosts unless explicitly AC_BE
+    }
+                   
+    return score;
+}
+*/
+
+inline double
+QosWeightedMloScheduler::ComputeLinkScore(uint8_t linkId, AcIndex ac) const
+{
+    auto linkIt = m_metrics.find(linkId);
+    if (linkIt == m_metrics.end()) return 0.0;
+    
+    auto acIt = linkIt->second.find(static_cast<uint8_t>(ac));
+    if (acIt == linkIt->second.end()) return 0.5;
+    
+    const auto& metrics = acIt->second;
+    
+    auto targetIt = m_targets.find(static_cast<uint8_t>(ac));
+    if (targetIt == m_targets.end()) return 0.5;
+    const auto& targets = targetIt->second;
+    
+    double DelayUtil = UtilityFunction(metrics.avgQueueDelay, targets.maxDelayMs, true);
+    double PerUtil = UtilityFunction(metrics.packetErrorRate, targets.maxLossRate, true);
+    double ThUtil = UtilityFunction(metrics.achievedThroughput, targets.minThroughputMbps, false);
+    
+    double Qnorm = std::min(1.0, metrics.queueLength / MAX_QUEUE_LENGTH);
+    double UtilNorm = std::min(1.0, metrics.channelUtilization);
+    double HolNorm = std::min(1.0, metrics.holDelay / MAX_HOL_DELAY);
+
+    double score = 0.0;
+    
+    if (ac == AC_VO) {
+        score = 0.40 * (1.0 - DelayUtil) + 0.30 * HolNorm + 0.15 * (1.0 - PerUtil) + 0.10 * Qnorm + 0.05 * UtilNorm;
+    } else if (ac == AC_VI) {
+        score = 0.30 * (1.0 - DelayUtil) + 0.20 * (1.0 - PerUtil) + 0.10 * Qnorm + 0.10 * UtilNorm + 0.30 * (1.0 - ThUtil);
+    } else if (ac == AC_BE) {
+        double originalScore = 0.40 * (1.0 - ThUtil) + 0.25 * Qnorm + 0.20 * UtilNorm + 0.10 * (1.0 - PerUtil) + 0.05 * (1.0 - DelayUtil);
+        
+        double averageDelayBE = m_acStates.at(AC_BE).averageDelay;
+        double BEStarvation = std::min(averageDelayBE / 100.0, 10.0);
+        double normStarvation = BEStarvation / 10.0;
+        
+        double normCredit = std::max(0.0, std::min(1.0, m_credits.at(AC_BE) / m_maxCredit));
+        
+        double totalThroughput = 0.0;
+        for (auto acIdx : {AC_VO, AC_VI, AC_BE, AC_BK}) {
+            totalThroughput += m_acStates.at(acIdx).throughput;
+        }
+        double currentShareBE = 0.0;
+        if (totalThroughput > 0.0) {
+            currentShareBE = m_acStates.at(AC_BE).throughput / totalThroughput;
+        }
+        double ShareDeficitBE = 0.25 - currentShareBE;
+        double FairnessBoostBE = std::max(0.0, ShareDeficitBE);
+        double normFairnessBoost = std::max(0.0, std::min(1.0, FairnessBoostBE / 0.25));
+        
+        score = originalScore - 0.30 * normStarvation - 0.20 * normCredit - 0.20 * normFairnessBoost;
+    } else if (ac == AC_BK) {
+        score = 0.40 * UtilNorm + 0.30 * Qnorm + 0.20 * (1.0 - ThUtil) + 0.10 * (1.0 - PerUtil);
+    } else {
+        score = 0.40 * (1.0 - ThUtil) + 0.25 * Qnorm + 0.20 * UtilNorm + 0.10 * (1.0 - PerUtil) + 0.05 * (1.0 - DelayUtil);
     }
                    
     return score;
@@ -828,6 +964,7 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
             // Apply real channel utilization to this AC
             metrics.channelUtilization = linkUtilization;
             
+            /*
             // Delay estimation using Little's Law (Queue Bytes / Throughput)
             if (metrics.queueBytes > 0) {
                 if (metrics.achievedThroughput > 0.001) { // 1 kbps minimum
@@ -841,6 +978,7 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
             } else {
                 metrics.avgQueueDelay = 0.0;
             }
+            */
 
             // HOL Delay Estimate (simplified)
             if (metrics.queueLength > 0) {
@@ -871,6 +1009,7 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
         }
         acState.queueLength = queuePackets;
         
+        /*
         // Calculate average delay globally using Little's Law: Delay = Queue Bytes / Throughput
         if (queueBytes > 0) {
             if (acState.throughput > 0.001) { // 1 kbps minimum
@@ -882,6 +1021,7 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
         } else {
             acState.averageDelay = 0.0;
         }
+        */
     }
     
     m_lastPeriodicUpdateTime = now;
