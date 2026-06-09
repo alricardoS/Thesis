@@ -165,6 +165,7 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     static int GetFrequencyRank(int frequency);
     //NOVO
     std::map<uint64_t, double> m_packetEnqueueTimes;
+    std::map<uint8_t, double> m_lastSelectionTimeMs;
     
     // QoS Evaluation Engine
     double ComputeLinkScore(uint8_t linkId, AcIndex ac) const;
@@ -233,19 +234,23 @@ inline QosWeightedMloScheduler::QosWeightedMloScheduler()
     
     // VO: Voice (low latency, low jitter, high reliability, throughput insensitive)
     m_weights[AC_VO] = {0.40, 0.30, 0.25, 0.05};
-    m_targets[AC_VO] = {150.0, 30.0, 0.01, 0.1}; // 150ms delay, 30ms jitter, 1% loss, 0.1 Mbps min tp
-    
+    m_targets[AC_VO] = {15.0, 5.0, 0.01, 0.1};
+    //m_targets[AC_VO] = {150.0, 30.0, 0.01, 0.1}; // 150ms delay, 30ms jitter, 1% loss, 0.1 Mbps min tp
+
     // VI: Video (low delay, low jitter, high throughput, moderate loss tolerance)
     m_weights[AC_VI] = {0.25, 0.15, 0.20, 0.40};
-    m_targets[AC_VI] = {150.0, 50.0, 0.01, 5.0}; // 150ms delay, 50ms jitter, 1% loss, 5 Mbps min tp
+    m_targets[AC_VI] = {30.0, 10.0, 0.01, 5.0};
+    //m_targets[AC_VI] = {150.0, 50.0, 0.01, 5.0}; // 150ms delay, 50ms jitter, 1% loss, 5 Mbps min tp
 
     // BE: Best effort (throughput oriented, latency/jitter tolerant)
     m_weights[AC_BE] = {0.10, 0.05, 0.15, 0.70};
-    m_targets[AC_BE] = {500.0, 200.0, 0.05, 1.0}; // 500ms delay, 200ms jitter, 5% loss, 1 Mbps min tp
+    m_targets[AC_BE] = {100.0, 50.0, 0.05, 1.0};
+   // m_targets[AC_BE] = {500.0, 200.0, 0.05, 1.0}; // 500ms delay, 200ms jitter, 5% loss, 1 Mbps min tp
 
     // BK: Background (throughput oriented, very high delay/jitter tolerance)
     m_weights[AC_BK] = {0.05, 0.05, 0.10, 0.80};
-    m_targets[AC_BK] = {1000.0, 500.0, 0.10, 0.5}; // 1000ms delay, 500ms jitter, 10% loss, 0.5 Mbps min tp
+    m_targets[AC_BK] = {300.0, 100.0, 0.10, 0.5};
+    //m_targets[AC_BK] = {1000.0, 500.0, 0.10, 0.5}; // 1000ms delay, 500ms jitter, 10% loss, 0.5 Mbps min tp
 
     m_credits[AC_VO] = 0.0;
     m_credits[AC_VI] = 0.0;
@@ -821,6 +826,9 @@ QosWeightedMloScheduler::ComputeLinkScore(uint8_t linkId, AcIndex ac) const
     return score;
 }
 
+/*
+//ORIGINAL
+
 inline uint8_t
 QosWeightedMloScheduler::SelectBestLink(AcIndex ac, const std::list<uint8_t>& eligibleLinks)
 {
@@ -885,6 +893,135 @@ QosWeightedMloScheduler::SelectBestLink(AcIndex ac, const std::list<uint8_t>& el
     if (m_csvEnabled && m_decisionCsv.is_open()) {
         double now = Simulator::Now().GetSeconds();
         auto& metrics = m_metrics[bestLink][static_cast<uint8_t>(ac)];
+        
+        double starvation = 0.0;
+        double credit = 0.0;
+        double fairnessBoost = 0.0;
+        if (ac == AC_BE) {
+            double averageDelayBE = m_acStates.at(AC_BE).averageDelay;
+            starvation = std::min(averageDelayBE / 100.0, 10.0);
+            credit = m_credits.at(AC_BE);
+            
+            double totalThroughput = 0.0;
+            for (auto acIdx : {AC_VO, AC_VI, AC_BE, AC_BK}) {
+                totalThroughput += m_acStates.at(acIdx).throughput;
+            }
+            double currentShareBE = 0.0;
+            if (totalThroughput > 0.0) {
+                currentShareBE = m_acStates.at(AC_BE).throughput / totalThroughput;
+            }
+            fairnessBoost = std::max(0.0, 0.25 - currentShareBE);
+        }
+        
+        m_decisionCsv << now << "," << m_nodeContext << "," << +ac << ","
+                      << +bestLink << "," << bestScore << ","
+                      << metrics.queueLength << "," << metrics.avgQueueDelay << ","
+                      << metrics.holDelay << "," << metrics.packetErrorRate << ","
+                      << metrics.averageSinr << "," << metrics.achievedThroughput << ","
+                      << metrics.channelUtilization << ","
+                      << starvation << "," << credit << "," << fairnessBoost << "\n";
+    }
+    
+    return bestLink;
+}*/
+
+inline uint8_t
+QosWeightedMloScheduler::SelectBestLink(AcIndex ac, const std::list<uint8_t>& eligibleLinks)
+{
+    if (eligibleLinks.empty())
+    {
+        return m_slowLinkId;
+    }
+    if (eligibleLinks.size() == 1)
+    {
+        m_lastSelectedLink[static_cast<uint8_t>(ac)] = eligibleLinks.front();
+        m_metrics[eligibleLinks.front()][static_cast<uint8_t>(ac)].packetsAssigned++;
+        return eligibleLinks.front();
+    }
+
+    double nowMs = Simulator::Now().GetMilliSeconds();
+    uint8_t acIndex = static_cast<uint8_t>(ac);
+
+    // Define o tempo de bloqueio de forma dinamica consoante a categoria
+    double lockDurationMs = 0; // Valor por omissao 3.0
+
+    
+    if (ac == AC_VO) {
+        lockDurationMs = 2.0;  // Voz precisa de pular rapidamente se o link falhar
+    } else if (ac == AC_VI) {
+        lockDurationMs = 4.0;  // Video permite uma ligeira espera para agregar mais
+    } else if (ac == AC_BE) {
+        lockDurationMs = 24.0; // Best Effort pode esperar bastante para criar agregacoes massivas
+    } else if (ac == AC_BK) {
+        lockDurationMs = 20.0; // Background tem foco total na eficiencia e ignorar o atraso
+    }
+    
+
+    // Bloqueio temporal para permitir agregacao A MPDU
+    if (m_lastSelectionTimeMs.find(acIndex) != m_lastSelectionTimeMs.end()) {
+        if (nowMs - m_lastSelectionTimeMs[acIndex] < lockDurationMs) {
+            auto lastIt = m_lastSelectedLink.find(acIndex);
+            if (lastIt != m_lastSelectedLink.end()) {
+                uint8_t lockedLink = lastIt->second;
+                if (std::find(eligibleLinks.begin(), eligibleLinks.end(), lockedLink) != eligibleLinks.end()) {
+                    m_metrics[lockedLink][acIndex].packetsAssigned++;
+                    return lockedLink;
+                }
+            }
+        }
+    }
+    
+
+    uint8_t bestLink = eligibleLinks.front();
+    double bestScore = std::numeric_limits<double>::max();
+    
+    uint64_t totalPacketsAssigned = 0;
+    for (uint8_t linkId : eligibleLinks) {
+        totalPacketsAssigned += m_metrics[linkId][acIndex].packetsAssigned;
+    }
+
+    std::map<uint8_t, double> finalScores;
+
+    for (uint8_t linkId : eligibleLinks) {
+        double score = ComputeLinkScore(linkId, ac);
+
+        double loadPenalty = 0.0;
+        if (totalPacketsAssigned > 0) {
+            loadPenalty = static_cast<double>(m_metrics[linkId][acIndex].packetsAssigned) / totalPacketsAssigned;
+        }
+
+        double finalScore = score + 0.05 * loadPenalty;
+        finalScores[linkId] = finalScore;
+
+        if (finalScore < bestScore) {
+            bestScore = finalScore;
+            bestLink = linkId;
+        }
+    }
+    
+    bool switched = false;
+    
+    auto lastIt = m_lastSelectedLink.find(acIndex);
+    if (lastIt != m_lastSelectedLink.end()) {
+        uint8_t lastLink = lastIt->second;
+        if (std::find(eligibleLinks.begin(), eligibleLinks.end(), lastLink) != eligibleLinks.end()) {
+            double lastScore = finalScores[lastLink];
+            if (bestScore > lastScore * (1.0 - 0.05)) { 
+                bestLink = lastLink;
+                bestScore = lastScore; 
+            } else {
+                switched = true;
+            }
+        }
+    }
+    
+    m_lastSelectedLink[acIndex] = bestLink;
+    m_lastSelectionTimeMs[acIndex] = nowMs;
+    m_metrics[bestLink][acIndex].packetsAssigned++;
+    
+    if (m_csvEnabled && m_decisionCsv.is_open()) {
+        double now = Simulator::Now().GetSeconds();
+        auto& metrics = m_metrics[bestLink][acIndex];
         
         double starvation = 0.0;
         double credit = 0.0;
