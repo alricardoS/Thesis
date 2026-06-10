@@ -49,7 +49,6 @@ const double MAX_QUEUE_LENGTH = 500.0;
 const double MAX_DELAY = 100.0;
 const double MAX_HOL_DELAY = 100.0;
 const double MAX_THROUGHPUT = 150.0;
-const double MAX_SINR = 50.0;
 
 // Internal metric counters and statistics per (link, AC)
 struct LinkState {
@@ -186,7 +185,7 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     std::map<uint8_t, AcTargets> m_targets;
     
     // Scheduler control variables
-    double m_metricsIntervalSec{0.5};
+    double m_metricsIntervalSec{0.5}; // 500 ms periodic metrics update
     double m_lastPeriodicUpdateTime{0.0};
     EventId m_updateEvent;
     double m_hysteresisThreshold{0.10}; // 10% hysteresis
@@ -199,12 +198,7 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
 
     // AC State and credit variables for anti-starvation & fairness
     std::map<uint8_t, AcState> m_acStates;
-    std::map<uint8_t, double> m_credits;
     std::map<uint8_t, uint64_t> m_lastAcBytesSent;
-    double m_maxCredit{200.0};
-    EventId m_creditEvent;
-    double m_creditIntervalSec{0.1}; // 100 ms
-    void UpdateCreditSystem();
     
     // Per-link airtime tracking for real channel utilization
     std::map<uint8_t, Time> m_linkTxStartTime;    // timestamp of last PhyTxBegin per link
@@ -234,28 +228,23 @@ inline QosWeightedMloScheduler::QosWeightedMloScheduler()
     
     // VO: Voice (low latency, low jitter, high reliability, throughput insensitive)
     m_weights[AC_VO] = {0.40, 0.30, 0.25, 0.05};
-    m_targets[AC_VO] = {15.0, 5.0, 0.01, 0.1};
+    m_targets[AC_VO] = {15.0, 1.0, 0.01, 150.0};
     //m_targets[AC_VO] = {150.0, 30.0, 0.01, 0.1}; // 150ms delay, 30ms jitter, 1% loss, 0.1 Mbps min tp
 
     // VI: Video (low delay, low jitter, high throughput, moderate loss tolerance)
     m_weights[AC_VI] = {0.25, 0.15, 0.20, 0.40};
-    m_targets[AC_VI] = {30.0, 10.0, 0.01, 5.0};
+    m_targets[AC_VI] = {30.0, 10.0, 0.01, 150.0};
     //m_targets[AC_VI] = {150.0, 50.0, 0.01, 5.0}; // 150ms delay, 50ms jitter, 1% loss, 5 Mbps min tp
 
     // BE: Best effort (throughput oriented, latency/jitter tolerant)
     m_weights[AC_BE] = {0.10, 0.05, 0.15, 0.70};
-    m_targets[AC_BE] = {100.0, 50.0, 0.05, 1.0};
+    m_targets[AC_BE] = {200.0, 50.0, 0.2, 150.0};
    // m_targets[AC_BE] = {500.0, 200.0, 0.05, 1.0}; // 500ms delay, 200ms jitter, 5% loss, 1 Mbps min tp
 
     // BK: Background (throughput oriented, very high delay/jitter tolerance)
     m_weights[AC_BK] = {0.05, 0.05, 0.10, 0.80};
-    m_targets[AC_BK] = {300.0, 100.0, 0.10, 0.5};
+    m_targets[AC_BK] = {300.0, 100.0, 0.10, 150.0};
     //m_targets[AC_BK] = {1000.0, 500.0, 0.10, 0.5}; // 1000ms delay, 500ms jitter, 10% loss, 0.5 Mbps min tp
-
-    m_credits[AC_VO] = 0.0;
-    m_credits[AC_VI] = 0.0;
-    m_credits[AC_BE] = 0.0;
-    m_credits[AC_BK] = 0.0;
 
     m_acStates[AC_VO] = {0, 0.0, 0.0, 0, 0};
     m_acStates[AC_VI] = {0, 0.0, 0.0, 0, 0};
@@ -325,7 +314,7 @@ QosWeightedMloScheduler::EnableDecisionCsv(const std::string& filename, const st
     // Write header if new file
     if (m_decisionCsv.is_open() && m_decisionCsv.tellp() == std::streampos(0))
     {
-        m_decisionCsv << "Timestamp,NodeContext,AC,SelectedLink,Score,QueueLength,QueueDelay,HolDelay,PER,SINR,Throughput,Utilization,Starvation,Credit,FairnessBoost\n";
+        m_decisionCsv << "Timestamp,NodeContext,AC,SelectedLink,Score,QueueLength,QueueDelay,HolDelay,PER,SINR,Throughput,Utilization\n";
     }
 }
 
@@ -392,11 +381,6 @@ QosWeightedMloScheduler::SetWifiMac(Ptr<WifiMac> mac)
         m_lastPeriodicUpdateTime = Simulator::Now().GetSeconds();
         m_updateEvent = Simulator::Schedule(Seconds(m_metricsIntervalSec), 
                                             &QosWeightedMloScheduler::UpdatePeriodicMetrics, this);
-    }
-    // Setup periodic credit updates in simulator
-    if (!m_creditEvent.IsPending()) {
-        m_creditEvent = Simulator::Schedule(Seconds(m_creditIntervalSec), 
-                                            &QosWeightedMloScheduler::UpdateCreditSystem, this);
     }
 }
 
@@ -630,7 +614,6 @@ QosWeightedMloScheduler::NotifyDequeue(AcIndex ac, const std::list<Ptr<WifiMpdu>
             
             acState.bytesSent += mpdu->GetSize();
             acState.packetsSent += 1;
-            m_credits[static_cast<uint8_t>(ac)] = std::max(0.0, m_credits[static_cast<uint8_t>(ac)] - 1.0);
         }
     }
 }
@@ -655,9 +638,6 @@ QosWeightedMloScheduler::DoDispose()
 {
     if (m_updateEvent.IsPending()) {
         m_updateEvent.Cancel();
-    }
-    if (m_creditEvent.IsPending()) {
-        m_creditEvent.Cancel();
     }
     m_metrics.clear();
     m_delegate = nullptr;
@@ -783,7 +763,16 @@ QosWeightedMloScheduler::ComputeLinkScore(uint8_t linkId, AcIndex ac) const
     
     double DelayUtil = UtilityFunction(metrics.avgQueueDelay, targets.maxDelayMs, true);
     double PerUtil = UtilityFunction(metrics.packetErrorRate, targets.maxLossRate, true);
-    double ThUtil = UtilityFunction(metrics.achievedThroughput, targets.minThroughputMbps, false);
+
+    // === NOVA ABORDAGEM: ESTIMATIVA DO DÉBITO POTENCIAL ===
+    double estimatedThroughput = metrics.achievedThroughput;
+    if (estimatedThroughput < 0.001) {
+        // Se a nossa categoria nao usa este link calculamos a velocidade que a antena conseguiria oferecer
+        // Um canal totalmente livre permite atingir o limite maximo definido na simulação
+        estimatedThroughput = MAX_THROUGHPUT * (1.0 - metrics.channelUtilization);
+    }
+
+    double ThUtil = UtilityFunction(estimatedThroughput, targets.minThroughputMbps, false);
     
     double Qnorm = std::min(1.0, metrics.queueLength / MAX_QUEUE_LENGTH);
     double UtilNorm = std::min(1.0, metrics.channelUtilization);
@@ -796,27 +785,7 @@ QosWeightedMloScheduler::ComputeLinkScore(uint8_t linkId, AcIndex ac) const
     } else if (ac == AC_VI) {
         score = 0.30 * (1.0 - DelayUtil) + 0.20 * (1.0 - PerUtil) + 0.10 * Qnorm + 0.10 * UtilNorm + 0.30 * (1.0 - ThUtil);
     } else if (ac == AC_BE) {
-        double originalScore = 0.40 * (1.0 - ThUtil) + 0.25 * Qnorm + 0.20 * UtilNorm + 0.10 * (1.0 - PerUtil) + 0.05 * (1.0 - DelayUtil);
-        
-        double averageDelayBE = m_acStates.at(AC_BE).averageDelay;
-        double BEStarvation = std::min(averageDelayBE / 100.0, 10.0);
-        double normStarvation = BEStarvation / 10.0;
-        
-        double normCredit = std::max(0.0, std::min(1.0, m_credits.at(AC_BE) / m_maxCredit));
-        
-        double totalThroughput = 0.0;
-        for (auto acIdx : {AC_VO, AC_VI, AC_BE, AC_BK}) {
-            totalThroughput += m_acStates.at(acIdx).throughput;
-        }
-        double currentShareBE = 0.0;
-        if (totalThroughput > 0.0) {
-            currentShareBE = m_acStates.at(AC_BE).throughput / totalThroughput;
-        }
-        double ShareDeficitBE = 0.25 - currentShareBE;
-        double FairnessBoostBE = std::max(0.0, ShareDeficitBE);
-        double normFairnessBoost = std::max(0.0, std::min(1.0, FairnessBoostBE / 0.25));
-        
-        score = originalScore - 0.30 * normStarvation - 0.20 * normCredit - 0.20 * normFairnessBoost;
+        score = 0.40 * (1.0 - ThUtil) + 0.25 * Qnorm + 0.20 * UtilNorm + 0.10 * (1.0 - PerUtil) + 0.05 * (1.0 - DelayUtil);
     } else if (ac == AC_BK) {
         score = 0.40 * UtilNorm + 0.30 * Qnorm + 0.20 * (1.0 - ThUtil) + 0.10 * (1.0 - PerUtil);
     } else {
@@ -925,6 +894,8 @@ QosWeightedMloScheduler::SelectBestLink(AcIndex ac, const std::list<uint8_t>& el
     return bestLink;
 }*/
 
+/*
+// With temporal locking
 inline uint8_t
 QosWeightedMloScheduler::SelectBestLink(AcIndex ac, const std::list<uint8_t>& eligibleLinks)
 {
@@ -1053,6 +1024,83 @@ QosWeightedMloScheduler::SelectBestLink(AcIndex ac, const std::list<uint8_t>& el
     
     return bestLink;
 }
+*/
+
+inline uint8_t
+QosWeightedMloScheduler::SelectBestLink(AcIndex ac, const std::list<uint8_t>& eligibleLinks)
+{
+    if (eligibleLinks.empty()) {
+        return m_slowLinkId;
+    }
+    if (eligibleLinks.size() == 1) {
+        m_lastSelectedLink[static_cast<uint8_t>(ac)] = eligibleLinks.front();
+        m_metrics[eligibleLinks.front()][static_cast<uint8_t>(ac)].packetsAssigned++;
+        return eligibleLinks.front();
+    }
+
+    uint8_t acIndex = static_cast<uint8_t>(ac);
+    double currentScore = std::numeric_limits<double>::max();
+    double alternativeScore = std::numeric_limits<double>::max();
+    
+    uint8_t currentLink = eligibleLinks.front();
+    uint8_t alternativeLink = eligibleLinks.back();
+
+    bool hasAnchor = false;
+    auto lastIt = m_lastSelectedLink.find(acIndex);
+    
+    // Verifica se ja temos um link ancorado para esta categoria
+    if (lastIt != m_lastSelectedLink.end()) {
+        hasAnchor = true;
+        currentLink = lastIt->second;
+        
+        for (uint8_t link : eligibleLinks) {
+            if (link != currentLink) {
+                alternativeLink = link;
+                break;
+            }
+        }
+    }
+
+    currentScore = ComputeLinkScore(currentLink, ac);
+    uint8_t finalLink = currentLink;
+    double finalScore = currentScore;
+    
+    if (!hasAnchor) {
+        alternativeScore = ComputeLinkScore(alternativeLink, ac);
+        if (alternativeScore < currentScore) {
+            finalLink = alternativeLink;
+            finalScore = alternativeScore;
+        }
+    } else {
+        // Se a pontuacao do link atual ultrapassar a barreira de dor de 3 decimas
+        if (currentScore >= 0.2) {
+            alternativeScore = ComputeLinkScore(alternativeLink, ac);
+
+            // Exigimos 33 por cento de melhoria real para efetivar a mudanca de fluxo
+            if (alternativeScore < (currentScore * 0.70)) {
+                finalLink = alternativeLink;
+                finalScore = alternativeScore;
+            }
+        }
+    }
+
+    m_lastSelectedLink[acIndex] = finalLink;
+    m_metrics[finalLink][acIndex].packetsAssigned++;
+    
+    if (m_csvEnabled && m_decisionCsv.is_open()) {
+        double now = Simulator::Now().GetSeconds();
+        auto& metrics = m_metrics[finalLink][acIndex];
+        
+        m_decisionCsv << now << "," << m_nodeContext << "," << +ac << ","
+                      << +finalLink << "," << finalScore << ","
+                      << metrics.queueLength << "," << metrics.avgQueueDelay << ","
+                      << metrics.holDelay << "," << metrics.packetErrorRate << ","
+                      << metrics.averageSinr << "," << metrics.achievedThroughput << ","
+                      << metrics.channelUtilization << "\n";
+    }
+    
+    return finalLink;
+}
 
 inline void
 QosWeightedMloScheduler::UpdatePeriodicMetrics()
@@ -1180,24 +1228,6 @@ QosWeightedMloScheduler::PrintFinalScores()
         }
         std::cout << "\n";
     }
-}
-
-inline void
-QosWeightedMloScheduler::UpdateCreditSystem()
-{
-    m_credits[AC_VO] += 1.0;
-    m_credits[AC_VI] += 2.0;
-    m_credits[AC_BE] += 4.0;
-    m_credits[AC_BK] += 2.0;
-
-    for (auto ac : {AC_VO, AC_VI, AC_BE, AC_BK}) {
-        if (m_credits[ac] > m_maxCredit) {
-            m_credits[ac] = m_maxCredit;
-        }
-    }
-
-    m_creditEvent = Simulator::Schedule(Seconds(m_creditIntervalSec),
-                                        &QosWeightedMloScheduler::UpdateCreditSystem, this);
 }
 
 // Installation Helper function
