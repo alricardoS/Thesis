@@ -132,14 +132,19 @@ Time g_frameDistributionEndTime;
 // Global flag to enable/disable the traffic-aware link-selection wrapper.
 bool g_useCustomMloScheduler = true;
 
+// Goal-Oriented scheduler thresholds
+double g_stayThreshold      = 0.85; // stay if currentSatisfaction >= this
+double g_migrationThreshold = 0.15; // migrate only if expectedGain > this
+
 Ptr<QosWeightedMloScheduler> g_apScheduler;
-std::vector<Ptr<QosWeightedMloScheduler>> g_staSchedulers;
+// STAs use the default FcfsWifiQueueScheduler (AP-only scope for goal-oriented scheduler)
+// std::vector<Ptr<QosWeightedMloScheduler>> g_staSchedulers; // removed — STAs use FCFS
 std::string g_schedulerDecisionCsvPath = "";
 
 // Default QoS Weights (Delay, Jitter, Loss, Throughput)
 double g_voDelayWeight = 0.40; double g_voJitterWeight = 0.30; double g_voLossWeight = 0.25; double g_voTpWeight = 0.05;
 double g_viDelayWeight = 0.25; double g_viJitterWeight = 0.15; double g_viLossWeight = 0.20; double g_viTpWeight = 0.40;
-double g_beDelayWeight = 0.10; double g_beJitterWeight = 0.05; double g_beLossWeight = 0.15; double g_beTpWeight = 0.70;
+double g_beDelayWeight = 0.20; double g_beJitterWeight = 0.05; double g_beLossWeight = 0.15; double g_beTpWeight = 0.60;
 double g_bkDelayWeight = 0.05; double g_bkJitterWeight = 0.05; double g_bkLossWeight = 0.10; double g_bkTpWeight = 0.80;
 
 std::string
@@ -466,15 +471,11 @@ LinkPhyTxBeginCallback(uint8_t linkId, Ptr<const Packet> packet, double txPowerW
     UpdateLinkActivityAccounting();
     g_linkTxDepth[linkId]++;
 
-    // Feed airtime start to scheduler for real channel utilization
+    // Feed airtime start to AP scheduler for real channel utilization
     if (g_apScheduler) {
         g_apScheduler->FeedLinkTxStart(linkId);
     }
-    for (auto& staScheduler : g_staSchedulers) {
-        if (staScheduler) {
-            staScheduler->FeedLinkTxStart(linkId);
-        }
-    }
+    // STAs use FCFS — no feed needed
 }
 
 void
@@ -486,15 +487,11 @@ LinkPhyTxEndCallback(uint8_t linkId, Ptr<const Packet> packet)
         g_linkTxDepth[linkId]--;
     }
 
-    // Feed airtime end to scheduler for real channel utilization
+    // Feed airtime end to AP scheduler for real channel utilization
     if (g_apScheduler) {
         g_apScheduler->FeedLinkTxEnd(linkId);
     }
-    for (auto& staScheduler : g_staSchedulers) {
-        if (staScheduler) {
-            staScheduler->FeedLinkTxEnd(linkId);
-        }
-    }
+    // STAs use FCFS — no feed needed
 }
 
 void
@@ -522,17 +519,44 @@ LinkPhyTxPsduBeginCallback(uint8_t linkId,
     }
     else
     {
-        // Count frames (MPDUs) instead of transmissions (PPDUs)
         for (const auto& kv : psduMap)
         {
             Ptr<const WifiPsdu> psdu = kv.second;
             if (psdu && psdu->GetNMpdus() > 0)
             {
                 g_linkSuTxCount[linkId] += psdu->GetNMpdus();
-                // Feed TX attempt count to scheduler for real PER calculation
+                AcIndex ac = GetAcFromPsdu(psdu);
+
                 if (g_apScheduler) {
-                    AcIndex ac = GetAcFromPsdu(psdu);
+                    // Phase 2: Feed PHY state so LinkCapabilityEngine can compute
+                    // estimatedCapacity = dataRate * (1 - PER). Use current PER
+                    // from the last window (not known yet for this TX — use 0 as
+                    // initial proxy; real PER is updated via FeedLinkTxAttempt +
+                    // FeedLinkMetrics in AckedMpdu).
                     g_apScheduler->FeedLinkTxAttempt(linkId, ac, psdu->GetNMpdus());
+                    g_apScheduler->FeedLinkPhyState(linkId, txVector, 0.0);
+
+                    // Phase 3: Feed packet transmitted (bytes + airtime proxy).
+                    // Airtime = PSDU duration; ns-3 3.47 exposes txVector.GetPpduDuration
+                    // only on EhtPpdu — use a conservative proxy from the PSDU size
+                    // and data rate instead.
+                    double dataRateMbps = 1.0;
+                    try {
+                        dataRateMbps = txVector.GetMode().GetDataRate(txVector) / 1e6;
+                    } catch (...) {}
+                    if (dataRateMbps < 0.001) dataRateMbps = 1.0;
+
+                    uint32_t psduBytes = psdu->GetSize();
+                    double   airtimeSec = (psduBytes * 8.0) / (dataRateMbps * 1e6);
+
+                    // Use first MPDU's header for peer/tid
+                    const WifiMacHeader& hdr = psdu->GetHeader(0);
+                    std::ostringstream peerSs;
+                    peerSs << hdr.GetAddr1();
+                    uint8_t tid = hdr.IsQosData() ? hdr.GetQosTid() : 0;
+
+                    g_apScheduler->FeedPacketTransmitted(
+                        linkId, ac, psduBytes, airtimeSec, peerSs.str(), tid);
                 }
             }
         }
@@ -723,7 +747,7 @@ void WifiQueueDropCallbackReal(AcIndex ac, Ptr<const WifiMpdu> mpdu)
     }
 }
 
-void MacTxDropCallbackReal(uint8_t linkId, Ptr<const Packet> packet)
+void MacTxDropCallbackReal(Ptr<const Packet> packet)
 {
     g_macTxDrop++;
     
@@ -732,7 +756,8 @@ void MacTxDropCallbackReal(uint8_t linkId, Ptr<const Packet> packet)
     if (packet->PeekHeader(hdr) > 0 && hdr.IsQosData()) {
         AcIndex ac = QosUtilsMapTidToAc(hdr.GetQosTid());
         if (g_apScheduler) {
-            g_apScheduler->FeedLinkDrop(linkId, ac);
+            g_apScheduler->FeedLinkDrop(0, ac);
+            g_apScheduler->FeedLinkDrop(1, ac);
         }
     }
 }
@@ -1078,6 +1103,8 @@ int main(int argc, char* argv[])
     cmd.AddValue("frameDistributionCsv", "CSV file for link frame distribution samples", frameDistributionCsvPath);
     cmd.AddValue("useCustomMloScheduler", "Enable custom MLO scheduler (VO/VI prefer fast link, BE/BK prefer slow link)", g_useCustomMloScheduler);
     cmd.AddValue("schedulerDecisionCsv", "CSV file for scheduler decisions", g_schedulerDecisionCsvPath);
+    cmd.AddValue("stayThreshold", "Satisfaction index above which the AP scheduler keeps the current link (0..1)", g_stayThreshold);
+    cmd.AddValue("migrationThreshold", "Minimum satisfaction gain required to trigger link migration (0..1)", g_migrationThreshold);
     cmd.AddValue("voDelayWeight", "VO Delay Weight", g_voDelayWeight);
     cmd.AddValue("voJitterWeight", "VO Jitter Weight", g_voJitterWeight);
     cmd.AddValue("voLossWeight", "VO Loss Weight", g_voLossWeight);
@@ -1316,10 +1343,8 @@ int main(int argc, char* argv[])
     apMacPtr->TraceConnectWithoutContext("AckedMpdu", MakeCallback(&RecordLinkTrafficFromMpdu));
 
     // Ligar o MAC TX Drop real (que faltava no teu script)
-    for (uint8_t linkId = 0; linkId < apWifiNetDev->GetNPhys(); ++linkId) {
-        apMacPtr->TraceConnectWithoutContext("MacTxDrop", 
-            MakeBoundCallback(&MacTxDropCallbackReal, linkId));
-    }
+    apMacPtr->TraceConnectWithoutContext("MacTxDrop", 
+        MakeCallback(&MacTxDropCallbackReal));
 
     for (auto ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
         Ptr<QosTxop> qosTxop = apMacPtr->GetQosTxop(ac);
@@ -1420,54 +1445,48 @@ int main(int argc, char* argv[])
         NS_LOG_UNCOND("Static ML association and Block ACK configured for " << g_numStas << " STAs on both links");
     }
 
-    // ===== APPLY QoS-AWARE WEIGHTED MLO SCHEDULER =====
-    // Install the wrapper on both AP and STAs so the link is chosen per MPDU.
+    // ===== APPLY QoS-AWARE GOAL-ORIENTED MLO SCHEDULER (AP ONLY) =====
+    // STAs use the default FcfsWifiQueueScheduler — goal-oriented logic is AP-only (downlink).
     if (g_useCustomMloScheduler)
     {
-        NS_LOG_UNCOND("===== MLO QoS-AWARE WEIGHTED SCHEDULER ENABLED =====");
-        NS_LOG_UNCOND("Policy: Dynamic weighted scoring per AC based on real-world requirements");
-        NS_LOG_UNCOND("Weights: VO(delay=0.45, jitter=0.30, loss=0.20, tp=0.05)");
-        NS_LOG_UNCOND("         VI(delay=0.25, jitter=0.20, loss=0.20, tp=0.35)");
+        NS_LOG_UNCOND("===== MLO GOAL-ORIENTED SCHEDULER ENABLED (AP only) =====");
+        NS_LOG_UNCOND("Policy: Goal-Oriented QoS satisfaction with 5 internal engines");
+        NS_LOG_UNCOND("Thresholds: StayThreshold=" << g_stayThreshold
+                      << " MigrationThreshold=" << g_migrationThreshold);
+        NS_LOG_UNCOND("Weights: VO(delay=0.40, jitter=0.30, loss=0.25, tp=0.05)");
+        NS_LOG_UNCOND("         VI(delay=0.25, jitter=0.15, loss=0.20, tp=0.40)");
         NS_LOG_UNCOND("         BE(delay=0.10, jitter=0.05, loss=0.15, tp=0.70)");
         NS_LOG_UNCOND("         BK(delay=0.05, jitter=0.05, loss=0.10, tp=0.80)");
-        
+
         Ptr<WifiNetDevice> apWifiDev = DynamicCast<WifiNetDevice>(apDev.Get(0));
         g_apScheduler = InstallQosWeightedScheduler(apWifiDev->GetMac(), freq1, freq2);
         if (g_apScheduler) {
+            // Set decision thresholds
+            g_apScheduler->SetAttribute("StayThreshold",
+                                        DoubleValue(g_stayThreshold));
+            g_apScheduler->SetAttribute("MigrationThreshold",
+                                        DoubleValue(g_migrationThreshold));
+
+            // QoS weights
             g_apScheduler->SetWeights(AC_VO, g_voDelayWeight, g_voJitterWeight, g_voLossWeight, g_voTpWeight);
             g_apScheduler->SetWeights(AC_VI, g_viDelayWeight, g_viJitterWeight, g_viLossWeight, g_viTpWeight);
             g_apScheduler->SetWeights(AC_BE, g_beDelayWeight, g_beJitterWeight, g_beLossWeight, g_beTpWeight);
             g_apScheduler->SetWeights(AC_BK, g_bkDelayWeight, g_bkJitterWeight, g_bkLossWeight, g_bkTpWeight);
+
             if (!g_schedulerDecisionCsvPath.empty()) {
                 g_apScheduler->EnableDecisionCsv(g_schedulerDecisionCsvPath, "AP");
             }
         }
 
-        // Apply the same policy to every STA MAC.
-        for (uint32_t i = 0; i < staDev.GetN(); ++i)
-        {
-            Ptr<WifiNetDevice> staWifiNetDev = DynamicCast<WifiNetDevice>(staDev.Get(i));
-                if (staWifiNetDev)
-                {
-                    Ptr<QosWeightedMloScheduler> staScheduler = InstallQosWeightedScheduler(staWifiNetDev->GetMac(), freq1, freq2);
-                    if (staScheduler) {
-                        staScheduler->SetWeights(AC_VO, g_voDelayWeight, g_voJitterWeight, g_voLossWeight, g_voTpWeight);
-                        staScheduler->SetWeights(AC_VI, g_viDelayWeight, g_viJitterWeight, g_viLossWeight, g_viTpWeight);
-                        staScheduler->SetWeights(AC_BE, g_beDelayWeight, g_beJitterWeight, g_beLossWeight, g_beTpWeight);
-                        staScheduler->SetWeights(AC_BK, g_bkDelayWeight, g_bkJitterWeight, g_bkLossWeight, g_bkTpWeight);
-                        if (!g_schedulerDecisionCsvPath.empty()) {
-                            staScheduler->EnableDecisionCsv(g_schedulerDecisionCsvPath, "STA" + std::to_string(i));
-                        }
-                        g_staSchedulers.push_back(staScheduler);
-                    }
-                }
-        }
-        NS_LOG_UNCOND("QoS-aware Weighted MLO scheduler installation complete (dynamic scoring with hysteresis)");
+        // STAs: use default FCFS scheduler (no custom installation needed;
+        // FcfsWifiQueueScheduler is already the ns-3 default).
+        NS_LOG_UNCOND("STAs: using default FcfsWifiQueueScheduler (AP-only scope)");
+        NS_LOG_UNCOND("Goal-Oriented MLO scheduler installation complete (AP only)");
     }
     else
     {
-        NS_LOG_UNCOND("===== MLO QoS-AWARE WEIGHTED SCHEDULER DISABLED =====");
-        NS_LOG_UNCOND("Using the default ns-3 FCFS scheduler");
+        NS_LOG_UNCOND("===== MLO GOAL-ORIENTED SCHEDULER DISABLED =====");
+        NS_LOG_UNCOND("Using the default ns-3 FCFS scheduler on all nodes");
     }
 
 

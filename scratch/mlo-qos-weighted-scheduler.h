@@ -1,9 +1,15 @@
 /*
- * QoS-Aware Weighted Metrics MLO Scheduler.
+ * Goal-Oriented Traffic-Aware MLO Scheduler
  *
- * This scheduler monitors metrics (throughput, delay, jitter, loss) for each link
- * and Access Category (AC) in real-time. It uses dynamic weighted scoring based on
- * real-world QoS targets to select the optimal transmission link.
+ * Evolução do QosWeightedMloScheduler para um scheduler orientado a objetivos QoS,
+ * com cinco motores internos:
+ *   1. Goal-Awareness Engine      — ComputeQosSatisfaction por AC
+ *   2. Link Capability Engine     — estimatedCapacity, availableCapacity, capabilityScore
+ *   3. Traffic Composition Engine — throughput/airtime/flows por (link, AC)
+ *   4. EDCA Competition Engine    — CompetitionPressure, ExpectedAccessOpportunity
+ *   5. Migration Decision Engine  — DecideLinkMigration com histerese e Best-Achievable
+ *
+ * Escopo: AP-only (downlink). STAs usam FcfsWifiQueueScheduler.
  */
 #ifndef MLO_QOS_WEIGHTED_SCHEDULER_H
 #define MLO_QOS_WEIGHTED_SCHEDULER_H
@@ -14,6 +20,8 @@
 #include "ns3/wifi-mac.h"
 #include "ns3/qos-txop.h"
 #include "ns3/wifi-mac-queue.h"
+#include "ns3/wifi-tx-vector.h"
+#include "ns3/wifi-mode.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,6 +29,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <cmath>
 #include <iostream>
 #include <fstream>
@@ -29,63 +38,136 @@
 namespace ns3
 {
 
-// QoS metrics weights for each Access Category
+// ---------------------------------------------------------------------------
+// QoS weights per AC (used in satisfaction aggregation)
+// ---------------------------------------------------------------------------
 struct AcWeights {
-    double delayWeight;       // Weight of latency/delay
-    double jitterWeight;      // Weight of delay variation (jitter)
-    double lossWeight;        // Weight of packet drops/loss
-    double throughputWeight;  // Weight of throughput
+    double delayWeight{0.30};
+    double jitterWeight{0.05};
+    double lossWeight{0.30};
+    double throughputWeight{0.35};  //ALTEREI ESTAVAM TODOS A 0.25
 };
 
-// Real-world QoS targets/requirements for each Access Category
-struct AcTargets {
-    double maxDelayMs;        // Max acceptable delay (ms) - ITU-T G.114
-    double maxJitterMs;       // Max acceptable jitter (ms)
-    double maxLossRate;       // Max acceptable packet loss rate (ratio 0-1)
-    double minThroughputMbps; // Min desired throughput (Mbps)
+// ---------------------------------------------------------------------------
+// Phase 1 — Goal-Awareness Engine structures
+// ---------------------------------------------------------------------------
+
+/// QoS goals (targets) per Access Category
+struct AcGoals {
+    double targetThroughputMbps{150.0};
+    double maxDelayMs{100.0};
+    double maxJitterMs{5.0};
+    double maxPacketLoss{0.05};
 };
 
-const double MAX_QUEUE_LENGTH = 500.0;
-const double MAX_DELAY = 100.0;
-const double MAX_HOL_DELAY = 100.0;
-const double MAX_THROUGHPUT = 150.0;
-
-// Internal metric counters and statistics per (link, AC)
-struct LinkState {
-    uint32_t queueLength{0};
-    double avgQueueDelay{0.0};
-    double holDelay{0.0};
-    double packetErrorRate{0.0};
-    double retransmissionRate{0.0};
-    double channelUtilization{0.0};
-    double averageSinr{0.0};
-    uint8_t currentMcs{0};
-    double achievedThroughput{0.0};
-    double averageAccessDelay{0.0};
-    uint64_t packetsAssigned{0};
-
-    // Tracking variables for calculations
-    uint64_t txBytes{0};
-    uint64_t dropFrames{0};
-    uint64_t enqueueCount{0};
-    double lastEnqueueTimeMs{0.0};
-    double lastDequeueTimeMs{0.0};
-    uint32_t queueBytes{0};
-
-    // Real per-link TX tracking for PER calculation
-    uint64_t txAttempts{0};   // frames attempted (from PhyTxPsduBegin)
-    uint64_t txSuccess{0};    // frames confirmed (from AckedMpdu)
-};
-
-struct AcState
-{
-    uint32_t queueLength{0};
-    double averageDelay{0.0};
+/// Per-AC QoS satisfaction index (all values in [0,1])
+struct QosSatisfaction {
     double throughput{0.0};
-    uint64_t packetsSent{0};
-    uint64_t bytesSent{0};
+    double delay{0.0};
+    double jitter{0.0};
+    double loss{0.0};
+    double index{0.0}; ///< weighted aggregate
 };
 
+// ---------------------------------------------------------------------------
+// Phase 2 — Link Capability Engine
+// ---------------------------------------------------------------------------
+
+/// Per-link (shared across ACs) PHY capacity assessment
+struct LinkCapability {
+    double estimatedCapacityMbps{0.0};   ///< PHY rate * (1 - PER)
+    double availableCapacityMbps{0.0};   ///< estimated - occupied (sum of AC throughputs)
+    double freeAirtime{1.0};             ///< 1 - channelUtilization
+    double capabilityScore{0.0};         ///< 0..1 normalised
+};
+
+// ---------------------------------------------------------------------------
+// Phase 3 — Traffic Composition Engine
+// ---------------------------------------------------------------------------
+
+/// Per-link traffic composition (updated every metrics window)
+struct LinkTrafficComposition {
+    double voThroughputMbps{0.0};
+    double viThroughputMbps{0.0};
+    double beThroughputMbps{0.0};
+    double bkThroughputMbps{0.0};
+
+    double voAirtimeFrac{0.0};
+    double viAirtimeFrac{0.0};
+    double beAirtimeFrac{0.0};
+    double bkAirtimeFrac{0.0};
+
+    uint32_t voFlows{0};
+    uint32_t viFlows{0};
+    uint32_t beFlows{0};
+    uint32_t bkFlows{0};
+
+    // Accumulators (reset each window)
+    uint64_t voBytes{0}, viBytes{0}, beBytes{0}, bkBytes{0};
+    double   voAirtimeSec{0.0}, viAirtimeSec{0.0}, beAirtimeSec{0.0}, bkAirtimeSec{0.0};
+    std::set<std::pair<std::string, uint8_t>> voFlowSet;
+    std::set<std::pair<std::string, uint8_t>> viFlowSet;
+    std::set<std::pair<std::string, uint8_t>> beFlowSet;
+    std::set<std::pair<std::string, uint8_t>> bkFlowSet;
+};
+
+// ---------------------------------------------------------------------------
+// Phase 4 — EDCA Competition Engine
+// ---------------------------------------------------------------------------
+
+/// Per-(link, AC) EDCA competition assessment
+struct EdcaCompetition {
+    double competitionPressure{0.0};            ///< weighted load from other ACs
+    double expectedAccessOpportunity{0.0};      ///< freeAirtime / (1 + pressure)
+    double effectiveAvailableCapacityMbps{0.0}; ///< availableCapacity * opportunity
+};
+
+// ---------------------------------------------------------------------------
+// Legacy per-(link, AC) raw metric counters (kept for HOL delay and PER)
+// ---------------------------------------------------------------------------
+struct LinkState {
+    // Throughput counters (reset each window)
+    uint64_t txBytes{0};
+    uint64_t txAttempts{0};
+    uint64_t txSuccess{0};
+    uint64_t dropFrames{0};
+
+    // Queue snapshot
+    uint32_t queueLength{0};
+    uint32_t queueBytes{0};
+    uint64_t enqueueCount{0};
+    double   lastEnqueueTimeMs{0.0};
+
+    // Derived metrics (updated each window)
+    double achievedThroughputMbps{0.0};
+    double packetErrorRate{0.0};
+    double channelUtilization{0.0};
+    double holDelay{0.0};
+
+    // Average delay per packet (EWMA, updated in NotifyDequeue for correct link)
+    double avgQueueDelayMs{0.0};
+    // Jitter (EWMA of |delay_i - delay_{i-1}|)
+    double avgJitterMs{0.0};
+    double lastDelayMs{-1.0}; // -1 means no prior sample
+};
+
+// Per-AC global state (bytes sent, packets sent)
+struct AcState {
+    uint64_t bytesSent{0};
+    uint64_t packetsSent{0};
+    double   throughputMbps{0.0};
+};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const double MAX_QUEUE_LENGTH = 500.0;
+const double MAX_DELAY_MS     = 200.0; //ALETEREI era 1000
+const double MAX_THROUGHPUT   = 600.0; // Mbps (6 GHz 320 MHz 2SS EHT)
+
+// ---------------------------------------------------------------------------
+// Main scheduler class
+// ---------------------------------------------------------------------------
 class QosWeightedMloScheduler : public WifiMacQueueScheduler
 {
   public:
@@ -97,19 +179,30 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     void ConfigureForPair(int freq1, int freq2);
     void SetWifiMac(Ptr<WifiMac> mac) override;
 
-    // External interfaces for feeding metrics
-    void FeedLinkMetrics(uint8_t linkId, AcIndex ac, uint32_t txBytes, uint32_t txFrames, uint32_t dropFrames);
+    // ---- External feed APIs (called from simulation script) ----
+    void FeedLinkMetrics(uint8_t linkId, AcIndex ac, uint32_t txBytes,
+                         uint32_t txFrames, uint32_t dropFrames);
     void FeedLinkDrop(uint8_t linkId, AcIndex ac);
     void FeedLinkTxAttempt(uint8_t linkId, AcIndex ac, uint32_t frames);
     void FeedLinkTxStart(uint8_t linkId);
     void FeedLinkTxEnd(uint8_t linkId);
-    
-    // Configuration interfaces
+
+    /// Phase 2: PHY state feed (MCS, channel width, PER from PhyTxPsduBegin)
+    void FeedLinkPhyState(uint8_t linkId, const WifiTxVector& txVector, double per);
+
+    /// Phase 3: packet transmitted feed (bytes + airtime proxy + flow id)
+    void FeedPacketTransmitted(uint8_t linkId, AcIndex ac, uint32_t bytes,
+                               double airtimeSec,
+                               const std::string& peerAddress, uint8_t tid);
+
+    // ---- Configuration ----
     void EnableDecisionCsv(const std::string& filename, const std::string& nodeContext);
     void SetWeights(AcIndex ac, double delay, double jitter, double loss, double tp);
     void SetTargets(AcIndex ac, double delayMs, double jitterMs, double lossRate, double tpMbps);
+    /// Alias for SetTargets using AcGoals semantics
+    void SetGoals(AcIndex ac, double tpMbps, double delayMs, double jitterMs, double lossRate);
 
-    // Core selection interface
+    // ---- ns-3 scheduler interface ----
     std::optional<WifiContainerQueueId> GetNext(AcIndex ac,
                                                 std::optional<uint8_t> linkId,
                                                 bool skipBlockedQueues = true) override;
@@ -117,154 +210,218 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
                                                 std::optional<uint8_t> linkId,
                                                 const WifiContainerQueueId& prevQueueId,
                                                 bool skipBlockedQueues = true) override;
-    
-    // Core Link Selection Decision
     std::list<uint8_t> GetLinkIds(AcIndex ac,
                                   Ptr<const WifiMpdu> mpdu,
                                   const std::list<WifiQueueBlockedReason>& ignoredReasons = {}) override;
 
-    // Delegations to FCFS Wifi Queue Scheduler delegate
-    void BlockQueues(WifiQueueBlockedReason reason,
-                     AcIndex ac,
+    void BlockQueues(WifiQueueBlockedReason reason, AcIndex ac,
                      const std::list<WifiContainerQueueType>& types,
-                     const Mac48Address& rxAddress,
-                     const Mac48Address& txAddress,
+                     const Mac48Address& rxAddress, const Mac48Address& txAddress,
                      const std::set<uint8_t>& tids = {},
                      const std::set<uint8_t>& linkIds = {}) override;
-    void UnblockQueues(WifiQueueBlockedReason reason,
-                       AcIndex ac,
+    void UnblockQueues(WifiQueueBlockedReason reason, AcIndex ac,
                        const std::list<WifiContainerQueueType>& types,
-                       const Mac48Address& rxAddress,
-                       const Mac48Address& txAddress,
+                       const Mac48Address& rxAddress, const Mac48Address& txAddress,
                        const std::set<uint8_t>& tids = {},
                        const std::set<uint8_t>& linkIds = {}) override;
     void BlockAllQueues(WifiQueueBlockedReason reason,
-                         const std::set<uint8_t>& linkIds = {}) override;
+                        const std::set<uint8_t>& linkIds = {}) override;
     void UnblockAllQueues(WifiQueueBlockedReason reason,
-                           const std::set<uint8_t>& linkIds = {}) override;
+                          const std::set<uint8_t>& linkIds = {}) override;
     bool GetAllQueuesBlockedOnLink(uint8_t linkId,
-                                   WifiQueueBlockedReason reason = WifiQueueBlockedReason::REASONS_COUNT) override;
+                                   WifiQueueBlockedReason reason =
+                                       WifiQueueBlockedReason::REASONS_COUNT) override;
     std::optional<Mask> GetQueueLinkMask(AcIndex ac,
                                          const WifiContainerQueueId& queueId,
                                          uint8_t linkId) override;
 
-    // Dynamic metrics collection points
     Ptr<WifiMpdu> HasToDropBeforeEnqueue(AcIndex ac, Ptr<WifiMpdu> mpdu) override;
     void NotifyEnqueue(AcIndex ac, Ptr<WifiMpdu> mpdu) override;
     void NotifyDequeue(AcIndex ac, const std::list<Ptr<WifiMpdu>>& mpdus) override;
     void NotifyRemove(AcIndex ac, const std::list<Ptr<WifiMpdu>>& mpdus) override;
 
-    // Debugging
     void PrintFinalScores();
 
   protected:
     void DoDispose() override;
 
   private:
+    // ---- Internal helpers ----
     static int GetFrequencyRank(int frequency);
-    //NOVO
-    std::map<uint64_t, double> m_packetEnqueueTimes;
-    std::map<uint8_t, double> m_lastSelectionTimeMs;
-    
-    // QoS Evaluation Engine
-    double ComputeLinkScore(uint8_t linkId, AcIndex ac) const;
-    double UtilityFunction(double value, double target, bool lowerIsBetter) const;
-    uint8_t SelectBestLink(AcIndex ac, const std::list<uint8_t>& eligibleLinks);
-    
-    // Periodic update function for window-based metrics (throughput, drop rate)
-    void UpdatePeriodicMetrics();
     void EnsureDelegate();
 
+    /// Sigmoid utility: maps value/target to [0,1]
+    double UtilityFunction(double value, double target, bool lowerIsBetter) const;
+
+    // ---- Phase 1: Goal-Awareness Engine ----
+    /// Compute QoS satisfaction for AC on the given link using current metrics
+    QosSatisfaction ComputeQosSatisfaction(AcIndex ac, uint8_t linkId) const;
+    /// Returns the weighted satisfaction index for AC on its current link
+    double CurrentQosSatisfaction(AcIndex ac) const;
+
+    // ---- Phase 2: Link Capability Engine ----
+    void UpdateLinkCapability(uint8_t linkId, double dt);
+
+    // ---- Phase 3: Traffic Composition Engine ----
+    void UpdateTrafficComposition(uint8_t linkId, double dt);
+
+    // ---- Phase 4: EDCA Competition Engine ----
+    void UpdateEdcaCompetition(uint8_t linkId);
+    /// Normalised load of ac on link (airtime fraction)
+    double NormalisedLoad(AcIndex ac, uint8_t linkId) const;
+
+    // ---- Phase 5+6: Migration Decision Engine ----
+    /// Expected QoS satisfaction if AC were placed on linkId
+    double ComputeExpectedQosSatisfaction(AcIndex ac, uint8_t linkId) const;
+    /// Returns true if any link can meet goals for AC
+    bool AnyLinkMeetsGoals(AcIndex ac, const std::list<uint8_t>& links) const;
+    /// Best-achievable score when no link meets goals (used as tiebreaker)
+    double ComputeBestAchievableScore(AcIndex ac, uint8_t linkId) const;
+    /// Main decision function — replaces SelectBestLink
+    uint8_t DecideLinkMigration(AcIndex ac, const std::list<uint8_t>& eligibleLinks);
+
+    // ---- Periodic update ----
+    void UpdatePeriodicMetrics();
+
+    // ---- Delegate (FCFS) ----
     Ptr<WifiMacQueueScheduler> m_delegate;
-    
-    // Internal metrics table: linkId -> (ac -> metrics)
+
+    // ---- Raw metrics: linkId -> (acIndex -> LinkState) ----
     std::map<uint8_t, std::map<uint8_t, LinkState>> m_metrics;
 
-    // QoS parameters per AC
-    std::map<uint8_t, AcWeights> m_weights;
-    std::map<uint8_t, AcTargets> m_targets;
-    
-    // Scheduler control variables
-    double m_metricsIntervalSec{0.5}; // 500 ms periodic metrics update
-    double m_lastPeriodicUpdateTime{0.0};
-    EventId m_updateEvent;
-    double m_hysteresisThreshold{0.10}; // 10% hysteresis
+    // ---- Packet enqueue timestamps for accurate delay ----
+    std::map<uint64_t, double> m_packetEnqueueTimes; // uid -> enqueue time (ms)
+    /// Which link was last selected per AC (for per-link delay attribution)
     std::map<uint8_t, uint8_t> m_lastSelectedLink;
 
+    // ---- Phase 1 state ----
+    std::map<uint8_t, AcGoals>        m_goals;         // per AC (indexed by AcIndex cast to uint8)
+    std::map<uint8_t, AcWeights>      m_weights;
+    std::map<uint8_t, QosSatisfaction> m_currentSatisfaction; // per AC, current link
+
+    // ---- Phase 2 state ----
+    std::map<uint8_t, LinkCapability> m_linkCapability; // per link
+    // PHY accumulators per link (EWMA of last MCS / PER)
+    struct PhyAccumulator {
+        double ewmaDataRateMbps{0.0};
+        double ewmaPer{0.0};
+        bool   valid{false};
+    };
+    std::map<uint8_t, PhyAccumulator> m_phyState;
+
+    // ---- Phase 3 state ----
+    std::map<uint8_t, LinkTrafficComposition> m_traffic; // per link
+
+    // ---- Phase 4 state ----
+    std::map<uint8_t, std::map<uint8_t, EdcaCompetition>> m_edca; // link -> ac -> EdcaCompetition
+
+    // EDCA competition weights: weight[candidate_ac][other_ac]
+    // Rows: VO=3, VI=2, BE=1, BK=0
+    double m_edcaWeights[4][4] = {
+        // other: BK    BE    VI    VO
+        {0.0,  0.5,  2.0,  5.0}, // candidate BK  //ALTEREI era 0.4
+        {0.5,  1.0,  2.0,  6.0}, // candidate BE  //ALTEREI era 0.4
+        {0.25, 0.5,  1.0,  2.0}, // candidate VI
+        {0.0,  0.05, 0.25, 1.0}  // candidate VO
+    };
+
+    // ---- Per-AC global state ----
+    std::map<uint8_t, AcState>   m_acStates;
+    std::map<uint8_t, uint64_t>  m_lastAcBytesSent;
+
+    // ---- Airtime tracking for channel utilisation ----
+    std::map<uint8_t, Time>     m_linkTxStartTime;
+    std::map<uint8_t, double>   m_linkBusyTime;
+    std::map<uint8_t, uint32_t> m_linkTxDepth;
+
+    // ---- Decision thresholds ----
+    double m_stayThreshold{0.85};       // stay if currentSatisfaction >= this
+    double m_migrationThreshold{0.15};  // migrate if expectedGain > this
+    double m_metricsIntervalSec{0.5};
+    double m_lastPeriodicUpdateTime{0.0};
+    EventId m_updateEvent;
+
+    // ---- Link identity ----
     uint8_t m_slowLinkId{0};
     uint8_t m_fastLinkId{1};
     int m_freq1{5};
     int m_freq2{6};
 
-    // AC State and credit variables for anti-starvation & fairness
-    std::map<uint8_t, AcState> m_acStates;
-    std::map<uint8_t, uint64_t> m_lastAcBytesSent;
-    
-    // Per-link airtime tracking for real channel utilization
-    std::map<uint8_t, Time> m_linkTxStartTime;    // timestamp of last PhyTxBegin per link
-    std::map<uint8_t, double> m_linkBusyTime;      // accumulated busy time (seconds) per link
-    std::map<uint8_t, uint32_t> m_linkTxDepth;     // TX depth counter per link
+    // ---- Legacy targets alias (for SetTargets backward compat) ----
+    // Maps 1:1 with m_goals
+    std::map<uint8_t, AcGoals>& m_targets{m_goals}; // same map, alias
 
-    // Logging
+    // ---- Logging ----
     std::ofstream m_decisionCsv;
-    std::string m_nodeContext;
-    bool m_csvEnabled{false};
+    std::string   m_nodeContext;
+    bool          m_csvEnabled{false};
 };
 
+// ===========================================================================
+// TypeId
+// ===========================================================================
 inline TypeId
 QosWeightedMloScheduler::GetTypeId()
 {
-    static TypeId tid = TypeId("ns3::QosWeightedMloScheduler")
-                            .SetParent<WifiMacQueueScheduler>()
-                            .SetGroupName("Wifi")
-                            .AddConstructor<QosWeightedMloScheduler>();
+    static TypeId tid =
+        TypeId("ns3::QosWeightedMloScheduler")
+            .SetParent<WifiMacQueueScheduler>()
+            .SetGroupName("Wifi")
+            .AddConstructor<QosWeightedMloScheduler>()
+            .AddAttribute("StayThreshold",
+                          "Satisfaction index above which the current link is kept",
+                          DoubleValue(0.85),
+                          MakeDoubleAccessor(&QosWeightedMloScheduler::m_stayThreshold),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("MigrationThreshold",
+                          "Minimum gain in expected satisfaction required to trigger migration",
+                          DoubleValue(0.15),
+                          MakeDoubleAccessor(&QosWeightedMloScheduler::m_migrationThreshold),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("MetricsInterval",
+                          "Periodic metrics update interval (s)",
+                          DoubleValue(0.5),
+                          MakeDoubleAccessor(&QosWeightedMloScheduler::m_metricsIntervalSec),
+                          MakeDoubleChecker<double>(0.05, 10.0));
     return tid;
 }
 
-inline QosWeightedMloScheduler::QosWeightedMloScheduler()
+// ===========================================================================
+// Constructor / Destructor
+// ===========================================================================
+inline
+QosWeightedMloScheduler::QosWeightedMloScheduler()
     : m_delegate(CreateObject<FcfsWifiQueueScheduler>())
 {
-    // Define standard weights based on real-world QoS specifications
-    
-    // VO: Voice (low latency, low jitter, high reliability, throughput insensitive)
+    // ---- Default goals per AC ----
+    m_goals[AC_VO] = {150.0, 15.0,  0.0,  0.01};  //ALTEREI a loss
+    m_goals[AC_VI] = {150.0, 30.0, 0.0,  0.01};  //ALTEREI a loss
+    m_goals[AC_BE] = {150.0, 200.0, 0.0, 0.10};  //ALTEREI a loss
+    m_goals[AC_BK] = {150.0, 300.0, 100.0, 0.10};
+
+    // ---- Default weights per AC ----
     m_weights[AC_VO] = {0.40, 0.30, 0.25, 0.05};
-    m_targets[AC_VO] = {15.0, 1.0, 0.01, 150.0};
-    //m_targets[AC_VO] = {150.0, 30.0, 0.01, 0.1}; // 150ms delay, 30ms jitter, 1% loss, 0.1 Mbps min tp
-
-    // VI: Video (low delay, low jitter, high throughput, moderate loss tolerance)
     m_weights[AC_VI] = {0.25, 0.15, 0.20, 0.40};
-    m_targets[AC_VI] = {30.0, 10.0, 0.01, 150.0};
-    //m_targets[AC_VI] = {150.0, 50.0, 0.01, 5.0}; // 150ms delay, 50ms jitter, 1% loss, 5 Mbps min tp
-
-    // BE: Best effort (throughput oriented, latency/jitter tolerant)
-    m_weights[AC_BE] = {0.10, 0.05, 0.15, 0.70};
-    m_targets[AC_BE] = {200.0, 50.0, 0.2, 150.0};
-   // m_targets[AC_BE] = {500.0, 200.0, 0.05, 1.0}; // 500ms delay, 200ms jitter, 5% loss, 1 Mbps min tp
-
-    // BK: Background (throughput oriented, very high delay/jitter tolerance)
+    m_weights[AC_BE] = {0.20, 0.05, 0.15, 0.60};
     m_weights[AC_BK] = {0.05, 0.05, 0.10, 0.80};
-    m_targets[AC_BK] = {300.0, 100.0, 0.10, 150.0};
-    //m_targets[AC_BK] = {1000.0, 500.0, 0.10, 0.5}; // 1000ms delay, 500ms jitter, 10% loss, 0.5 Mbps min tp
 
-    m_acStates[AC_VO] = {0, 0.0, 0.0, 0, 0};
-    m_acStates[AC_VI] = {0, 0.0, 0.0, 0, 0};
-    m_acStates[AC_BE] = {0, 0.0, 0.0, 0, 0};
-    m_acStates[AC_BK] = {0, 0.0, 0.0, 0, 0};
-
-    m_lastAcBytesSent[AC_VO] = 0;
-    m_lastAcBytesSent[AC_VI] = 0;
-    m_lastAcBytesSent[AC_BE] = 0;
-    m_lastAcBytesSent[AC_BK] = 0;
-}
-
-inline QosWeightedMloScheduler::~QosWeightedMloScheduler()
-{
-    if (m_decisionCsv.is_open())
-    {
-        m_decisionCsv.close();
+    // ---- Init AC state ----
+    for (auto ac : {AC_VO, AC_VI, AC_BE, AC_BK}) {
+        m_acStates[static_cast<uint8_t>(ac)] = {};
+        m_lastAcBytesSent[static_cast<uint8_t>(ac)] = 0;
+        m_currentSatisfaction[static_cast<uint8_t>(ac)] = {};
     }
 }
 
+inline
+QosWeightedMloScheduler::~QosWeightedMloScheduler()
+{
+    if (m_decisionCsv.is_open()) m_decisionCsv.close();
+}
+
+// ===========================================================================
+// Setup
+// ===========================================================================
 inline void
 QosWeightedMloScheduler::ConfigureForPair(int freq1, int freq2)
 {
@@ -272,59 +429,97 @@ QosWeightedMloScheduler::ConfigureForPair(int freq1, int freq2)
     m_freq2 = freq2;
     const int rank1 = GetFrequencyRank(freq1);
     const int rank2 = GetFrequencyRank(freq2);
+    m_fastLinkId = (rank1 >= rank2) ? 0 : 1;
+    m_slowLinkId = (rank1 >= rank2) ? 1 : 0;
 
-    if (rank1 >= rank2)
-    {
-        m_fastLinkId = 0;
-        m_slowLinkId = 1;
-    }
-    else
-    {
-        m_fastLinkId = 1;
-        m_slowLinkId = 0;
-    }
-    
-    // Initialize metrics maps
     for (uint8_t linkId : {m_slowLinkId, m_fastLinkId}) {
         for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
-            m_metrics[linkId][static_cast<uint8_t>(ac)] = LinkState();
+            m_metrics[linkId][static_cast<uint8_t>(ac)] = LinkState{};
+        }
+        m_linkCapability[linkId] = LinkCapability{};
+        m_traffic[linkId]        = LinkTrafficComposition{};
+        m_phyState[linkId]       = PhyAccumulator{};
+        m_linkBusyTime[linkId]   = 0.0;
+        m_linkTxDepth[linkId]    = 0;
+        for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
+            m_edca[linkId][static_cast<uint8_t>(ac)] = EdcaCompetition{};
         }
     }
 }
 
 inline void
-QosWeightedMloScheduler::SetWeights(AcIndex ac, double delay, double jitter, double loss, double tp)
+QosWeightedMloScheduler::SetWifiMac(Ptr<WifiMac> mac)
+{
+    WifiMacQueueScheduler::SetWifiMac(mac);
+    EnsureDelegate();
+    m_delegate->SetWifiMac(mac);
+
+    if (!m_updateEvent.IsPending()) {
+        m_lastPeriodicUpdateTime = Simulator::Now().GetSeconds();
+        m_updateEvent = Simulator::Schedule(
+            Seconds(m_metricsIntervalSec),
+            &QosWeightedMloScheduler::UpdatePeriodicMetrics, this);
+    }
+}
+
+inline void
+QosWeightedMloScheduler::EnsureDelegate()
+{
+    if (!m_delegate) m_delegate = CreateObject<FcfsWifiQueueScheduler>();
+}
+
+// ===========================================================================
+// Configuration
+// ===========================================================================
+inline void
+QosWeightedMloScheduler::SetWeights(AcIndex ac, double delay, double jitter,
+                                    double loss, double tp)
 {
     m_weights[static_cast<uint8_t>(ac)] = {delay, jitter, loss, tp};
 }
 
 inline void
-QosWeightedMloScheduler::SetTargets(AcIndex ac, double delayMs, double jitterMs, double lossRate, double tpMbps)
+QosWeightedMloScheduler::SetTargets(AcIndex ac, double delayMs, double jitterMs,
+                                    double lossRate, double tpMbps)
 {
-    m_targets[static_cast<uint8_t>(ac)] = {delayMs, jitterMs, lossRate, tpMbps};
+    // Map legacy SetTargets call to AcGoals
+    m_goals[static_cast<uint8_t>(ac)] = {tpMbps, delayMs, jitterMs, lossRate};
 }
 
 inline void
-QosWeightedMloScheduler::EnableDecisionCsv(const std::string& filename, const std::string& nodeContext)
+QosWeightedMloScheduler::SetGoals(AcIndex ac, double tpMbps, double delayMs,
+                                   double jitterMs, double lossRate)
 {
-    m_csvEnabled = true;
+    m_goals[static_cast<uint8_t>(ac)] = {tpMbps, delayMs, jitterMs, lossRate};
+}
+
+inline void
+QosWeightedMloScheduler::EnableDecisionCsv(const std::string& filename,
+                                            const std::string& nodeContext)
+{
+    m_csvEnabled  = true;
     m_nodeContext = nodeContext;
     m_decisionCsv.open(filename, std::ios::out | std::ios::app);
-    
-    // Write header if new file
-    if (m_decisionCsv.is_open() && m_decisionCsv.tellp() == std::streampos(0))
-    {
-        m_decisionCsv << "Timestamp,NodeContext,AC,SelectedLink,Score,QueueLength,QueueDelay,HolDelay,PER,SINR,Throughput,Utilization\n";
+    if (m_decisionCsv.is_open() && m_decisionCsv.tellp() == std::streampos(0)) {
+        m_decisionCsv << "Timestamp,NodeContext,AC,SelectedLink,Decision,"
+                         "CurrentSat,ExpectedSat,CompetitionPressure,"
+                         "EffectiveCapMbps,CapabilityScore,"
+                         "AvgDelayMs,AvgJitterMs,PER,ChannelUtil,Throughput\n";
     }
 }
 
+// ===========================================================================
+// External feed APIs
+// ===========================================================================
 inline void
-QosWeightedMloScheduler::FeedLinkMetrics(uint8_t linkId, AcIndex ac, uint32_t txBytes, uint32_t txFrames, uint32_t dropFrames)
+QosWeightedMloScheduler::FeedLinkMetrics(uint8_t linkId, AcIndex ac,
+                                          uint32_t txBytes, uint32_t txFrames,
+                                          uint32_t dropFrames)
 {
-    auto& metrics = m_metrics[linkId][static_cast<uint8_t>(ac)];
-    metrics.txBytes += txBytes;
-    metrics.txSuccess += txFrames;  // confirmed frames (from AckedMpdu)
-    metrics.dropFrames += dropFrames;
+    auto& s = m_metrics[linkId][static_cast<uint8_t>(ac)];
+    s.txBytes    += txBytes;
+    s.txSuccess  += txFrames;
+    s.dropFrames += dropFrames;
 }
 
 inline void
@@ -334,7 +529,8 @@ QosWeightedMloScheduler::FeedLinkDrop(uint8_t linkId, AcIndex ac)
 }
 
 inline void
-QosWeightedMloScheduler::FeedLinkTxAttempt(uint8_t linkId, AcIndex ac, uint32_t frames)
+QosWeightedMloScheduler::FeedLinkTxAttempt(uint8_t linkId, AcIndex ac,
+                                             uint32_t frames)
 {
     m_metrics[linkId][static_cast<uint8_t>(ac)].txAttempts += frames;
 }
@@ -342,9 +538,8 @@ QosWeightedMloScheduler::FeedLinkTxAttempt(uint8_t linkId, AcIndex ac, uint32_t 
 inline void
 QosWeightedMloScheduler::FeedLinkTxStart(uint8_t linkId)
 {
-    if (m_linkTxDepth[linkId] == 0) {
+    if (m_linkTxDepth[linkId] == 0)
         m_linkTxStartTime[linkId] = Simulator::Now();
-    }
     m_linkTxDepth[linkId]++;
 }
 
@@ -360,87 +555,591 @@ QosWeightedMloScheduler::FeedLinkTxEnd(uint8_t linkId)
     }
 }
 
+// Phase 2 feed: PHY state (called from PhyTxPsduBegin)
 inline void
-QosWeightedMloScheduler::EnsureDelegate()
+QosWeightedMloScheduler::FeedLinkPhyState(uint8_t linkId,
+                                           const WifiTxVector& txVector,
+                                           double per)
 {
-    if (!m_delegate)
-    {
-        m_delegate = CreateObject<FcfsWifiQueueScheduler>();
+    double dataRateMbps = 0.0;
+    try {
+        // GetMode() gives the data MCS; GetDataRate returns bits/s
+        WifiMode mode = txVector.GetMode();
+        dataRateMbps  = mode.GetDataRate(txVector) / 1e6;
+    } catch (...) {
+        return;
+    }
+
+    auto& phy = m_phyState[linkId];
+    if (!phy.valid) {
+        phy.ewmaDataRateMbps = dataRateMbps;
+        phy.ewmaPer          = per;
+        phy.valid            = true;
+    } else {
+        constexpr double alpha = 0.4; // EWMA smoothing //ALTEREI era 0.2
+        phy.ewmaDataRateMbps = (1.0 - alpha) * phy.ewmaDataRateMbps + alpha * dataRateMbps;
+        phy.ewmaPer          = (1.0 - alpha) * phy.ewmaPer          + alpha * per;
+    }
+}
+
+// Phase 3 feed: per-packet transmitted info
+inline void
+QosWeightedMloScheduler::FeedPacketTransmitted(uint8_t linkId, AcIndex ac,
+                                                uint32_t bytes, double airtimeSec,
+                                                const std::string& peerAddress,
+                                                uint8_t tid)
+{
+    auto& tc = m_traffic[linkId];
+    auto  flowId = std::make_pair(peerAddress, tid);
+
+    switch (ac) {
+    case AC_VO:
+        tc.voBytes += bytes; tc.voAirtimeSec += airtimeSec;
+        tc.voFlowSet.insert(flowId); break;
+    case AC_VI:
+        tc.viBytes += bytes; tc.viAirtimeSec += airtimeSec;
+        tc.viFlowSet.insert(flowId); break;
+    case AC_BE:
+        tc.beBytes += bytes; tc.beAirtimeSec += airtimeSec;
+        tc.beFlowSet.insert(flowId); break;
+    case AC_BK:
+        tc.bkBytes += bytes; tc.bkAirtimeSec += airtimeSec;
+        tc.bkFlowSet.insert(flowId); break;
+    default: break;
+    }
+}
+
+// ===========================================================================
+// Utility function (sigmoid)
+// ===========================================================================
+inline double
+QosWeightedMloScheduler::UtilityFunction(double value, double target,
+                                          bool lowerIsBetter) const
+{
+    if (target <= 0.0) return 0.5;
+    double ratio = value / target;
+    if (lowerIsBetter)
+        return 1.0 / (1.0 + std::exp(5.0 * (ratio - 1.0)));
+    else
+        return 1.0 / (1.0 + std::exp(5.0 * (1.0 - ratio)));
+}
+
+// ===========================================================================
+// Phase 1 — Goal-Awareness Engine
+// ===========================================================================
+inline QosSatisfaction
+QosWeightedMloScheduler::ComputeQosSatisfaction(AcIndex ac, uint8_t linkId) const
+{
+    QosSatisfaction sat{};
+    uint8_t acIdx = static_cast<uint8_t>(ac);
+
+    auto gIt = m_goals.find(acIdx);
+    auto wIt = m_weights.find(acIdx);
+    if (gIt == m_goals.end() || wIt == m_weights.end()) return sat;
+
+    const AcGoals&   g = gIt->second;
+    const AcWeights& w = wIt->second;
+
+    // Fetch per-(link, AC) metrics
+    auto lIt = m_metrics.find(linkId);
+    if (lIt == m_metrics.end()) return sat;
+    auto aIt = lIt->second.find(acIdx);
+    if (aIt == lIt->second.end()) return sat;
+    const LinkState& m = aIt->second;
+
+    sat.throughput = UtilityFunction(m.achievedThroughputMbps, g.targetThroughputMbps, false);
+    sat.delay      = UtilityFunction(m.avgQueueDelayMs,         g.maxDelayMs,           true);
+    sat.jitter     = UtilityFunction(m.avgJitterMs,             g.maxJitterMs,           true);
+    sat.loss       = UtilityFunction(m.packetErrorRate,         g.maxPacketLoss,         true);
+
+    double totalW  = w.throughputWeight + w.delayWeight + w.jitterWeight + w.lossWeight;
+    if (totalW <= 0.0) totalW = 1.0;
+
+    sat.index = (w.throughputWeight * sat.throughput
+               + w.delayWeight      * sat.delay
+               + w.jitterWeight     * sat.jitter
+               + w.lossWeight       * sat.loss) / totalW;
+
+    return sat;
+}
+
+inline double
+QosWeightedMloScheduler::CurrentQosSatisfaction(AcIndex ac) const
+{
+    uint8_t acIdx = static_cast<uint8_t>(ac);
+    auto it = m_currentSatisfaction.find(acIdx);
+    if (it == m_currentSatisfaction.end()) return 0.0;
+    return it->second.index;
+}
+
+// ===========================================================================
+// Phase 2 — Link Capability Engine
+// ===========================================================================
+inline void
+QosWeightedMloScheduler::UpdateLinkCapability(uint8_t linkId, double dt)
+{
+    auto& cap = m_linkCapability[linkId];
+    auto& phy = m_phyState[linkId];
+
+    // Estimated capacity from PHY state
+    if (phy.valid) {
+        cap.estimatedCapacityMbps = phy.ewmaDataRateMbps * (1.0 - phy.ewmaPer);
+    } else {
+        // Fallback: use static max for the band
+        cap.estimatedCapacityMbps = (linkId == m_fastLinkId) ? 400.0 : 150.0;
+    }
+
+    // Occupied capacity = sum of throughputs across all ACs on this link
+    auto& tc = m_traffic[linkId];
+    double occupied = tc.voThroughputMbps + tc.viThroughputMbps
+                    + tc.beThroughputMbps + tc.bkThroughputMbps;
+
+    cap.availableCapacityMbps = std::max(0.0, cap.estimatedCapacityMbps - occupied);
+
+    // Free airtime
+    double util = 0.0;
+    if (dt > 0.0) {
+        util = std::min(1.0, m_linkBusyTime[linkId] / dt);
+    }
+    cap.freeAirtime = std::max(0.0, 1.0 - util);
+
+    // Capability score = normalised available fraction
+    cap.capabilityScore = (cap.estimatedCapacityMbps > 0.0)
+                            ? std::min(1.0, cap.availableCapacityMbps / cap.estimatedCapacityMbps)
+                            : 0.0;
+}
+
+// ===========================================================================
+// Phase 3 — Traffic Composition Engine
+// ===========================================================================
+inline void
+QosWeightedMloScheduler::UpdateTrafficComposition(uint8_t linkId, double dt)
+{
+    auto& tc = m_traffic[linkId];
+    double invDt = (dt > 0.0) ? 1.0 / dt : 0.0;
+
+    tc.voThroughputMbps = tc.voBytes * 8.0 * invDt / 1e6;
+    tc.viThroughputMbps = tc.viBytes * 8.0 * invDt / 1e6;
+    tc.beThroughputMbps = tc.beBytes * 8.0 * invDt / 1e6;
+    tc.bkThroughputMbps = tc.bkBytes * 8.0 * invDt / 1e6;
+
+    double totalAirtime = tc.voAirtimeSec + tc.viAirtimeSec
+                        + tc.beAirtimeSec + tc.bkAirtimeSec;
+    double invTA = (totalAirtime > 0.0) ? 1.0 / totalAirtime : 0.0;
+    tc.voAirtimeFrac = tc.voAirtimeSec * invTA;
+    tc.viAirtimeFrac = tc.viAirtimeSec * invTA;
+    tc.beAirtimeFrac = tc.beAirtimeSec * invTA;
+    tc.bkAirtimeFrac = tc.bkAirtimeSec * invTA;
+
+    tc.voFlows = static_cast<uint32_t>(tc.voFlowSet.size());
+    tc.viFlows = static_cast<uint32_t>(tc.viFlowSet.size());
+    tc.beFlows = static_cast<uint32_t>(tc.beFlowSet.size());
+    tc.bkFlows = static_cast<uint32_t>(tc.bkFlowSet.size());
+
+    // Reset accumulators
+    tc.voBytes = tc.viBytes = tc.beBytes = tc.bkBytes = 0;
+    tc.voAirtimeSec = tc.viAirtimeSec = tc.beAirtimeSec = tc.bkAirtimeSec = 0.0;
+    tc.voFlowSet.clear(); tc.viFlowSet.clear();
+    tc.beFlowSet.clear(); tc.bkFlowSet.clear();
+}
+
+// ===========================================================================
+// Phase 4 — EDCA Competition Engine
+// ===========================================================================
+inline double
+QosWeightedMloScheduler::NormalisedLoad(AcIndex ac, uint8_t linkId) const
+{
+    auto it = m_traffic.find(linkId);
+    if (it == m_traffic.end()) return 0.0;
+    const auto& tc = it->second;
+    switch (ac) {
+    case AC_VO: return tc.voAirtimeFrac;
+    case AC_VI: return tc.viAirtimeFrac;
+    case AC_BE: return tc.beAirtimeFrac;
+    case AC_BK: return tc.bkAirtimeFrac;
+    default:    return 0.0;
     }
 }
 
 inline void
-QosWeightedMloScheduler::SetWifiMac(Ptr<WifiMac> mac)
+QosWeightedMloScheduler::UpdateEdcaCompetition(uint8_t linkId)
 {
-    WifiMacQueueScheduler::SetWifiMac(mac);
-    EnsureDelegate();
-    m_delegate->SetWifiMac(mac);
-    
-    // Setup periodic metrics updates in simulator
-    if (!m_updateEvent.IsPending()) {
-        m_lastPeriodicUpdateTime = Simulator::Now().GetSeconds();
-        m_updateEvent = Simulator::Schedule(Seconds(m_metricsIntervalSec), 
-                                            &QosWeightedMloScheduler::UpdatePeriodicMetrics, this);
+    // Row index in m_edcaWeights: BK=0, BE=1, VI=2, VO=3
+    auto acToRow = [](AcIndex ac) -> int {
+        switch (ac) { case AC_BK: return 0; case AC_BE: return 1;
+                      case AC_VI: return 2; case AC_VO: return 3; default: return 1; }
+    };
+
+    const AcIndex allAcs[] = {AC_BK, AC_BE, AC_VI, AC_VO};
+
+    auto& capLink = m_linkCapability[linkId];
+
+    for (AcIndex candAc : allAcs) {
+        uint8_t  candIdx = static_cast<uint8_t>(candAc);
+        int      candRow = acToRow(candAc);
+        auto&    edca    = m_edca[linkId][candIdx];
+
+        double pressure = 0.0;
+        for (AcIndex otherAc : allAcs) {
+            if (otherAc == candAc) continue;
+            int otherRow = acToRow(otherAc);
+            pressure += m_edcaWeights[candRow][otherRow] * NormalisedLoad(otherAc, linkId);
+        }
+        edca.competitionPressure = pressure;
+
+        double opp = capLink.freeAirtime / (1.0 + pressure);
+        edca.expectedAccessOpportunity = std::min(1.0, std::max(0.0, opp));
+
+        edca.effectiveAvailableCapacityMbps =
+            capLink.availableCapacityMbps * edca.expectedAccessOpportunity;
     }
 }
 
+// ===========================================================================
+// Phase 5+6 — Migration Decision Engine
+// ===========================================================================
+inline double
+QosWeightedMloScheduler::ComputeExpectedQosSatisfaction(AcIndex ac,
+                                                         uint8_t linkId) const
+{
+    uint8_t  acIdx = static_cast<uint8_t>(ac);
+    auto gIt = m_goals.find(acIdx);
+    auto wIt = m_weights.find(acIdx);
+    if (gIt == m_goals.end() || wIt == m_weights.end()) return 0.0;
+    const AcGoals&   g = gIt->second;
+    const AcWeights& w = wIt->second;
+
+    // Capacity-based throughput projection
+    auto edcaIt = m_edca.find(linkId);
+    double effCap = 0.0;
+    if (edcaIt != m_edca.end()) {
+        auto acEdca = edcaIt->second.find(acIdx);
+        if (acEdca != edcaIt->second.end())
+            effCap = acEdca->second.effectiveAvailableCapacityMbps;
+    }
+    double expTp = UtilityFunction(effCap, g.targetThroughputMbps, false);
+
+    // For delay/jitter/loss: use current measured values on this link as a proxy,
+    // combined with a penalty proportional to EDCA competition pressure
+    double pressure = 0.0;
+    if (edcaIt != m_edca.end()) {
+        auto acEdca = edcaIt->second.find(acIdx);
+        if (acEdca != edcaIt->second.end())
+            pressure = acEdca->second.competitionPressure;
+    }
+
+    // Read current metrics on the target link
+    double delayMs  = 0.0, jitterMs = 0.0, per = 0.0;
+    auto lIt = m_metrics.find(linkId);
+    if (lIt != m_metrics.end()) {
+        auto aIt = lIt->second.find(acIdx);
+        if (aIt != lIt->second.end()) {
+            delayMs  = aIt->second.avgQueueDelayMs  * (1.0 + pressure * 0.3); //ALTEREI era 0.2
+            jitterMs = aIt->second.avgJitterMs       * (1.0 + pressure * 0.2);
+            per      = aIt->second.packetErrorRate;
+        }
+    }
+
+    double expDelay  = UtilityFunction(delayMs,  g.maxDelayMs,    true);
+    double expJitter = UtilityFunction(jitterMs, g.maxJitterMs,    true);
+    double expLoss   = UtilityFunction(per,      g.maxPacketLoss,  true);
+
+    // Penalise by PER and capability score
+    auto capIt = m_linkCapability.find(linkId);
+    double capScore = (capIt != m_linkCapability.end()) ? capIt->second.capabilityScore : 0.5;
+    double perPenalty = 1.0 - per; // PER already in [0,1]
+
+    double totalW = w.throughputWeight + w.delayWeight + w.jitterWeight + w.lossWeight;
+    if (totalW <= 0.0) totalW = 1.0;
+
+    double baseSat = (w.throughputWeight * expTp
+                    + w.delayWeight      * expDelay
+                    + w.jitterWeight     * expJitter
+                    + w.lossWeight       * expLoss) / totalW;
+
+    // Blend with capability and PER
+    double expectedScore = baseSat * 0.65 + capScore * 0.25 + perPenalty * 0.1; //ALTEREI era 0.8, 0.1, 0.1
+
+    // --- ALTRUISTIC PENALTY ---
+    // Se outro AC estiver a "passar fome" (starving) neste link, penalizamos o score
+    // para que este AC (e.g. VO) procure outro link, deixando espaco livre para o AC mais fraco (e.g. BE).
+    double altruisticPenalty = 0.0;
+    for (AcIndex otherAc : {AC_BK, AC_BE, AC_VI, AC_VO}) {
+        if (otherAc == ac) continue;
+        uint8_t otherAcIdx = static_cast<uint8_t>(otherAc);
+        auto lastIt = m_lastSelectedLink.find(otherAcIdx);
+        
+        // Se o outro AC estiver correntemente a usar este link como primario
+        if (lastIt != m_lastSelectedLink.end() && lastIt->second == linkId) {
+            double otherSat = m_currentSatisfaction.count(otherAcIdx) 
+                              ? m_currentSatisfaction.at(otherAcIdx).index : 1.0;
+            // Se a satisfacao do outro AC for fraca (e.g. < 0.3)
+            if (otherSat < 0.5) {
+                // Penaliza proporcionalmente a fome do outro AC (max 0.6 de penalizacao)
+                altruisticPenalty += (0.6 - otherSat);
+            }
+        }
+    }
+
+    return std::max(0.0, expectedScore - altruisticPenalty);
+}
+
+inline bool
+QosWeightedMloScheduler::AnyLinkMeetsGoals(AcIndex ac,
+                                            const std::list<uint8_t>& links) const
+{
+    for (uint8_t linkId : links) {
+        if (ComputeExpectedQosSatisfaction(ac, linkId) >= 1.0) return true;
+    }
+    return false;
+}
+
+inline double
+QosWeightedMloScheduler::ComputeBestAchievableScore(AcIndex ac,
+                                                     uint8_t linkId) const
+{
+    // Best-achievable: same as ExpectedQoS but without requiring >= 1.0
+    // (already what ComputeExpectedQosSatisfaction returns)
+    return ComputeExpectedQosSatisfaction(ac, linkId);
+}
+
+inline uint8_t
+QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac,
+                                              const std::list<uint8_t>& eligibleLinks)
+{
+    if (eligibleLinks.empty())       return m_slowLinkId;
+    if (eligibleLinks.size() == 1)   {
+        uint8_t onlyLink = eligibleLinks.front();
+        m_lastSelectedLink[static_cast<uint8_t>(ac)] = onlyLink;
+        m_metrics[onlyLink][static_cast<uint8_t>(ac)].enqueueCount++;
+        return onlyLink;
+    }
+
+    uint8_t acIdx = static_cast<uint8_t>(ac);
+
+    // Determine current link (anchor)
+    auto lastIt = m_lastSelectedLink.find(acIdx);
+    bool hasAnchor = (lastIt != m_lastSelectedLink.end())
+                  && (std::find(eligibleLinks.begin(), eligibleLinks.end(),
+                                lastIt->second) != eligibleLinks.end());
+    uint8_t currentLink = hasAnchor ? lastIt->second : eligibleLinks.front();
+
+    // ---- Phase 5: check if we can stay ----
+    double currentSat = m_currentSatisfaction.count(acIdx)
+                            ? m_currentSatisfaction.at(acIdx).index : 0.0;
+
+    std::string decision = "STAY_SATISFIED";
+    uint8_t selectedLink = currentLink;
+    double  selectedExpSat = currentSat;
+
+    if (currentSat >= m_stayThreshold && hasAnchor) {
+        // Satisfied — keep current link
+        decision = "STAY_SATISFIED";
+    } else {
+        // Need to evaluate alternatives
+        bool goalsAchievable = AnyLinkMeetsGoals(ac, eligibleLinks);
+
+        uint8_t bestLink   = currentLink;
+        double  bestScore  = goalsAchievable
+                                ? ComputeExpectedQosSatisfaction(ac, currentLink)
+                                : ComputeBestAchievableScore(ac, currentLink);
+
+        for (uint8_t linkId : eligibleLinks) {
+            double score = goalsAchievable
+                               ? ComputeExpectedQosSatisfaction(ac, linkId)
+                               : ComputeBestAchievableScore(ac, linkId);
+            if (score > bestScore) {
+                bestScore = score;
+                bestLink  = linkId;
+            }
+        }
+
+        selectedExpSat = bestScore;
+
+        if (bestLink != currentLink) {
+            double improvement = bestScore - currentSat;
+            if (improvement > m_migrationThreshold) {
+                selectedLink = bestLink;
+                decision     = "MIGRATE_GAIN";
+            } else {
+                selectedLink = currentLink;
+                decision     = "STAY_HYSTERESIS";
+            }
+        } else {
+            decision = hasAnchor ? "STAY_HYSTERESIS" : "STAY_BEST";
+        }
+    }
+
+    m_lastSelectedLink[acIdx] = selectedLink;
+    m_metrics[selectedLink][acIdx].enqueueCount++;
+
+    // ---- CSV logging ----
+    if (m_csvEnabled && m_decisionCsv.is_open()) {
+        double now = Simulator::Now().GetSeconds();
+        auto& lm   = m_metrics[selectedLink][acIdx];
+        auto& edca = m_edca[selectedLink][acIdx];
+        auto& cap  = m_linkCapability[selectedLink];
+
+        m_decisionCsv << now << ',' << m_nodeContext << ',' << +ac << ','
+                      << +selectedLink << ',' << decision << ','
+                      << currentSat << ',' << selectedExpSat << ','
+                      << edca.competitionPressure << ','
+                      << edca.effectiveAvailableCapacityMbps << ','
+                      << cap.capabilityScore << ','
+                      << lm.avgQueueDelayMs << ',' << lm.avgJitterMs << ','
+                      << lm.packetErrorRate << ',' << lm.channelUtilization << ','
+                      << lm.achievedThroughputMbps << '\n';
+    }
+
+    return selectedLink;
+}
+
+// ===========================================================================
+// Periodic metrics update (all engines)
+// ===========================================================================
+inline void
+QosWeightedMloScheduler::UpdatePeriodicMetrics()
+{
+    double now = Simulator::Now().GetSeconds();
+    double dt  = now - m_lastPeriodicUpdateTime;
+    if (dt <= 0.0) dt = m_metricsIntervalSec;
+
+    // ---- Update global AC throughput ----
+    for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
+        uint8_t acIdx = static_cast<uint8_t>(ac);
+        auto&   acSt  = m_acStates[acIdx];
+        uint64_t bytes = acSt.bytesSent - m_lastAcBytesSent[acIdx];
+        acSt.throughputMbps = (bytes * 8.0) / (dt * 1e6);
+        m_lastAcBytesSent[acIdx] = acSt.bytesSent;
+    }
+
+    for (auto& [linkId, acMap] : m_metrics) {
+        // ---- Channel utilization ----
+        double util = 0.0;
+        if (dt > 0.0) util = std::min(1.0, m_linkBusyTime[linkId] / dt);
+        // (busy time is reset inside UpdateLinkCapability after use)
+
+        for (auto& [acIdxRaw, ls] : acMap) {
+            // Throughput per (link, AC)
+            ls.achievedThroughputMbps = (ls.txBytes * 8.0) / (dt * 1e6);
+            ls.txBytes = 0;
+
+            // PER
+            if (ls.txAttempts > 0)
+                ls.packetErrorRate = 1.0 - std::min(1.0,
+                    static_cast<double>(ls.txSuccess) / ls.txAttempts);
+            else
+                ls.packetErrorRate = 0.0;
+            ls.txAttempts = 0;
+            ls.txSuccess  = 0;
+            ls.dropFrames = 0;
+            ls.enqueueCount = 0;
+
+            ls.channelUtilization = util;
+
+            // HOL delay estimate
+            if (ls.queueLength > 0) {
+                double nowMs  = Simulator::Now().GetMilliSeconds();
+                double waitMs = nowMs - ls.lastEnqueueTimeMs;
+                ls.holDelay   = std::min(waitMs, MAX_DELAY_MS);
+            } else {
+                ls.holDelay = 0.0;
+            }
+        }
+
+        // Phase 3 — traffic composition
+        UpdateTrafficComposition(linkId, dt);
+
+        // Phase 2 — link capability (uses updated traffic composition)
+        UpdateLinkCapability(linkId, dt);
+
+        // Reset busy time for next window
+        m_linkBusyTime[linkId] = 0.0;
+
+        // Phase 4 — EDCA competition
+        UpdateEdcaCompetition(linkId);
+    }
+
+    // Phase 1 — update current satisfaction for each AC on its current link
+    for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
+        uint8_t acIdx = static_cast<uint8_t>(ac);
+        auto lastIt   = m_lastSelectedLink.find(acIdx);
+        if (lastIt != m_lastSelectedLink.end()) {
+            m_currentSatisfaction[acIdx] = ComputeQosSatisfaction(ac, lastIt->second);
+        }
+    }
+
+    // Update queue lengths from MAC
+    Ptr<WifiMac> mac = GetMac();
+    if (mac) {
+        for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
+            Ptr<QosTxop> txop = mac->GetQosTxop(ac);
+            if (!txop) continue;
+            Ptr<WifiMacQueue> q = txop->GetWifiMacQueue();
+            if (!q) continue;
+            uint32_t nPkts  = q->GetNPackets();
+            uint32_t nBytes = q->GetNBytes();
+            for (auto& [linkId, acMap] : m_metrics) {
+                auto aIt = acMap.find(static_cast<uint8_t>(ac));
+                if (aIt != acMap.end()) {
+                    aIt->second.queueLength = nPkts;
+                    aIt->second.queueBytes  = nBytes;
+                }
+            }
+        }
+    }
+
+    m_lastPeriodicUpdateTime = now;
+    m_updateEvent = Simulator::Schedule(
+        Seconds(m_metricsIntervalSec),
+        &QosWeightedMloScheduler::UpdatePeriodicMetrics, this);
+}
+
+// ===========================================================================
+// ns-3 scheduler interface — delegations
+// ===========================================================================
 inline std::optional<WifiContainerQueueId>
-QosWeightedMloScheduler::GetNext(AcIndex ac,
-                                       std::optional<uint8_t> linkId,
-                                       bool skipBlockedQueues)
+QosWeightedMloScheduler::GetNext(AcIndex ac, std::optional<uint8_t> linkId,
+                                  bool skipBlockedQueues)
 {
     EnsureDelegate();
     return m_delegate->GetNext(ac, linkId, skipBlockedQueues);
 }
 
 inline std::optional<WifiContainerQueueId>
-QosWeightedMloScheduler::GetNext(AcIndex ac,
-                                       std::optional<uint8_t> linkId,
-                                       const WifiContainerQueueId& prevQueueId,
-                                       bool skipBlockedQueues)
+QosWeightedMloScheduler::GetNext(AcIndex ac, std::optional<uint8_t> linkId,
+                                  const WifiContainerQueueId& prevQueueId,
+                                  bool skipBlockedQueues)
 {
     EnsureDelegate();
     return m_delegate->GetNext(ac, linkId, prevQueueId, skipBlockedQueues);
 }
 
 inline std::list<uint8_t>
-QosWeightedMloScheduler::GetLinkIds(AcIndex ac,
-                                          Ptr<const WifiMpdu> mpdu,
-                                          const std::list<WifiQueueBlockedReason>& ignoredReasons)
+QosWeightedMloScheduler::GetLinkIds(AcIndex ac, Ptr<const WifiMpdu> mpdu,
+                                     const std::list<WifiQueueBlockedReason>& ignoredReasons)
 {
     EnsureDelegate();
-
-    const auto eligibleLinks = m_delegate->GetLinkIds(ac, mpdu, ignoredReasons);
-    if (eligibleLinks.empty())
-    {
-        return {};
-    }
-
-    // Dynamic QoS-Weighted metric selection!
-    return {SelectBestLink(ac, eligibleLinks)};
+    const auto eligible = m_delegate->GetLinkIds(ac, mpdu, ignoredReasons);
+    if (eligible.empty()) return {};
+    return {DecideLinkMigration(ac, eligible)};
 }
 
 inline void
-QosWeightedMloScheduler::BlockQueues(WifiQueueBlockedReason reason,
-                                           AcIndex ac,
-                                           const std::list<WifiContainerQueueType>& types,
-                                           const Mac48Address& rxAddress,
-                                           const Mac48Address& txAddress,
-                                           const std::set<uint8_t>& tids,
-                                           const std::set<uint8_t>& linkIds)
+QosWeightedMloScheduler::BlockQueues(WifiQueueBlockedReason reason, AcIndex ac,
+                                      const std::list<WifiContainerQueueType>& types,
+                                      const Mac48Address& rxAddress, const Mac48Address& txAddress,
+                                      const std::set<uint8_t>& tids, const std::set<uint8_t>& linkIds)
 {
     EnsureDelegate();
     m_delegate->BlockQueues(reason, ac, types, rxAddress, txAddress, tids, linkIds);
 }
 
 inline void
-QosWeightedMloScheduler::UnblockQueues(WifiQueueBlockedReason reason,
-                                             AcIndex ac,
-                                             const std::list<WifiContainerQueueType>& types,
-                                             const Mac48Address& rxAddress,
-                                             const Mac48Address& txAddress,
-                                             const std::set<uint8_t>& tids,
-                                             const std::set<uint8_t>& linkIds)
+QosWeightedMloScheduler::UnblockQueues(WifiQueueBlockedReason reason, AcIndex ac,
+                                        const std::list<WifiContainerQueueType>& types,
+                                        const Mac48Address& rxAddress, const Mac48Address& txAddress,
+                                        const std::set<uint8_t>& tids, const std::set<uint8_t>& linkIds)
 {
     EnsureDelegate();
     m_delegate->UnblockQueues(reason, ac, types, rxAddress, txAddress, tids, linkIds);
@@ -448,7 +1147,7 @@ QosWeightedMloScheduler::UnblockQueues(WifiQueueBlockedReason reason,
 
 inline void
 QosWeightedMloScheduler::BlockAllQueues(WifiQueueBlockedReason reason,
-                                              const std::set<uint8_t>& linkIds)
+                                         const std::set<uint8_t>& linkIds)
 {
     EnsureDelegate();
     m_delegate->BlockAllQueues(reason, linkIds);
@@ -456,164 +1155,123 @@ QosWeightedMloScheduler::BlockAllQueues(WifiQueueBlockedReason reason,
 
 inline void
 QosWeightedMloScheduler::UnblockAllQueues(WifiQueueBlockedReason reason,
-                                                const std::set<uint8_t>& linkIds)
+                                           const std::set<uint8_t>& linkIds)
 {
     EnsureDelegate();
     m_delegate->UnblockAllQueues(reason, linkIds);
 }
 
 inline bool
-QosWeightedMloScheduler::GetAllQueuesBlockedOnLink(
-    uint8_t linkId,
-    WifiQueueBlockedReason reason)
+QosWeightedMloScheduler::GetAllQueuesBlockedOnLink(uint8_t linkId,
+                                                    WifiQueueBlockedReason reason)
 {
     EnsureDelegate();
     return m_delegate->GetAllQueuesBlockedOnLink(linkId, reason);
 }
 
 inline std::optional<WifiMacQueueScheduler::Mask>
-QosWeightedMloScheduler::GetQueueLinkMask(AcIndex ac,
-                                                const WifiContainerQueueId& queueId,
-                                                uint8_t linkId)
+QosWeightedMloScheduler::GetQueueLinkMask(AcIndex ac, const WifiContainerQueueId& queueId,
+                                           uint8_t linkId)
 {
     EnsureDelegate();
     return m_delegate->GetQueueLinkMask(ac, queueId, linkId);
 }
 
+// ===========================================================================
+// Queue notification hooks
+// ===========================================================================
 inline Ptr<WifiMpdu>
 QosWeightedMloScheduler::HasToDropBeforeEnqueue(AcIndex ac, Ptr<WifiMpdu> mpdu)
 {
     EnsureDelegate();
-    Ptr<WifiMpdu> droppedMpdu = m_delegate->HasToDropBeforeEnqueue(ac, mpdu);
-    if (droppedMpdu) {
-        // Global enqueue drop (not per-link yet as we don't know the link)
-        // Add to enqueueCount to allow loss rate calculation
-        for (auto& [linkId, acMap] : m_metrics) {
+    Ptr<WifiMpdu> dropped = m_delegate->HasToDropBeforeEnqueue(ac, mpdu);
+    if (dropped) {
+        for (auto& [linkId, acMap] : m_metrics)
             acMap[static_cast<uint8_t>(ac)].dropFrames++;
-        }
     }
-    return droppedMpdu;
+    return dropped;
 }
-
-/*
-inline void
-QosWeightedMloScheduler::NotifyEnqueue(AcIndex ac, Ptr<WifiMpdu> mpdu)
-{
-    EnsureDelegate();
-    m_delegate->NotifyEnqueue(ac, mpdu);
-    
-    double nowMs = Simulator::Now().GetMilliSeconds();
-    
-    // Update queue stats for this AC on all links
-    Ptr<WifiMac> mac = GetMac();
-    if (mac) {
-        Ptr<QosTxop> qosTxop = mac->GetQosTxop(ac);
-        if (qosTxop) {
-            Ptr<WifiMacQueue> queue = qosTxop->GetWifiMacQueue();
-            if (queue) {
-                for (auto& [linkId, acMap] : m_metrics) {
-                    acMap[static_cast<uint8_t>(ac)].queueLength = queue->GetNPackets();
-                    acMap[static_cast<uint8_t>(ac)].queueBytes = queue->GetNBytes();
-                    acMap[static_cast<uint8_t>(ac)].enqueueCount++;
-                    acMap[static_cast<uint8_t>(ac)].lastEnqueueTimeMs = nowMs;
-                }
-            }
-        }
-    }
-}
-*/
 
 inline void
 QosWeightedMloScheduler::NotifyEnqueue(AcIndex ac, Ptr<WifiMpdu> mpdu)
 {
     EnsureDelegate();
     m_delegate->NotifyEnqueue(ac, mpdu);
-    
+
     double nowMs = Simulator::Now().GetMilliSeconds();
-    
-    // Guardar o tempo real de entrada através do UID único do pacote
-    if (mpdu && mpdu->GetPacket()) {
+    if (mpdu && mpdu->GetPacket())
         m_packetEnqueueTimes[mpdu->GetPacket()->GetUid()] = nowMs;
-    }
-    
+
+    // Update queue snapshot on all links (per-AC)
     Ptr<WifiMac> mac = GetMac();
     if (mac) {
-        Ptr<QosTxop> qosTxop = mac->GetQosTxop(ac);
-        if (qosTxop) {
-            Ptr<WifiMacQueue> queue = qosTxop->GetWifiMacQueue();
-            if (queue) {
+        Ptr<QosTxop> txop = mac->GetQosTxop(ac);
+        if (txop) {
+            Ptr<WifiMacQueue> q = txop->GetWifiMacQueue();
+            if (q) {
+                uint32_t nPkts  = q->GetNPackets();
+                uint32_t nBytes = q->GetNBytes();
                 for (auto& [linkId, acMap] : m_metrics) {
-                    acMap[static_cast<uint8_t>(ac)].queueLength = queue->GetNPackets();
-                    acMap[static_cast<uint8_t>(ac)].queueBytes = queue->GetNBytes();
-                    acMap[static_cast<uint8_t>(ac)].enqueueCount++;
-                    acMap[static_cast<uint8_t>(ac)].lastEnqueueTimeMs = nowMs;
+                    auto& ls = acMap[static_cast<uint8_t>(ac)];
+                    ls.queueLength       = nPkts;
+                    ls.queueBytes        = nBytes;
+                    ls.enqueueCount++;
+                    ls.lastEnqueueTimeMs = nowMs;
                 }
             }
         }
     }
 }
 
-/*
 inline void
 QosWeightedMloScheduler::NotifyDequeue(AcIndex ac, const std::list<Ptr<WifiMpdu>>& mpdus)
 {
     EnsureDelegate();
     m_delegate->NotifyDequeue(ac, mpdus);
-    
-    double nowMs = Simulator::Now().GetMilliSeconds();
-    
-    for (auto& [linkId, acMap] : m_metrics) {
-        auto& metrics = acMap[static_cast<uint8_t>(ac)];
-        metrics.lastDequeueTimeMs = nowMs;
-    }
 
-    // Update global AC monitoring state and consume credits
-    auto& acState = m_acStates[static_cast<uint8_t>(ac)];
-    for (const auto& mpdu : mpdus) {
-        if (mpdu) {
-            acState.bytesSent += mpdu->GetSize();
-            acState.packetsSent += 1;
-            
-            // Consume credit per packet transmitted
-            m_credits[static_cast<uint8_t>(ac)] = std::max(0.0, m_credits[static_cast<uint8_t>(ac)] - 1.0);
-        }
-    }
-}
-*/
+    uint8_t  acIdx      = static_cast<uint8_t>(ac);
+    double   nowMs      = Simulator::Now().GetMilliSeconds();
+    auto&    acSt       = m_acStates[acIdx];
 
-inline void
-QosWeightedMloScheduler::NotifyDequeue(AcIndex ac, const std::list<Ptr<WifiMpdu>>& mpdus)
-{
-    EnsureDelegate();
-    m_delegate->NotifyDequeue(ac, mpdus);
-    
-    double nowMs = Simulator::Now().GetMilliSeconds();
-    auto& acState = m_acStates[static_cast<uint8_t>(ac)];
-    
+    // Determine the link this AC is currently using for per-link delay/jitter
+    uint8_t  txLinkId   = m_slowLinkId; // fallback
+    auto lastIt = m_lastSelectedLink.find(acIdx);
+    if (lastIt != m_lastSelectedLink.end())
+        txLinkId = lastIt->second;
+
+    auto lIt = m_metrics.find(txLinkId);
+
     for (const auto& mpdu : mpdus) {
-        if (mpdu && mpdu->GetPacket()) {
-            uint64_t uid = mpdu->GetPacket()->GetUid();
-            auto it = m_packetEnqueueTimes.find(uid);
-            
-            // Se o pacote estava registado calculamos o atraso exato
-            if (it != m_packetEnqueueTimes.end()) {
-                double packetDelay = nowMs - it->second;
-                m_packetEnqueueTimes.erase(it);
-                
-                // Média Móvel (EWMA) para suavizar variações bruscas
-                acState.averageDelay = (acState.averageDelay == 0.0) ? packetDelay : 
-                                       (0.8 * acState.averageDelay + 0.2 * packetDelay);
-                
-                for (auto& [linkId, acMap] : m_metrics) {
-                    auto& metrics = acMap[static_cast<uint8_t>(ac)];
-                    metrics.lastDequeueTimeMs = nowMs;
-                    metrics.avgQueueDelay = (metrics.avgQueueDelay == 0.0) ? packetDelay : 
-                                            (0.8 * metrics.avgQueueDelay + 0.2 * packetDelay);
+        if (!mpdu || !mpdu->GetPacket()) continue;
+
+        acSt.bytesSent   += mpdu->GetSize();
+        acSt.packetsSent += 1;
+
+        uint64_t uid = mpdu->GetPacket()->GetUid();
+        auto eqIt    = m_packetEnqueueTimes.find(uid);
+        if (eqIt == m_packetEnqueueTimes.end()) continue;
+
+        double delayMs = nowMs - eqIt->second;
+        m_packetEnqueueTimes.erase(eqIt);
+
+        // Update per-link delay and jitter (EWMA) — only on the TX link
+        if (lIt != m_metrics.end()) {
+            auto aIt = lIt->second.find(acIdx);
+            if (aIt != lIt->second.end()) {
+                auto& ls = aIt->second;
+                // Delay EWMA
+                ls.avgQueueDelayMs = (ls.avgQueueDelayMs <= 0.0)
+                                       ? delayMs
+                                       : (0.8 * ls.avgQueueDelayMs + 0.2 * delayMs);
+                // Jitter EWMA
+                if (ls.lastDelayMs >= 0.0) {
+                    double jitter = std::fabs(delayMs - ls.lastDelayMs);
+                    ls.avgJitterMs = (ls.avgJitterMs <= 0.0)
+                                       ? jitter
+                                       : (0.8 * ls.avgJitterMs + 0.2 * jitter);
                 }
+                ls.lastDelayMs = delayMs;
             }
-            
-            acState.bytesSent += mpdu->GetSize();
-            acState.packetsSent += 1;
         }
     }
 }
@@ -623,626 +1281,68 @@ QosWeightedMloScheduler::NotifyRemove(AcIndex ac, const std::list<Ptr<WifiMpdu>>
 {
     EnsureDelegate();
     m_delegate->NotifyRemove(ac, mpdus);
-    
-    // NotifyRemove is called when packets are dropped from queue (e.g. lifetime expired)
     for (const auto& mpdu : mpdus) {
         if (!mpdu) continue;
-        for (auto& [linkId, acMap] : m_metrics) {
+        for (auto& [linkId, acMap] : m_metrics)
             acMap[static_cast<uint8_t>(ac)].dropFrames++;
-        }
     }
 }
 
+// ===========================================================================
+// DoDispose
+// ===========================================================================
 inline void
 QosWeightedMloScheduler::DoDispose()
 {
-    if (m_updateEvent.IsPending()) {
-        m_updateEvent.Cancel();
-    }
+    if (m_updateEvent.IsPending()) m_updateEvent.Cancel();
     m_metrics.clear();
     m_delegate = nullptr;
-    if (m_decisionCsv.is_open())
-    {
-        m_decisionCsv.close();
-    }
+    if (m_decisionCsv.is_open()) m_decisionCsv.close();
     WifiMacQueueScheduler::DoDispose();
 }
 
+// ===========================================================================
+// Helpers
+// ===========================================================================
 inline int
 QosWeightedMloScheduler::GetFrequencyRank(int frequency)
 {
-    switch (frequency)
-    {
-    case 6:
-        return 2;
-    case 5:
-        return 1;
-    case 2:
-        return 0;
-    default:
-        return 0;
+    switch (frequency) {
+    case 6: return 2;
+    case 5: return 1;
+    case 2: return 0;
+    default: return 0;
     }
-}
-
-inline double
-QosWeightedMloScheduler::UtilityFunction(double value, double target, bool lowerIsBetter) const
-{
-    if (target <= 0.0) return 0.5;
-    
-    double ratio = value / target;
-    
-    if (lowerIsBetter) {
-        // Lower is better (delay, jitter, loss rate).
-        // Ratio <= 1.0 (meeting requirements) gives high utility (around 0.8 to 1.0)
-        // Ratio > 1.0 (failing requirements) gives steeply decreasing utility
-        return 1.0 / (1.0 + std::exp(5.0 * (ratio - 1.0)));
-    } else {
-        // Higher is better (throughput).
-        // Ratio >= 1.0 (meeting target throughput) gives high utility
-        // Ratio < 1.0 gives steeply decreasing utility
-        return 1.0 / (1.0 + std::exp(5.0 * (1.0 - ratio)));
-    }
-}
-
-/*
-inline double
-QosWeightedMloScheduler::ComputeLinkScore(uint8_t linkId, AcIndex ac) const
-{
-    auto linkIt = m_metrics.find(linkId);
-    if (linkIt == m_metrics.end()) return 0.0;
-    
-    auto acIt = linkIt->second.find(static_cast<uint8_t>(ac));
-    if (acIt == linkIt->second.end()) return 0.5;
-    
-    const auto& metrics = acIt->second;
-    
-    double Qnorm = std::min(1.0, metrics.queueLength / MAX_QUEUE_LENGTH);
-    double DelayNorm = std::min(1.0, metrics.avgQueueDelay / MAX_DELAY);
-    double HolNorm = std::min(1.0, metrics.holDelay / MAX_HOL_DELAY);
-    double PerNorm = std::min(1.0, metrics.packetErrorRate);
-    double UtilNorm = std::min(1.0, metrics.channelUtilization);
-    double ThNorm = std::max(0.0, 1.0 - (metrics.achievedThroughput / MAX_THROUGHPUT));
-    // double SinrNorm = std::max(0.0, 1.0 - (metrics.averageSinr / MAX_SINR));
-
-    double score = 0.0;
-    
-    if (ac == AC_VO) {
-        score = 0.40 * DelayNorm + 0.30 * HolNorm + 0.15 * PerNorm + 0.10 * Qnorm + 0.05 * UtilNorm;
-    } else if (ac == AC_VI) {
-        score = 0.30 * DelayNorm + 0.20 * PerNorm + 0.10 * Qnorm + 0.10 * UtilNorm + 0.30 * ThNorm;
-    } else if (ac == AC_BE) {
-        double originalScore = 0.40 * ThNorm + 0.25 * Qnorm + 0.20 * UtilNorm + 0.10 * PerNorm + 0.05 * DelayNorm;
-        
-        // Starvation detection
-        double averageDelayBE = m_acStates.at(AC_BE).averageDelay;
-        double BEStarvation = std::min(averageDelayBE / 100.0, 10.0);
-        double normStarvation = BEStarvation / 10.0;
-        
-        // Credit system
-        double normCredit = std::max(0.0, std::min(1.0, m_credits.at(AC_BE) / m_maxCredit));
-        
-        // Fairness Share
-        double totalThroughput = 0.0;
-        for (auto acIdx : {AC_VO, AC_VI, AC_BE, AC_BK}) {
-            totalThroughput += m_acStates.at(acIdx).throughput;
-        }
-        double currentShareBE = 0.0;
-        if (totalThroughput > 0.0) {
-            currentShareBE = m_acStates.at(AC_BE).throughput / totalThroughput;
-        }
-        double ShareDeficitBE = 0.25 - currentShareBE; // TargetShareBE = 0.25
-        double FairnessBoostBE = std::max(0.0, ShareDeficitBE);
-        double normFairnessBoost = std::max(0.0, std::min(1.0, FairnessBoostBE / 0.25));
-        
-        score = originalScore - 0.30 * normStarvation - 0.20 * normCredit - 0.20 * normFairnessBoost;
-    } else if (ac == AC_BK) {
-        score = 0.40 * UtilNorm + 0.30 * Qnorm + 0.20 * ThNorm + 0.10 * PerNorm;
-    } else {
-        score = 0.40 * ThNorm + 0.25 * Qnorm + 0.20 * UtilNorm + 0.10 * PerNorm + 0.05 * DelayNorm; // Default to BE
-        // Default doesn't apply fairness/starvation boosts unless explicitly AC_BE
-    }
-                   
-    return score;
-}
-*/
-
-inline double
-QosWeightedMloScheduler::ComputeLinkScore(uint8_t linkId, AcIndex ac) const
-{
-    auto linkIt = m_metrics.find(linkId);
-    if (linkIt == m_metrics.end()) return 0.0;
-    
-    auto acIt = linkIt->second.find(static_cast<uint8_t>(ac));
-    if (acIt == linkIt->second.end()) return 0.5;
-    
-    const auto& metrics = acIt->second;
-    
-    auto targetIt = m_targets.find(static_cast<uint8_t>(ac));
-    if (targetIt == m_targets.end()) return 0.5;
-    const auto& targets = targetIt->second;
-    
-    double DelayUtil = UtilityFunction(metrics.avgQueueDelay, targets.maxDelayMs, true);
-    double PerUtil = UtilityFunction(metrics.packetErrorRate, targets.maxLossRate, true);
-
-    // === NOVA ABORDAGEM: ESTIMATIVA DO DÉBITO POTENCIAL ===
-    double estimatedThroughput = metrics.achievedThroughput;
-    if (estimatedThroughput < 0.001) {
-        // Se a nossa categoria nao usa este link calculamos a velocidade que a antena conseguiria oferecer
-        // Um canal totalmente livre permite atingir o limite maximo definido na simulação
-        estimatedThroughput = MAX_THROUGHPUT * (1.0 - metrics.channelUtilization);
-    }
-
-    double ThUtil = UtilityFunction(estimatedThroughput, targets.minThroughputMbps, false);
-    
-    double Qnorm = std::min(1.0, metrics.queueLength / MAX_QUEUE_LENGTH);
-    double UtilNorm = std::min(1.0, metrics.channelUtilization);
-    double HolNorm = std::min(1.0, metrics.holDelay / MAX_HOL_DELAY);
-
-    double score = 0.0;
-    
-    if (ac == AC_VO) {
-        score = 0.40 * (1.0 - DelayUtil) + 0.30 * HolNorm + 0.15 * (1.0 - PerUtil) + 0.10 * Qnorm + 0.05 * UtilNorm;
-    } else if (ac == AC_VI) {
-        score = 0.30 * (1.0 - DelayUtil) + 0.20 * (1.0 - PerUtil) + 0.10 * Qnorm + 0.10 * UtilNorm + 0.30 * (1.0 - ThUtil);
-    } else if (ac == AC_BE) {
-        score = 0.40 * (1.0 - ThUtil) + 0.25 * Qnorm + 0.20 * UtilNorm + 0.10 * (1.0 - PerUtil) + 0.05 * (1.0 - DelayUtil);
-    } else if (ac == AC_BK) {
-        score = 0.40 * UtilNorm + 0.30 * Qnorm + 0.20 * (1.0 - ThUtil) + 0.10 * (1.0 - PerUtil);
-    } else {
-        score = 0.40 * (1.0 - ThUtil) + 0.25 * Qnorm + 0.20 * UtilNorm + 0.10 * (1.0 - PerUtil) + 0.05 * (1.0 - DelayUtil);
-    }
-                   
-    return score;
-}
-
-/*
-//ORIGINAL
-
-inline uint8_t
-QosWeightedMloScheduler::SelectBestLink(AcIndex ac, const std::list<uint8_t>& eligibleLinks)
-{
-    if (eligibleLinks.empty())
-    {
-        return m_slowLinkId;
-    }
-    if (eligibleLinks.size() == 1)
-    {
-        m_lastSelectedLink[static_cast<uint8_t>(ac)] = eligibleLinks.front();
-        m_metrics[eligibleLinks.front()][static_cast<uint8_t>(ac)].packetsAssigned++;
-        return eligibleLinks.front();
-    }
-
-    uint8_t bestLink = eligibleLinks.front();
-    double bestScore = std::numeric_limits<double>::max();
-    
-    uint64_t totalPacketsAssigned = 0;
-    for (uint8_t linkId : eligibleLinks) {
-        totalPacketsAssigned += m_metrics[linkId][static_cast<uint8_t>(ac)].packetsAssigned;
-    }
-
-    std::map<uint8_t, double> finalScores;
-
-    for (uint8_t linkId : eligibleLinks) {
-        double score = ComputeLinkScore(linkId, ac);
-
-        double loadPenalty = 0.0;
-        if (totalPacketsAssigned > 0) {
-            loadPenalty = static_cast<double>(m_metrics[linkId][static_cast<uint8_t>(ac)].packetsAssigned) / totalPacketsAssigned;
-        }
-
-        double finalScore = score + 0.05 * loadPenalty;
-        finalScores[linkId] = finalScore;
-
-        if (finalScore < bestScore) {
-            bestScore = finalScore;
-            bestLink = linkId;
-        }
-    }
-    
-    bool switched = false;
-    
-    auto lastIt = m_lastSelectedLink.find(static_cast<uint8_t>(ac));
-    if (lastIt != m_lastSelectedLink.end()) {
-        uint8_t lastLink = lastIt->second;
-        if (std::find(eligibleLinks.begin(), eligibleLinks.end(), lastLink) != eligibleLinks.end()) {
-            double lastScore = finalScores[lastLink];
-            if (bestScore > lastScore * (1.0 - 0.05)) { // bestScore < lastScore * 0.95 means 5% improvement
-                bestLink = lastLink;
-                bestScore = lastScore; // Update to reflect we stayed
-            } else {
-                switched = true;
-            }
-        }
-    }
-    
-    m_lastSelectedLink[static_cast<uint8_t>(ac)] = bestLink;
-    m_metrics[bestLink][static_cast<uint8_t>(ac)].packetsAssigned++;
-    
-    // Log Decision
-    if (m_csvEnabled && m_decisionCsv.is_open()) {
-        double now = Simulator::Now().GetSeconds();
-        auto& metrics = m_metrics[bestLink][static_cast<uint8_t>(ac)];
-        
-        double starvation = 0.0;
-        double credit = 0.0;
-        double fairnessBoost = 0.0;
-        if (ac == AC_BE) {
-            double averageDelayBE = m_acStates.at(AC_BE).averageDelay;
-            starvation = std::min(averageDelayBE / 100.0, 10.0);
-            credit = m_credits.at(AC_BE);
-            
-            double totalThroughput = 0.0;
-            for (auto acIdx : {AC_VO, AC_VI, AC_BE, AC_BK}) {
-                totalThroughput += m_acStates.at(acIdx).throughput;
-            }
-            double currentShareBE = 0.0;
-            if (totalThroughput > 0.0) {
-                currentShareBE = m_acStates.at(AC_BE).throughput / totalThroughput;
-            }
-            fairnessBoost = std::max(0.0, 0.25 - currentShareBE);
-        }
-        
-        m_decisionCsv << now << "," << m_nodeContext << "," << +ac << ","
-                      << +bestLink << "," << bestScore << ","
-                      << metrics.queueLength << "," << metrics.avgQueueDelay << ","
-                      << metrics.holDelay << "," << metrics.packetErrorRate << ","
-                      << metrics.averageSinr << "," << metrics.achievedThroughput << ","
-                      << metrics.channelUtilization << ","
-                      << starvation << "," << credit << "," << fairnessBoost << "\n";
-    }
-    
-    return bestLink;
-}*/
-
-/*
-// With temporal locking
-inline uint8_t
-QosWeightedMloScheduler::SelectBestLink(AcIndex ac, const std::list<uint8_t>& eligibleLinks)
-{
-    if (eligibleLinks.empty())
-    {
-        return m_slowLinkId;
-    }
-    if (eligibleLinks.size() == 1)
-    {
-        m_lastSelectedLink[static_cast<uint8_t>(ac)] = eligibleLinks.front();
-        m_metrics[eligibleLinks.front()][static_cast<uint8_t>(ac)].packetsAssigned++;
-        return eligibleLinks.front();
-    }
-
-    double nowMs = Simulator::Now().GetMilliSeconds();
-    uint8_t acIndex = static_cast<uint8_t>(ac);
-
-    // Define o tempo de bloqueio de forma dinamica consoante a categoria
-    double lockDurationMs = 0; // Valor por omissao 3.0
-
-    
-    if (ac == AC_VO) {
-        lockDurationMs = 2.0;  // Voz precisa de pular rapidamente se o link falhar
-    } else if (ac == AC_VI) {
-        lockDurationMs = 4.0;  // Video permite uma ligeira espera para agregar mais
-    } else if (ac == AC_BE) {
-        lockDurationMs = 24.0; // Best Effort pode esperar bastante para criar agregacoes massivas
-    } else if (ac == AC_BK) {
-        lockDurationMs = 20.0; // Background tem foco total na eficiencia e ignorar o atraso
-    }
-    
-
-    // Bloqueio temporal para permitir agregacao A MPDU
-    if (m_lastSelectionTimeMs.find(acIndex) != m_lastSelectionTimeMs.end()) {
-        if (nowMs - m_lastSelectionTimeMs[acIndex] < lockDurationMs) {
-            auto lastIt = m_lastSelectedLink.find(acIndex);
-            if (lastIt != m_lastSelectedLink.end()) {
-                uint8_t lockedLink = lastIt->second;
-                if (std::find(eligibleLinks.begin(), eligibleLinks.end(), lockedLink) != eligibleLinks.end()) {
-                    m_metrics[lockedLink][acIndex].packetsAssigned++;
-                    return lockedLink;
-                }
-            }
-        }
-    }
-    
-
-    uint8_t bestLink = eligibleLinks.front();
-    double bestScore = std::numeric_limits<double>::max();
-    
-    uint64_t totalPacketsAssigned = 0;
-    for (uint8_t linkId : eligibleLinks) {
-        totalPacketsAssigned += m_metrics[linkId][acIndex].packetsAssigned;
-    }
-
-    std::map<uint8_t, double> finalScores;
-
-    for (uint8_t linkId : eligibleLinks) {
-        double score = ComputeLinkScore(linkId, ac);
-
-        double loadPenalty = 0.0;
-        if (totalPacketsAssigned > 0) {
-            loadPenalty = static_cast<double>(m_metrics[linkId][acIndex].packetsAssigned) / totalPacketsAssigned;
-        }
-
-        double finalScore = score + 0.05 * loadPenalty;
-        finalScores[linkId] = finalScore;
-
-        if (finalScore < bestScore) {
-            bestScore = finalScore;
-            bestLink = linkId;
-        }
-    }
-    
-    bool switched = false;
-    
-    auto lastIt = m_lastSelectedLink.find(acIndex);
-    if (lastIt != m_lastSelectedLink.end()) {
-        uint8_t lastLink = lastIt->second;
-        if (std::find(eligibleLinks.begin(), eligibleLinks.end(), lastLink) != eligibleLinks.end()) {
-            double lastScore = finalScores[lastLink];
-            if (bestScore > lastScore * (1.0 - 0.05)) { 
-                bestLink = lastLink;
-                bestScore = lastScore; 
-            } else {
-                switched = true;
-            }
-        }
-    }
-    
-    m_lastSelectedLink[acIndex] = bestLink;
-    m_lastSelectionTimeMs[acIndex] = nowMs;
-    m_metrics[bestLink][acIndex].packetsAssigned++;
-    
-    if (m_csvEnabled && m_decisionCsv.is_open()) {
-        double now = Simulator::Now().GetSeconds();
-        auto& metrics = m_metrics[bestLink][acIndex];
-        
-        double starvation = 0.0;
-        double credit = 0.0;
-        double fairnessBoost = 0.0;
-        if (ac == AC_BE) {
-            double averageDelayBE = m_acStates.at(AC_BE).averageDelay;
-            starvation = std::min(averageDelayBE / 100.0, 10.0);
-            credit = m_credits.at(AC_BE);
-            
-            double totalThroughput = 0.0;
-            for (auto acIdx : {AC_VO, AC_VI, AC_BE, AC_BK}) {
-                totalThroughput += m_acStates.at(acIdx).throughput;
-            }
-            double currentShareBE = 0.0;
-            if (totalThroughput > 0.0) {
-                currentShareBE = m_acStates.at(AC_BE).throughput / totalThroughput;
-            }
-            fairnessBoost = std::max(0.0, 0.25 - currentShareBE);
-        }
-        
-        m_decisionCsv << now << "," << m_nodeContext << "," << +ac << ","
-                      << +bestLink << "," << bestScore << ","
-                      << metrics.queueLength << "," << metrics.avgQueueDelay << ","
-                      << metrics.holDelay << "," << metrics.packetErrorRate << ","
-                      << metrics.averageSinr << "," << metrics.achievedThroughput << ","
-                      << metrics.channelUtilization << ","
-                      << starvation << "," << credit << "," << fairnessBoost << "\n";
-    }
-    
-    return bestLink;
-}
-*/
-
-inline uint8_t
-QosWeightedMloScheduler::SelectBestLink(AcIndex ac, const std::list<uint8_t>& eligibleLinks)
-{
-    if (eligibleLinks.empty()) {
-        return m_slowLinkId;
-    }
-    if (eligibleLinks.size() == 1) {
-        m_lastSelectedLink[static_cast<uint8_t>(ac)] = eligibleLinks.front();
-        m_metrics[eligibleLinks.front()][static_cast<uint8_t>(ac)].packetsAssigned++;
-        return eligibleLinks.front();
-    }
-
-    uint8_t acIndex = static_cast<uint8_t>(ac);
-    double currentScore = std::numeric_limits<double>::max();
-    double alternativeScore = std::numeric_limits<double>::max();
-    
-    uint8_t currentLink = eligibleLinks.front();
-    uint8_t alternativeLink = eligibleLinks.back();
-
-    bool hasAnchor = false;
-    auto lastIt = m_lastSelectedLink.find(acIndex);
-    
-    // Verifica se ja temos um link ancorado para esta categoria
-    if (lastIt != m_lastSelectedLink.end()) {
-        hasAnchor = true;
-        currentLink = lastIt->second;
-        
-        for (uint8_t link : eligibleLinks) {
-            if (link != currentLink) {
-                alternativeLink = link;
-                break;
-            }
-        }
-    }
-
-    currentScore = ComputeLinkScore(currentLink, ac);
-    uint8_t finalLink = currentLink;
-    double finalScore = currentScore;
-    
-    if (!hasAnchor) {
-        alternativeScore = ComputeLinkScore(alternativeLink, ac);
-        if (alternativeScore < currentScore) {
-            finalLink = alternativeLink;
-            finalScore = alternativeScore;
-        }
-    } else {
-        // Se a pontuacao do link atual ultrapassar a barreira de dor de 3 decimas
-        if (currentScore >= 0.2) {
-            alternativeScore = ComputeLinkScore(alternativeLink, ac);
-
-            // Exigimos 33 por cento de melhoria real para efetivar a mudanca de fluxo
-            if (alternativeScore < (currentScore * 0.70)) {
-                finalLink = alternativeLink;
-                finalScore = alternativeScore;
-            }
-        }
-    }
-
-    m_lastSelectedLink[acIndex] = finalLink;
-    m_metrics[finalLink][acIndex].packetsAssigned++;
-    
-    if (m_csvEnabled && m_decisionCsv.is_open()) {
-        double now = Simulator::Now().GetSeconds();
-        auto& metrics = m_metrics[finalLink][acIndex];
-        
-        m_decisionCsv << now << "," << m_nodeContext << "," << +ac << ","
-                      << +finalLink << "," << finalScore << ","
-                      << metrics.queueLength << "," << metrics.avgQueueDelay << ","
-                      << metrics.holDelay << "," << metrics.packetErrorRate << ","
-                      << metrics.averageSinr << "," << metrics.achievedThroughput << ","
-                      << metrics.channelUtilization << "\n";
-    }
-    
-    return finalLink;
-}
-
-inline void
-QosWeightedMloScheduler::UpdatePeriodicMetrics()
-{
-    double now = Simulator::Now().GetSeconds();
-    double dt = now - m_lastPeriodicUpdateTime;
-    if (dt <= 0.0) dt = m_metricsIntervalSec;
-    
-    // Update global AC throughputs
-    for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
-        auto& acState = m_acStates[static_cast<uint8_t>(ac)];
-        uint64_t acBytes = acState.bytesSent - m_lastAcBytesSent[static_cast<uint8_t>(ac)];
-        acState.throughput = (acBytes * 8.0) / (dt * 1e6); // in Mbps
-        m_lastAcBytesSent[static_cast<uint8_t>(ac)] = acState.bytesSent;
-    }
-    
-    for (auto& [linkId, acMap] : m_metrics) {
-        // Compute real channel utilization for this link (shared across all ACs)
-        double linkUtilization = 0.0;
-        if (dt > 0.0) {
-            linkUtilization = m_linkBusyTime[linkId] / dt;
-            if (linkUtilization > 1.0) linkUtilization = 1.0;
-            if (linkUtilization < 0.0) linkUtilization = 0.0;
-        }
-        m_linkBusyTime[linkId] = 0.0; // reset for next window
-
-        for (auto& [ac, metrics] : acMap) {
-            // Recalculate throughput: (bytes * 8) / (dt * 1e6)
-            metrics.achievedThroughput = (metrics.txBytes * 8.0) / (dt * 1e6);
-            metrics.txBytes = 0;
-            
-            // Recalculate PER from real TX attempts vs confirmed frames
-            if (metrics.txAttempts > 0) {
-                double successRate = static_cast<double>(metrics.txSuccess) / metrics.txAttempts;
-                metrics.packetErrorRate = 1.0 - successRate;
-                if (metrics.packetErrorRate < 0.0) metrics.packetErrorRate = 0.0;
-            } else {
-                metrics.packetErrorRate = 0.0;
-            }
-            metrics.txAttempts = 0;
-            metrics.txSuccess = 0;
-            // Also reset legacy drop/enqueue counters
-            metrics.enqueueCount = 0;
-            metrics.dropFrames = 0;
-            
-            // Apply real channel utilization to this AC
-            metrics.channelUtilization = linkUtilization;
-            
-            /*
-            // Delay estimation using Little's Law (Queue Bytes / Throughput)
-            if (metrics.queueBytes > 0) {
-                if (metrics.achievedThroughput > 0.001) { // 1 kbps minimum
-                    double estimatedDelayMs = (metrics.queueBytes * 8.0) / (metrics.achievedThroughput * 1000.0);
-                    // Cap estimated delay
-                    if (estimatedDelayMs > MAX_DELAY) estimatedDelayMs = MAX_DELAY;
-                    metrics.avgQueueDelay = (metrics.avgQueueDelay == 0.0) ? estimatedDelayMs : (0.7 * metrics.avgQueueDelay + 0.3 * estimatedDelayMs);
-                } else {
-                    metrics.avgQueueDelay = MAX_DELAY; 
-                }
-            } else {
-                metrics.avgQueueDelay = 0.0;
-            }
-            */
-
-            // HOL Delay Estimate (simplified)
-            if (metrics.queueLength > 0) {
-                double nowMs = Simulator::Now().GetMilliSeconds();
-                double waitTime = nowMs - metrics.lastEnqueueTimeMs;
-                metrics.holDelay = (waitTime > MAX_HOL_DELAY) ? MAX_HOL_DELAY : waitTime;
-            } else {
-                metrics.holDelay = 0.0;
-            }
-        }
-    }
-    
-    // Update global AC queue lengths and average delays
-    Ptr<WifiMac> mac = GetMac();
-    for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
-        auto& acState = m_acStates[static_cast<uint8_t>(ac)];
-        uint32_t queueBytes = 0;
-        uint32_t queuePackets = 0;
-        if (mac) {
-            Ptr<QosTxop> qosTxop = mac->GetQosTxop(ac);
-            if (qosTxop) {
-                Ptr<WifiMacQueue> queue = qosTxop->GetWifiMacQueue();
-                if (queue) {
-                    queueBytes = queue->GetNBytes();
-                    queuePackets = queue->GetNPackets();
-                }
-            }
-        }
-        acState.queueLength = queuePackets;
-        
-        /*
-        // Calculate average delay globally using Little's Law: Delay = Queue Bytes / Throughput
-        if (queueBytes > 0) {
-            if (acState.throughput > 0.001) { // 1 kbps minimum
-                double estimatedDelayMs = (queueBytes * 8.0) / (acState.throughput * 1000.0);
-                acState.averageDelay = (acState.averageDelay == 0.0) ? estimatedDelayMs : (0.7 * acState.averageDelay + 0.3 * estimatedDelayMs);
-            } else {
-                acState.averageDelay = 500.0; // default cap when queued but no throughput
-            }
-        } else {
-            acState.averageDelay = 0.0;
-        }
-        */
-    }
-    
-    m_lastPeriodicUpdateTime = now;
-    
-    // Reschedule next update
-    m_updateEvent = Simulator::Schedule(Seconds(m_metricsIntervalSec), 
-                                        &QosWeightedMloScheduler::UpdatePeriodicMetrics, this);
 }
 
 inline void
 QosWeightedMloScheduler::PrintFinalScores()
 {
-    std::cout << "\n=== FINAL MLO SCHEDULER SCORES (" << m_nodeContext << ") ===\n";
+    std::cout << "\n=== FINAL MLO SCHEDULER SATISFACTION (" << m_nodeContext << ") ===\n";
     for (auto ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
-        std::cout << "AC " << +ac << ": ";
-        for (uint8_t linkId : {0, 1}) {
-            double score = ComputeLinkScore(linkId, ac);
-            std::cout << "Link" << +linkId << "=" << score << " | ";
+        uint8_t acIdx = static_cast<uint8_t>(ac);
+        std::cout << "AC " << +acIdx << ": ";
+        for (uint8_t linkId : {m_slowLinkId, m_fastLinkId}) {
+            double sat = ComputeExpectedQosSatisfaction(ac, linkId);
+            std::cout << "Link" << +linkId << "=" << sat << " | ";
         }
-        std::cout << "\n";
+        double curSat = m_currentSatisfaction.count(acIdx)
+                            ? m_currentSatisfaction.at(acIdx).index : 0.0;
+        std::cout << "CurrentSat=" << curSat << "\n";
     }
 }
 
-// Installation Helper function
+// ===========================================================================
+// Installation helper
+// ===========================================================================
 inline Ptr<QosWeightedMloScheduler>
 InstallQosWeightedScheduler(Ptr<WifiMac> mac, int freq1, int freq2)
 {
-    if (!mac)
-    {
-        return nullptr;
-    }
-
-    Ptr<QosWeightedMloScheduler> scheduler = CreateObject<QosWeightedMloScheduler>();
-    scheduler->ConfigureForPair(freq1, freq2);
-    mac->SetMacQueueScheduler(scheduler);
-    return scheduler;
+    if (!mac) return nullptr;
+    auto sched = CreateObject<QosWeightedMloScheduler>();
+    sched->ConfigureForPair(freq1, freq2);
+    mac->SetMacQueueScheduler(sched);
+    return sched;
 }
 
 } // namespace ns3
