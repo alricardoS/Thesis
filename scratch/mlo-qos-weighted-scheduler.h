@@ -335,8 +335,8 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     std::map<uint8_t, uint32_t> m_linkTxDepth;
 
     // ---- Decision thresholds ----
-    double m_stayThreshold{0.85};       // stay if currentSatisfaction >= this
-    double m_migrationThreshold{0.15};  // migrate if expectedGain > this
+    double m_stayThreshold{0.60};       // stay if currentSatisfaction >= this //ALTEREI ERA 0.85
+    double m_migrationThreshold{0.05};  // migrate if expectedGain > this      //ALTEREI ERA 0.15
     double m_metricsIntervalSec{0.5};
     double m_lastPeriodicUpdateTime{0.0};
     EventId m_updateEvent;
@@ -874,7 +874,7 @@ QosWeightedMloScheduler::ComputeExpectedQosSatisfaction(AcIndex ac,
             double otherSat = m_currentSatisfaction.count(otherAcIdx) 
                               ? m_currentSatisfaction.at(otherAcIdx).index : 1.0;
             // Se a satisfacao do outro AC for fraca (e.g. < 0.3)
-            if (otherSat < 0.5) {
+            if (otherSat < 0.4) {
                 // Penaliza proporcionalmente a fome do outro AC (max 0.6 de penalizacao)
                 altruisticPenalty += (0.6 - otherSat);
             }
