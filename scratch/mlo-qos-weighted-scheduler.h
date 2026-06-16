@@ -320,7 +320,7 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     double m_edcaWeights[4][4] = {
         // other: BK    BE    VI    VO
         {0.0,  0.5,  2.0,  5.0}, // candidate BK  //ALTEREI era 0.4
-        {0.5,  1.0,  2.0,  6.0}, // candidate BE  //ALTEREI era 0.4
+        {0.5,  1.0,  2.0,  8.0}, // candidate BE  //ALTEREI era 0.4
         {0.25, 0.5,  1.0,  2.0}, // candidate VI
         {0.0,  0.05, 0.25, 1.0}  // candidate VO
     };
@@ -394,9 +394,9 @@ QosWeightedMloScheduler::QosWeightedMloScheduler()
     : m_delegate(CreateObject<FcfsWifiQueueScheduler>())
 {
     // ---- Default goals per AC ----
-    m_goals[AC_VO] = {150.0, 15.0,  0.0,  0.01};  //ALTEREI a loss
-    m_goals[AC_VI] = {150.0, 30.0, 0.0,  0.01};  //ALTEREI a loss
-    m_goals[AC_BE] = {150.0, 200.0, 0.0, 0.10};  //ALTEREI a loss
+    m_goals[AC_VO] = {150.0, 15.0,  0.1,  0.01};  //ALTEREI a loss
+    m_goals[AC_VI] = {150.0, 30.0, 0.1,  0.01};  //ALTEREI a loss
+    m_goals[AC_BE] = {150.0, 200.0, 1.0, 0.10};  //ALTEREI a loss
     m_goals[AC_BK] = {150.0, 300.0, 100.0, 0.10};
 
     // ---- Default weights per AC ----
@@ -874,7 +874,7 @@ QosWeightedMloScheduler::ComputeExpectedQosSatisfaction(AcIndex ac,
             double otherSat = m_currentSatisfaction.count(otherAcIdx) 
                               ? m_currentSatisfaction.at(otherAcIdx).index : 1.0;
             // Se a satisfacao do outro AC for fraca (e.g. < 0.3)
-            if (otherSat < 0.4) {
+            if (otherSat < 0.45) {
                 // Penaliza proporcionalmente a fome do outro AC (max 0.6 de penalizacao)
                 altruisticPenalty += (0.6 - otherSat);
             }
