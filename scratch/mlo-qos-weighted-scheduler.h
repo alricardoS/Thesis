@@ -76,9 +76,17 @@ struct QosSatisfaction {
 /// Per-link (shared across ACs) PHY capacity assessment
 struct LinkCapability {
     double estimatedCapacityMbps{0.0};   ///< PHY rate * (1 - PER)
-    double availableCapacityMbps{0.0};   ///< estimated - occupied (sum of AC throughputs)
+    double availableCapacityMbps{0.0};   ///< estimated - occupied (sum of ALL AC throughputs) — kept for capabilityScore/diagnostics
     double freeAirtime{1.0};             ///< 1 - channelUtilization
     double capabilityScore{0.0};         ///< 0..1 normalised
+
+    /// Priority-aware available capacity per AC: estimatedCapacity minus the
+    /// throughput of ACs with EQUAL OR HIGHER 802.11 priority only. Models
+    /// the real EDCA behaviour where a higher-priority AC (e.g. VO) doesn't
+    /// lose access just because a lower-priority AC (e.g. BE/BK) is
+    /// transmitting more — VO always wins channel access first. Indexed by
+    /// AcIndex cast to uint8_t.
+    std::map<uint8_t, double> availableCapacityPerAcMbps;
 };
 
 // ---------------------------------------------------------------------------
@@ -141,6 +149,7 @@ struct LinkState {
     // Derived metrics (updated each window)
     double achievedThroughputMbps{0.0};
     double packetErrorRate{0.0};
+    bool   perInitialized{false}; // true once at least one PER sample has been taken
     double channelUtilization{0.0};
     double holDelay{0.0};
 
@@ -277,7 +286,35 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     bool AnyLinkMeetsGoals(AcIndex ac, const std::list<uint8_t>& links) const;
     /// Best-achievable score when no link meets goals (used as tiebreaker)
     double ComputeBestAchievableScore(AcIndex ac, uint8_t linkId) const;
-    /// Main decision function — replaces SelectBestLink
+
+    /// Returns true if ac's own QoS satisfaction on linkId clears a
+    /// "goals met" threshold — using the same composite index as
+    /// m_currentSatisfaction (CurrentQosSatisfaction), not a borrowed Mbps
+    /// comparison. Generic across any AC: each AC's own weights/goals
+    /// already encode what "meeting goals" means for it.
+    bool MeetsOwnGoals(AcIndex ac, uint8_t linkId) const;
+
+    /// Returns true if placing ac on linkId would harm the worst-affected
+    /// AC currently resident there beyond an acceptable threshold — using
+    /// the same composite satisfaction index (otherSat) as the rest of the
+    /// scheduler, not a single metric like loss alone, so all four
+    /// dimensions (delay/jitter/loss/throughput) count with their AC-specific
+    /// weights, consistent with how satisfaction is judged everywhere else.
+    /// harmedAcOut/worstSatOut (optional) report which AC and how badly.
+    bool WouldHarmResident(AcIndex ac, uint8_t linkId,
+                           AcIndex* harmedAcOut = nullptr,
+                           double* worstSatOut = nullptr) const;
+
+    /// Main decision function — replaces SelectBestLink. Implements an
+    /// explicit priority cascade:
+    ///   First: prefer a link where ac meets its OWN goals AND doesn't harm any
+    ///      resident AC beyond the harm threshold.
+    ///   Second: if no such link exists, prefer a link where ac meets its own
+    ///      goals, even if it harms a resident (EDCA priority is real and
+    ///      cannot be waived — ac is not required to sacrifice its own
+    ///      goals for a lower/equal-priority resident).
+    ///   Third: if ac cannot meet its own goals anywhere, fall back to the
+    ///      best-achievable score (existing behaviour).
     uint8_t DecideLinkMigration(AcIndex ac, const std::list<uint8_t>& eligibleLinks);
 
     // ---- Periodic update ----
@@ -319,8 +356,8 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     // Rows: VO=3, VI=2, BE=1, BK=0
     double m_edcaWeights[4][4] = {
         // other: BK    BE    VI    VO
-        {0.0,  0.5,  2.0,  5.0}, // candidate BK  //ALTEREI era 0.4
-        {0.5,  1.0,  2.0,  8.0}, // candidate BE  //ALTEREI era 0.4
+        {0.0,  0.5,  7.0,  9.0}, // candidate BK  //ALTEREI era 0.4
+        {0.5,  1.0,  6.0,  8.0}, // candidate BE  //ALTEREI era 0.4
         {0.25, 0.5,  1.0,  2.0}, // candidate VI
         {0.0,  0.05, 0.25, 1.0}  // candidate VO
     };
@@ -335,11 +372,25 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     std::map<uint8_t, uint32_t> m_linkTxDepth;
 
     // ---- Decision thresholds ----
-    double m_stayThreshold{0.60};       // stay if currentSatisfaction >= this //ALTEREI ERA 0.85
-    double m_migrationThreshold{0.05};  // migrate if expectedGain > this      //ALTEREI ERA 0.15
+    double m_stayThreshold{0.75};       // stay if currentSatisfaction >= this //ALTEREI ERA 0.85
+    double m_migrationThreshold{0.25};  // migrate if expectedGain > this      //ALTEREI ERA 0.15
     double m_metricsIntervalSec{0.5};
     double m_lastPeriodicUpdateTime{0.0};
     EventId m_updateEvent;
+
+    // ---- Priority-cascade thresholds (DecideLinkMigration) ----
+    // "Meets own goals" threshold for MeetsOwnGoals() — a candidate clears
+    // its own goals on a link if ComputeExpectedQosSatisfaction there is at
+    // or above this. Distinct from m_stayThreshold (which gates whether to
+    // even start evaluating alternatives) — this gates whether a *candidate*
+    // link counts as "good enough on its own merits" during evaluation.
+    double m_ownGoalsThreshold{0.90};
+    // "Harm" threshold for WouldHarmResident() — a resident AC is considered
+    // harmed if its OWN current composite satisfaction would sit at or below
+    // this. Uses the same composite otherSat index as the rest of the
+    // scheduler (delay/jitter/loss/throughput, AC-specific weights), not a
+    // single raw metric like loss alone.
+    double m_harmThreshold{0.70};
 
     // ---- Link identity ----
     uint8_t m_slowLinkId{0};
@@ -382,7 +433,17 @@ QosWeightedMloScheduler::GetTypeId()
                           "Periodic metrics update interval (s)",
                           DoubleValue(0.5),
                           MakeDoubleAccessor(&QosWeightedMloScheduler::m_metricsIntervalSec),
-                          MakeDoubleChecker<double>(0.05, 10.0));
+                          MakeDoubleChecker<double>(0.05, 10.0))
+            .AddAttribute("OwnGoalsThreshold",
+                          "Composite satisfaction threshold above which a candidate link counts as meeting the AC's own goals",
+                          DoubleValue(0.90),
+                          MakeDoubleAccessor(&QosWeightedMloScheduler::m_ownGoalsThreshold),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("HarmThreshold",
+                          "Composite satisfaction threshold at or below which a resident AC is considered harmed by a newcomer",
+                          DoubleValue(0.70),
+                          MakeDoubleAccessor(&QosWeightedMloScheduler::m_harmThreshold),
+                          MakeDoubleChecker<double>(0.0, 1.0));
     return tid;
 }
 
@@ -696,6 +757,26 @@ QosWeightedMloScheduler::UpdateLinkCapability(uint8_t linkId, double dt)
 
     cap.availableCapacityMbps = std::max(0.0, cap.estimatedCapacityMbps - occupied);
 
+    // ---- Priority-aware available capacity per AC ----
+    // Real 802.11 EDCA priority order (highest to lowest): VO > VI > BE > BK.
+    // A higher-priority AC only "sees" the throughput of ACs at its own
+    // priority level or above as competing for the channel — it doesn't lose
+    // capacity just because a lower-priority AC is transmitting more, since
+    // it always wins channel access first via shorter AIFS/CW.
+    double voTp = tc.voThroughputMbps;
+    double viTp = tc.viThroughputMbps;
+    double beTp = tc.beThroughputMbps;
+    double bkTp = tc.bkThroughputMbps;
+
+    cap.availableCapacityPerAcMbps[static_cast<uint8_t>(AC_VO)] =
+        std::max(0.0, cap.estimatedCapacityMbps - voTp);
+    cap.availableCapacityPerAcMbps[static_cast<uint8_t>(AC_VI)] =
+        std::max(0.0, cap.estimatedCapacityMbps - voTp - viTp);
+    cap.availableCapacityPerAcMbps[static_cast<uint8_t>(AC_BE)] =
+        std::max(0.0, cap.estimatedCapacityMbps - voTp - viTp - beTp);
+    cap.availableCapacityPerAcMbps[static_cast<uint8_t>(AC_BK)] =
+        std::max(0.0, cap.estimatedCapacityMbps - voTp - viTp - beTp - bkTp);
+
     // Free airtime
     double util = 0.0;
     if (dt > 0.0) {
@@ -791,7 +872,9 @@ QosWeightedMloScheduler::UpdateEdcaCompetition(uint8_t linkId)
         edca.expectedAccessOpportunity = std::min(1.0, std::max(0.0, opp));
 
         edca.effectiveAvailableCapacityMbps =
-            capLink.availableCapacityMbps * edca.expectedAccessOpportunity;
+            capLink.availableCapacityPerAcMbps.count(candIdx)
+                ? capLink.availableCapacityPerAcMbps.at(candIdx) * edca.expectedAccessOpportunity
+                : capLink.availableCapacityMbps * edca.expectedAccessOpportunity; // fallback, shouldn't normally trigger
     }
 }
 
@@ -861,22 +944,65 @@ QosWeightedMloScheduler::ComputeExpectedQosSatisfaction(AcIndex ac,
     double expectedScore = baseSat * 0.65 + capScore * 0.25 + perPenalty * 0.1; //ALTEREI era 0.8, 0.1, 0.1
 
     // --- ALTRUISTIC PENALTY ---
-    // Se outro AC estiver a "passar fome" (starving) neste link, penalizamos o score
-    // para que este AC (e.g. VO) procure outro link, deixando espaco livre para o AC mais fraco (e.g. BE).
+    // Two components (no per-scenario hardcoding — both work for any AC
+    // combination):
+    //
+    // (A) REACTIVE: if another AC is already starving on this link, penalise
+    //     entering it further (original behaviour — kept as-is).
+    // (B) PREVENTIVE: even if the other AC is NOT yet starving, check whether
+    //     it would lose its "comfortable" capacity headroom if this candidate
+    //     joins. This reuses otherAc's OWN effectiveAvailableCapacityMbps
+    //     (already computed by UpdateEdcaCompetition using the correct,
+    //     already-validated direction of m_edcaWeights — "how much otherAc,
+    //     as resident, feels the load already on this link"). We do NOT
+    //     introduce a second, reverse-direction matrix lookup here: that
+    //     would silently assume m_edcaWeights is symmetric (that "how much X
+    //     feels Y" equals "how much Y would be hurt by X joining"), which is
+    //     not a property the matrix actually has or needs to have.
+    //
+    //     Instead, we ask a self-contained question: "does otherAc's current
+    //     effective capacity already sit close to what it needs (its own
+    //     target throughput)?" If otherAc's headroom is thin, ANY new
+    //     candidate adding load is risky — penalise candidates proportionally
+    //     to how much load they'd actually bring (their own normalised load),
+    //     not to a borrowed/inverted weight.
     double altruisticPenalty = 0.0;
     for (AcIndex otherAc : {AC_BK, AC_BE, AC_VI, AC_VO}) {
         if (otherAc == ac) continue;
         uint8_t otherAcIdx = static_cast<uint8_t>(otherAc);
         auto lastIt = m_lastSelectedLink.find(otherAcIdx);
-        
-        // Se o outro AC estiver correntemente a usar este link como primario
-        if (lastIt != m_lastSelectedLink.end() && lastIt->second == linkId) {
-            double otherSat = m_currentSatisfaction.count(otherAcIdx) 
-                              ? m_currentSatisfaction.at(otherAcIdx).index : 1.0;
-            // Se a satisfacao do outro AC for fraca (e.g. < 0.3)
-            if (otherSat < 0.45) {
-                // Penaliza proporcionalmente a fome do outro AC (max 0.6 de penalizacao)
-                altruisticPenalty += (0.6 - otherSat);
+
+        // Only consider ACs currently resident on this candidate link.
+        if (lastIt == m_lastSelectedLink.end() || lastIt->second != linkId) continue;
+
+        double otherSat = m_currentSatisfaction.count(otherAcIdx)
+                          ? m_currentSatisfaction.at(otherAcIdx).index : 1.0;
+
+        // (A) Reactive: other AC already starving — penalise as before.
+        if (otherSat < 0.45) {
+            altruisticPenalty += (0.6 - otherSat);
+        }
+
+        // (B) Preventive: how much capacity headroom does otherAc currently
+        // have on THIS link, relative to its own goal? If headroom is thin,
+        // treat any incoming load from the candidate as a fairness risk.
+        auto otherGIt = m_goals.find(otherAcIdx);
+        if (edcaIt != m_edca.end() && otherGIt != m_goals.end()) {
+            auto otherEdca = edcaIt->second.find(otherAcIdx);
+            if (otherEdca != edcaIt->second.end()) {
+                double headroomRatio = otherEdca->second.effectiveAvailableCapacityMbps
+                                      / std::max(1.0, otherGIt->second.targetThroughputMbps);
+                // headroomRatio >= 1.0 means otherAc already has at least its
+                // full target available — comfortable, low risk from a newcomer.
+                // headroomRatio < 1.0 means otherAc is already tight — a
+                // newcomer's load is a real threat to it.
+                if (headroomRatio < 1.0 && otherSat < 0.75) {
+                    double candidateLoadProxy = NormalisedLoad(ac, linkId);
+                    if (candidateLoadProxy <= 0.0) candidateLoadProxy = 0.15; // cold-start default
+                    double tightness = (1.0 - headroomRatio); // 0 = fine, 1 = no headroom at all
+                    double preventiveTerm = std::min(0.5, tightness * candidateLoadProxy * 2.0);
+                    altruisticPenalty = std::max(altruisticPenalty, preventiveTerm);
+                }
             }
         }
     }
@@ -901,6 +1027,60 @@ QosWeightedMloScheduler::ComputeBestAchievableScore(AcIndex ac,
     // Best-achievable: same as ExpectedQoS but without requiring >= 1.0
     // (already what ComputeExpectedQosSatisfaction returns)
     return ComputeExpectedQosSatisfaction(ac, linkId);
+}
+
+inline bool
+QosWeightedMloScheduler::MeetsOwnGoals(AcIndex ac, uint8_t linkId) const
+{
+    // Use the same composite score the rest of the scheduler relies on.
+    // ComputeExpectedQosSatisfaction already blends throughput/delay/jitter/
+    // loss with this AC's own weights and its own EDCA-aware projected
+    // capacity on linkId — exactly "would I be satisfied here", generalised
+    // to any AC without per-scenario hardcoding.
+    return ComputeExpectedQosSatisfaction(ac, linkId) >= m_ownGoalsThreshold;
+}
+
+inline bool
+QosWeightedMloScheduler::WouldHarmResident(AcIndex ac, uint8_t linkId,
+                                            AcIndex* harmedAcOut,
+                                            double* worstSatOut) const
+{
+    // Find the worst-affected resident AC on linkId (excluding ac itself)
+    // using the SAME composite satisfaction index (m_currentSatisfaction)
+    // used everywhere else in the scheduler — all four QoS dimensions count,
+    // weighted per that resident's own AcWeights, not just loss in isolation.
+    //
+    // We deliberately use the CURRENT measured satisfaction of residents
+    // (not a re-projection), because the question here is "is anyone HERE
+    // already struggling", which is what currentSat already answers — the
+    // preventive headroom check inside ComputeExpectedQosSatisfaction (the
+    // altruisticPenalty term) is a separate, complementary signal already
+    // folded into the score; this function answers the cascade's explicit
+    // "would I actively harm someone" question on its own terms.
+    double worstSat = 1.0;
+    AcIndex worstAc = ac;
+    bool foundResident = false;
+
+    for (AcIndex otherAc : {AC_BK, AC_BE, AC_VI, AC_VO}) {
+        if (otherAc == ac) continue;
+        uint8_t otherAcIdx = static_cast<uint8_t>(otherAc);
+        auto lastIt = m_lastSelectedLink.find(otherAcIdx);
+        if (lastIt == m_lastSelectedLink.end() || lastIt->second != linkId) continue;
+
+        double otherSat = m_currentSatisfaction.count(otherAcIdx)
+                              ? m_currentSatisfaction.at(otherAcIdx).index : 1.0;
+        foundResident = true;
+        if (otherSat < worstSat) {
+            worstSat = otherSat;
+            worstAc  = otherAc;
+        }
+    }
+
+    if (harmedAcOut)  *harmedAcOut  = worstAc;
+    if (worstSatOut)  *worstSatOut  = foundResident ? worstSat : 1.0;
+
+    if (!foundResident) return false; // nobody else there — can't harm anyone
+    return worstSat <= m_harmThreshold;
 }
 
 inline uint8_t
@@ -936,23 +1116,42 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac,
         // Satisfied — keep current link
         decision = "STAY_SATISFIED";
     } else {
-        // Need to evaluate alternatives
-        bool goalsAchievable = AnyLinkMeetsGoals(ac, eligibleLinks);
-
-        uint8_t bestLink   = currentLink;
-        double  bestScore  = goalsAchievable
-                                ? ComputeExpectedQosSatisfaction(ac, currentLink)
-                                : ComputeBestAchievableScore(ac, currentLink);
+        // ---- Explicit priority cascade across eligible links ----
+        // Category 1: meets own goals AND doesn't harm any resident beyond
+        //             the harm threshold — the ideal outcome.
+        // Category 2: meets own goals but DOES harm a resident — acceptable
+        //             only because ac has no Category-1 alternative; EDCA
+        //             priority is real and ac is not required to sacrifice
+        //             its own goals for a lower/equal-priority resident.
+        // Category 3: doesn't meet own goals anywhere — fall back to
+        //             best-achievable score (previous behaviour).
+        //
+        // Within whichever category has candidates, pick the link with the
+        // highest ComputeExpectedQosSatisfaction score.
+        uint8_t bestCat1Link = 0; double bestCat1Score = -1.0; bool hasCat1 = false;
+        uint8_t bestCat2Link = 0; double bestCat2Score = -1.0; bool hasCat2 = false;
+        uint8_t bestCat3Link = currentLink; double bestCat3Score = ComputeBestAchievableScore(ac, currentLink);
 
         for (uint8_t linkId : eligibleLinks) {
-            double score = goalsAchievable
-                               ? ComputeExpectedQosSatisfaction(ac, linkId)
-                               : ComputeBestAchievableScore(ac, linkId);
-            if (score > bestScore) {
-                bestScore = score;
-                bestLink  = linkId;
+            bool meetsOwn = MeetsOwnGoals(ac, linkId);
+            bool harms    = WouldHarmResident(ac, linkId);
+            double score  = ComputeExpectedQosSatisfaction(ac, linkId);
+
+            if (meetsOwn && !harms) {
+                if (!hasCat1 || score > bestCat1Score) { bestCat1Score = score; bestCat1Link = linkId; hasCat1 = true; }
+            } else if (meetsOwn && harms) {
+                if (!hasCat2 || score > bestCat2Score) { bestCat2Score = score; bestCat2Link = linkId; hasCat2 = true; }
             }
+            // Category 3 fallback always tracks the best achievable score
+            // regardless of meetsOwn/harms, as a safety net.
+            double bestScoreSoFar = ComputeBestAchievableScore(ac, linkId);
+            if (bestScoreSoFar > bestCat3Score) { bestCat3Score = bestScoreSoFar; bestCat3Link = linkId; }
         }
+
+        uint8_t bestLink; double bestScore; std::string categoryTag;
+        if (hasCat1)      { bestLink = bestCat1Link; bestScore = bestCat1Score; categoryTag = "CAT1_CLEAN"; }
+        else if (hasCat2) { bestLink = bestCat2Link; bestScore = bestCat2Score; categoryTag = "CAT2_PRIORITY_OVERRIDE"; }
+        else              { bestLink = bestCat3Link; bestScore = bestCat3Score; categoryTag = "CAT3_BEST_EFFORT"; }
 
         selectedExpSat = bestScore;
 
@@ -960,7 +1159,7 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac,
             double improvement = bestScore - currentSat;
             if (improvement > m_migrationThreshold) {
                 selectedLink = bestLink;
-                decision     = "MIGRATE_GAIN";
+                decision     = "MIGRATE_" + categoryTag;
             } else {
                 selectedLink = currentLink;
                 decision     = "STAY_HYSTERESIS";
@@ -1024,12 +1223,34 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
             ls.achievedThroughputMbps = (ls.txBytes * 8.0) / (dt * 1e6);
             ls.txBytes = 0;
 
-            // PER
-            if (ls.txAttempts > 0)
-                ls.packetErrorRate = 1.0 - std::min(1.0,
+            // PER — use EWMA instead of a hard per-window reset.
+            //
+            // BUG THIS FIXES: txAttempts is incremented at PHY TX START
+            // (FeedLinkTxAttempt), while txSuccess is incremented only when
+            // the ACK/BlockAck confirms success (FeedLinkMetrics) — which
+            // can arrive AFTER this 0.5s window has already reset both
+            // counters to zero, especially under high delay/contention
+            // (exactly when an accurate PER matters most). A hard reset
+            // every window systematically inflates PER under load, because
+            // a TX attempted near the end of a window whose confirmation
+            // lands in the NEXT window is counted as 100% loss in the
+            // window it started in, and contributes nothing to the window
+            // it actually succeeded in.
+            //
+            // Fix: keep a running (EWMA) estimate instead. If a window has
+            // zero attempts, leave the estimate unchanged rather than
+            // snapping it to 0 (no evidence either way).
+            if (ls.txAttempts > 0) {
+                double windowPer = 1.0 - std::min(1.0,
                     static_cast<double>(ls.txSuccess) / ls.txAttempts);
-            else
-                ls.packetErrorRate = 0.0;
+                constexpr double perAlpha = 0.3; // smoothing factor
+                if (!ls.perInitialized) {
+                    ls.packetErrorRate = windowPer; // first-ever sample
+                    ls.perInitialized  = true;
+                } else {
+                    ls.packetErrorRate = (1.0 - perAlpha) * ls.packetErrorRate + perAlpha * windowPer;
+                }
+            }
             ls.txAttempts = 0;
             ls.txSuccess  = 0;
             ls.dropFrames = 0;
