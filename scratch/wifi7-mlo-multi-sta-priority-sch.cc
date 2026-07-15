@@ -133,8 +133,8 @@ Time g_frameDistributionEndTime;
 bool g_useCustomMloScheduler = true;
 
 // Goal-Oriented scheduler thresholds
-double g_stayThreshold      = 0.85; // stay if currentSatisfaction >= this
-double g_migrationThreshold = 0.15; // migrate only if expectedGain > this
+double g_stayThreshold      = 0.75; // stay if currentSatisfaction >= this
+double g_migrationThreshold = 0.25; // migrate only if expectedGain > this
 
 Ptr<QosWeightedMloScheduler> g_apScheduler;
 // STAs use the default FcfsWifiQueueScheduler (AP-only scope for goal-oriented scheduler)
@@ -797,6 +797,16 @@ std::vector<bool> g_firstPacket;
 // Per-STA throughput tracking
 std::vector<uint64_t> g_lastTotalRx;
 
+// Per-STA identity/goal, for feeding real per-STA QoS to the AP scheduler
+std::vector<std::vector<Mac48Address>> g_staIndexToMacs; // todos os MACs (MLD + link) por STA
+std::vector<AcIndex> g_staAc;                             // AC de cada STA
+double g_offeredMbpsPerSta = 150.0;                       // taxa oferecida por STA
+// Baselines por janela (para converter somas cumulativas em médias por janela)
+std::vector<double>   g_lastDelaySumMs;
+std::vector<uint64_t> g_lastDelaySamples;
+std::vector<double>   g_lastJitterSumMs;
+std::vector<uint64_t> g_lastJitterSamples;
+
 struct QueueOccupancyTarget
 {
     std::string role;
@@ -875,6 +885,31 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
         uint64_t currentTotalRx = sinks[i]->GetTotalRx();
         double throughput = ((currentTotalRx - g_lastTotalRx[i]) * 8.0) / (1.0 * 1e6);
         g_lastTotalRx[i] = currentTotalRx;
+
+        // ---- Métricas REAIS por-STA nesta janela (delta das somas cumulativas) ----
+        uint64_t dSamples = g_delaySamples[i]  - g_lastDelaySamples[i];
+        double   dDelaySum = g_delaySumMs[i]   - g_lastDelaySumMs[i];
+        uint64_t jSamples = g_jitterSamples[i] - g_lastJitterSamples[i];
+        double   dJitterSum = g_jitterSumMs[i] - g_lastJitterSumMs[i];
+        g_lastDelaySamples[i]  = g_delaySamples[i];
+        g_lastDelaySumMs[i]    = g_delaySumMs[i];
+        g_lastJitterSamples[i] = g_jitterSamples[i];
+        g_lastJitterSumMs[i]   = g_jitterSumMs[i];
+
+        double winDelay  = (dSamples > 0) ? (dDelaySum / dSamples) : 0.0;
+        double winJitter = (jSamples > 0) ? (dJitterSum / jSamples) : 0.0;
+        double winLoss   = (g_offeredMbpsPerSta > 0.0)
+                             ? std::min(1.0, std::max(0.0, 1.0 - throughput / g_offeredMbpsPerSta))
+                             : 0.0;
+
+        // Alimentar o scheduler do AP com a QoS real deste STA (para todos os
+        // seus MACs, para casar com o Addr1 que o scheduler observa).
+        if (g_apScheduler && i < g_staIndexToMacs.size()) {
+            for (const auto& mac : g_staIndexToMacs[i]) {
+                g_apScheduler->FeedStaQos(mac, g_staAc[i],
+                                          throughput, winDelay, winJitter, winLoss);
+            }
+        }
 
         if (throughput > 0) {
             totalThroughput += throughput;
@@ -976,6 +1011,20 @@ PriorityClassToAcName(uint32_t priorityClass)
         return "VO";
     default:
         return "BE";
+    }
+}
+
+// Classe de prioridade (0=BK,1=BE,2=VI,3=VO) -> AcIndex (BE=0,BK=1,VI=2,VO=3)
+AcIndex
+PriorityClassToAc(uint32_t priorityClass)
+{
+    switch (priorityClass)
+    {
+    case 0: return AC_BK;
+    case 1: return AC_BE;
+    case 2: return AC_VI;
+    case 3: return AC_VO;
+    default: return AC_BE;
     }
 }
 
@@ -1142,6 +1191,17 @@ int main(int argc, char* argv[])
     g_lastDelayMs.resize(g_numStas, 0.0);
     g_firstPacket.resize(g_numStas, true);
     g_lastTotalRx.resize(g_numStas, 0);
+    g_lastDelaySumMs.resize(g_numStas, 0.0);
+    g_lastDelaySamples.resize(g_numStas, 0);
+    g_lastJitterSumMs.resize(g_numStas, 0.0);
+    g_lastJitterSamples.resize(g_numStas, 0);
+    // Taxa oferecida por STA (para calcular loss = 1 - recebido/oferecido)
+    {
+        double v = std::atof(dataRateStr.c_str());
+        if (dataRateStr.find("Gbps") != std::string::npos) v *= 1000.0;
+        else if (dataRateStr.find("Kbps") != std::string::npos) v /= 1000.0;
+        if (v > 0.0) g_offeredMbpsPerSta = v;
+    }
     g_queueOccupancyCsvPath = queueOccupancyCsvPath;
     g_queueSampleInterval = queueSampleInterval;
     g_linkTrafficCsvPath = linkTrafficCsvPath;
@@ -1522,17 +1582,26 @@ int main(int argc, char* argv[])
     // ifAp[0] = AP, ifSta[0..3] = STAs
 
     g_staAddressToIndex.clear();
+    g_staIndexToMacs.assign(staDev.GetN(), {});
+    g_staAc.assign(staDev.GetN(), AC_BE);
     for (uint32_t i = 0; i < staDev.GetN(); ++i)
     {
         Ptr<WifiNetDevice> staWifiNetDev = DynamicCast<WifiNetDevice>(staDev.Get(i));
         if (staWifiNetDev)
         {
+            Mac48Address mldMac = Mac48Address::ConvertFrom(staWifiNetDev->GetMac()->GetAddress());
             g_staAddressToIndex[MacAddressToString(staWifiNetDev->GetMac()->GetAddress())] = i;
+            g_staIndexToMacs[i].push_back(mldMac);
             for (uint8_t linkId = 0; linkId < staWifiNetDev->GetNPhys(); ++linkId)
             {
+                Mac48Address linkMac = Mac48Address::ConvertFrom(
+                    staWifiNetDev->GetMac()->GetFrameExchangeManager(linkId)->GetAddress());
                 g_staAddressToIndex[MacAddressToString(
                     staWifiNetDev->GetMac()->GetFrameExchangeManager(linkId)->GetAddress())] = i;
+                g_staIndexToMacs[i].push_back(linkMac);
             }
+            if (i < staPriorities.size())
+                g_staAc[i] = PriorityClassToAc(staPriorities[i]);
         }
     }
 

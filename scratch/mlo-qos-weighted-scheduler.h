@@ -69,6 +69,16 @@ struct QosSatisfaction {
     double index{0.0}; ///< weighted aggregate
 };
 
+/// Real per-(STA,AC) end-to-end QoS measurements fed from the simulation sinks.
+struct StaQos {
+    double   tpMbps{0.0};
+    double   delayMs{0.0};
+    double   jitterMs{0.0};
+    double   lossRate{0.0};
+    bool     valid{false};
+    uint32_t samples{0}; ///< nº de janelas de medição alimentadas (warmup)
+};
+
 // ---------------------------------------------------------------------------
 // Phase 2 — Link Capability Engine
 // ---------------------------------------------------------------------------
@@ -204,6 +214,11 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
                                double airtimeSec,
                                const std::string& peerAddress, uint8_t tid);
 
+    /// Real per-(STA,AC) end-to-end QoS measurements (fed periodically from the
+    /// simulation sinks). These drive the MEASURED satisfaction (curSat).
+    void FeedStaQos(Mac48Address sta, AcIndex ac,
+                    double tpMbps, double delayMs, double jitterMs, double lossRate);
+
     // ---- Configuration ----
     void EnableDecisionCsv(const std::string& filename, const std::string& nodeContext);
     void SetWeights(AcIndex ac, double delay, double jitter, double loss, double tp);
@@ -263,10 +278,12 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     double UtilityFunction(double value, double target, bool lowerIsBetter) const;
 
     // ---- Phase 1: Goal-Awareness Engine ----
-    /// Compute QoS satisfaction for AC on the given link using current metrics
-    QosSatisfaction ComputeQosSatisfaction(AcIndex ac, uint8_t linkId) const;
-    /// Returns the weighted satisfaction index for AC on its current link
-    double CurrentQosSatisfaction(AcIndex ac) const;
+    /// Compute QoS satisfaction for (STA, AC) using real per-STA end-to-end
+    /// measurements (m_staQos). linkId kept for signature compatibility.
+    QosSatisfaction ComputeQosSatisfaction(AcIndex ac, const Mac48Address& sta,
+                                           uint8_t linkId) const;
+    /// Returns the weighted satisfaction index for (STA, AC) on its current link
+    double CurrentQosSatisfaction(AcIndex ac, const Mac48Address& sta) const;
 
     // ---- Phase 2: Link Capability Engine ----
     void UpdateLinkCapability(uint8_t linkId, double dt);
@@ -280,19 +297,21 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     double NormalisedLoad(AcIndex ac, uint8_t linkId) const;
 
     // ---- Phase 5+6: Migration Decision Engine ----
-    /// Expected QoS satisfaction if AC were placed on linkId
-    double ComputeExpectedQosSatisfaction(AcIndex ac, uint8_t linkId) const;
-    /// Returns true if any link can meet goals for AC
-    bool AnyLinkMeetsGoals(AcIndex ac, const std::list<uint8_t>& links) const;
+    /// Number of OTHER STAs of the same AC already assigned to linkId
+    uint32_t CountCoResidents(AcIndex ac, const Mac48Address& sta, uint8_t linkId) const;
+    /// Expected QoS satisfaction if (STA, AC) were placed on linkId
+    double ComputeExpectedQosSatisfaction(AcIndex ac, const Mac48Address& sta, uint8_t linkId) const;
+    /// Returns true if any link can meet goals for (STA, AC)
+    bool AnyLinkMeetsGoals(AcIndex ac, const Mac48Address& sta, const std::list<uint8_t>& links) const;
     /// Best-achievable score when no link meets goals (used as tiebreaker)
-    double ComputeBestAchievableScore(AcIndex ac, uint8_t linkId) const;
+    double ComputeBestAchievableScore(AcIndex ac, const Mac48Address& sta, uint8_t linkId) const;
 
     /// Returns true if ac's own QoS satisfaction on linkId clears a
     /// "goals met" threshold — using the same composite index as
     /// m_currentSatisfaction (CurrentQosSatisfaction), not a borrowed Mbps
     /// comparison. Generic across any AC: each AC's own weights/goals
     /// already encode what "meeting goals" means for it.
-    bool MeetsOwnGoals(AcIndex ac, uint8_t linkId) const;
+    bool MeetsOwnGoals(AcIndex ac, const Mac48Address& sta, uint8_t linkId) const;
 
     /// Returns true if placing ac on linkId would harm the worst-affected
     /// AC currently resident there beyond an acceptable threshold — using
@@ -301,7 +320,7 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     /// dimensions (delay/jitter/loss/throughput) count with their AC-specific
     /// weights, consistent with how satisfaction is judged everywhere else.
     /// harmedAcOut/worstSatOut (optional) report which AC and how badly.
-    bool WouldHarmResident(AcIndex ac, uint8_t linkId,
+    bool WouldHarmResident(AcIndex ac, const Mac48Address& sta, uint8_t linkId,
                            AcIndex* harmedAcOut = nullptr,
                            double* worstSatOut = nullptr) const;
 
@@ -315,7 +334,8 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     ///      goals for a lower/equal-priority resident).
     ///   Third: if ac cannot meet its own goals anywhere, fall back to the
     ///      best-achievable score (existing behaviour).
-    uint8_t DecideLinkMigration(AcIndex ac, const std::list<uint8_t>& eligibleLinks);
+    uint8_t DecideLinkMigration(AcIndex ac, const Mac48Address& sta,
+                                 const std::list<uint8_t>& eligibleLinks);
 
     // ---- Periodic update ----
     void UpdatePeriodicMetrics();
@@ -328,13 +348,16 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
 
     // ---- Packet enqueue timestamps for accurate delay ----
     std::map<uint64_t, double> m_packetEnqueueTimes; // uid -> enqueue time (ms)
-    /// Which link was last selected per AC (for per-link delay attribution)
-    std::map<uint8_t, uint8_t> m_lastSelectedLink;
+    /// Per-(destination STA MAC, AC) routing key for per-flow link assignment
+    using StaAcKey = std::pair<Mac48Address, uint8_t>;
+    std::map<StaAcKey, uint8_t> m_lastSelectedLink;
 
     // ---- Phase 1 state ----
     std::map<uint8_t, AcGoals>        m_goals;         // per AC (indexed by AcIndex cast to uint8)
     std::map<uint8_t, AcWeights>      m_weights;
-    std::map<uint8_t, QosSatisfaction> m_currentSatisfaction; // per AC, current link
+    std::map<StaAcKey, QosSatisfaction> m_currentSatisfaction; // per (STA, AC), current link
+    std::set<StaAcKey> m_hasMeasuredSat; // (STA,AC) com pelo menos uma medição real de throughput
+    std::map<StaAcKey, StaQos> m_staQos; // (STA,AC) -> métricas reais end-to-end (dos sinks)
 
     // ---- Phase 2 state ----
     std::map<uint8_t, LinkCapability> m_linkCapability; // per link
@@ -470,7 +493,8 @@ QosWeightedMloScheduler::QosWeightedMloScheduler()
     for (auto ac : {AC_VO, AC_VI, AC_BE, AC_BK}) {
         m_acStates[static_cast<uint8_t>(ac)] = {};
         m_lastAcBytesSent[static_cast<uint8_t>(ac)] = 0;
-        m_currentSatisfaction[static_cast<uint8_t>(ac)] = {};
+        // m_currentSatisfaction is keyed by (STA MAC, AC) and populated
+        // lazily as STAs are discovered — no per-AC init needed here.
     }
 }
 
@@ -670,6 +694,16 @@ QosWeightedMloScheduler::FeedPacketTransmitted(uint8_t linkId, AcIndex ac,
     }
 }
 
+inline void
+QosWeightedMloScheduler::FeedStaQos(Mac48Address sta, AcIndex ac,
+                                    double tpMbps, double delayMs,
+                                    double jitterMs, double lossRate)
+{
+    auto& q = m_staQos[{sta, static_cast<uint8_t>(ac)}];
+    q.tpMbps = tpMbps; q.delayMs = delayMs; q.jitterMs = jitterMs;
+    q.lossRate = lossRate; q.valid = true; q.samples++;
+}
+
 // ===========================================================================
 // Utility function (sigmoid)
 // ===========================================================================
@@ -689,8 +723,10 @@ QosWeightedMloScheduler::UtilityFunction(double value, double target,
 // Phase 1 — Goal-Awareness Engine
 // ===========================================================================
 inline QosSatisfaction
-QosWeightedMloScheduler::ComputeQosSatisfaction(AcIndex ac, uint8_t linkId) const
+QosWeightedMloScheduler::ComputeQosSatisfaction(AcIndex ac, const Mac48Address& sta,
+                                                uint8_t linkId) const
 {
+    (void)linkId; // as medições reais são end-to-end por-STA (link corrente)
     QosSatisfaction sat{};
     uint8_t acIdx = static_cast<uint8_t>(ac);
 
@@ -701,17 +737,17 @@ QosWeightedMloScheduler::ComputeQosSatisfaction(AcIndex ac, uint8_t linkId) cons
     const AcGoals&   g = gIt->second;
     const AcWeights& w = wIt->second;
 
-    // Fetch per-(link, AC) metrics
-    auto lIt = m_metrics.find(linkId);
-    if (lIt == m_metrics.end()) return sat;
-    auto aIt = lIt->second.find(acIdx);
-    if (aIt == lIt->second.end()) return sat;
-    const LinkState& m = aIt->second;
+    // Métricas REAIS por-(STA,AC), medidas end-to-end nos sinks e alimentadas
+    // via FeedStaQos. Sem entrada válida ainda (arranque), devolve zeros — o
+    // bootstrap sticky trata do cold-start.
+    auto qIt = m_staQos.find({sta, acIdx});
+    if (qIt == m_staQos.end() || !qIt->second.valid) return sat;
+    const StaQos& q = qIt->second;
 
-    sat.throughput = UtilityFunction(m.achievedThroughputMbps, g.targetThroughputMbps, false);
-    sat.delay      = UtilityFunction(m.avgQueueDelayMs,         g.maxDelayMs,           true);
-    sat.jitter     = UtilityFunction(m.avgJitterMs,             g.maxJitterMs,           true);
-    sat.loss       = UtilityFunction(m.packetErrorRate,         g.maxPacketLoss,         true);
+    sat.throughput = UtilityFunction(q.tpMbps,   g.targetThroughputMbps, false);
+    sat.delay      = UtilityFunction(q.delayMs,  g.maxDelayMs,           true);
+    sat.jitter     = UtilityFunction(q.jitterMs, g.maxJitterMs,          true);
+    sat.loss       = UtilityFunction(q.lossRate, g.maxPacketLoss,        true);
 
     double totalW  = w.throughputWeight + w.delayWeight + w.jitterWeight + w.lossWeight;
     if (totalW <= 0.0) totalW = 1.0;
@@ -725,10 +761,9 @@ QosWeightedMloScheduler::ComputeQosSatisfaction(AcIndex ac, uint8_t linkId) cons
 }
 
 inline double
-QosWeightedMloScheduler::CurrentQosSatisfaction(AcIndex ac) const
+QosWeightedMloScheduler::CurrentQosSatisfaction(AcIndex ac, const Mac48Address& sta) const
 {
-    uint8_t acIdx = static_cast<uint8_t>(ac);
-    auto it = m_currentSatisfaction.find(acIdx);
+    auto it = m_currentSatisfaction.find({sta, static_cast<uint8_t>(ac)});
     if (it == m_currentSatisfaction.end()) return 0.0;
     return it->second.index;
 }
@@ -883,6 +918,7 @@ QosWeightedMloScheduler::UpdateEdcaCompetition(uint8_t linkId)
 // ===========================================================================
 inline double
 QosWeightedMloScheduler::ComputeExpectedQosSatisfaction(AcIndex ac,
+                                                         const Mac48Address& sta,
                                                          uint8_t linkId) const
 {
     uint8_t  acIdx = static_cast<uint8_t>(ac);
@@ -900,7 +936,15 @@ QosWeightedMloScheduler::ComputeExpectedQosSatisfaction(AcIndex ac,
         if (acEdca != edcaIt->second.end())
             effCap = acEdca->second.effectiveAvailableCapacityMbps;
     }
-    double expTp = UtilityFunction(effCap, g.targetThroughputMbps, false);
+
+    // Co-occupancy: when N other STAs of the same AC already share this link,
+    // divide the projected capacity by N+1 (this STA + the N others).
+    // If only this STA would be here, denominator = 1 and no change applies.
+    uint32_t coRes = CountCoResidents(ac, sta, linkId);
+    double effCapShared = (coRes > 0)
+                            ? effCap / static_cast<double>(coRes + 1)
+                            : effCap;
+    double expTp = UtilityFunction(effCapShared, g.targetThroughputMbps, false);
 
     // For delay/jitter/loss: use current measured values on this link as a proxy,
     // combined with a penalty proportional to EDCA competition pressure
@@ -970,13 +1014,20 @@ QosWeightedMloScheduler::ComputeExpectedQosSatisfaction(AcIndex ac,
     for (AcIndex otherAc : {AC_BK, AC_BE, AC_VI, AC_VO}) {
         if (otherAc == ac) continue;
         uint8_t otherAcIdx = static_cast<uint8_t>(otherAc);
-        auto lastIt = m_lastSelectedLink.find(otherAcIdx);
 
-        // Only consider ACs currently resident on this candidate link.
-        if (lastIt == m_lastSelectedLink.end() || lastIt->second != linkId) continue;
+        // Find worst-satisfied STA of this AC type that is resident on linkId.
+        bool anyResident = false;
+        double worstOtherSat = 1.0;
+        for (const auto& [key, resLink] : m_lastSelectedLink) {
+            if (key.second != otherAcIdx || resLink != linkId) continue;
+            anyResident = true;
+            double sat = m_currentSatisfaction.count(key)
+                           ? m_currentSatisfaction.at(key).index : 1.0;
+            if (sat < worstOtherSat) worstOtherSat = sat;
+        }
+        if (!anyResident) continue;
 
-        double otherSat = m_currentSatisfaction.count(otherAcIdx)
-                          ? m_currentSatisfaction.at(otherAcIdx).index : 1.0;
+        double otherSat = worstOtherSat;
 
         // (A) Reactive: other AC already starving — penalise as before.
         if (otherSat < 0.45) {
@@ -1010,141 +1061,143 @@ QosWeightedMloScheduler::ComputeExpectedQosSatisfaction(AcIndex ac,
     return std::max(0.0, expectedScore - altruisticPenalty);
 }
 
+inline uint32_t
+QosWeightedMloScheduler::CountCoResidents(AcIndex ac, const Mac48Address& sta,
+                                           uint8_t linkId) const
+{
+    uint8_t acIdx = static_cast<uint8_t>(ac);
+    uint32_t count = 0;
+    for (const auto& [key, link] : m_lastSelectedLink) {
+        if (link == linkId && key.second == acIdx && key.first != sta) ++count;
+    }
+    return count;
+}
+
 inline bool
-QosWeightedMloScheduler::AnyLinkMeetsGoals(AcIndex ac,
-                                            const std::list<uint8_t>& links) const
+QosWeightedMloScheduler::AnyLinkMeetsGoals(AcIndex ac, const Mac48Address& sta,
+                                             const std::list<uint8_t>& links) const
 {
     for (uint8_t linkId : links) {
-        if (ComputeExpectedQosSatisfaction(ac, linkId) >= 1.0) return true;
+        if (ComputeExpectedQosSatisfaction(ac, sta, linkId) >= 1.0) return true;
     }
     return false;
 }
 
 inline double
-QosWeightedMloScheduler::ComputeBestAchievableScore(AcIndex ac,
+QosWeightedMloScheduler::ComputeBestAchievableScore(AcIndex ac, const Mac48Address& sta,
                                                      uint8_t linkId) const
 {
-    // Best-achievable: same as ExpectedQoS but without requiring >= 1.0
-    // (already what ComputeExpectedQosSatisfaction returns)
-    return ComputeExpectedQosSatisfaction(ac, linkId);
+    return ComputeExpectedQosSatisfaction(ac, sta, linkId);
 }
 
 inline bool
-QosWeightedMloScheduler::MeetsOwnGoals(AcIndex ac, uint8_t linkId) const
+QosWeightedMloScheduler::MeetsOwnGoals(AcIndex ac, const Mac48Address& sta,
+                                         uint8_t linkId) const
 {
-    // Use the same composite score the rest of the scheduler relies on.
-    // ComputeExpectedQosSatisfaction already blends throughput/delay/jitter/
-    // loss with this AC's own weights and its own EDCA-aware projected
-    // capacity on linkId — exactly "would I be satisfied here", generalised
-    // to any AC without per-scenario hardcoding.
-    return ComputeExpectedQosSatisfaction(ac, linkId) >= m_ownGoalsThreshold;
+    return ComputeExpectedQosSatisfaction(ac, sta, linkId) >= m_ownGoalsThreshold;
 }
 
 inline bool
-QosWeightedMloScheduler::WouldHarmResident(AcIndex ac, uint8_t linkId,
+QosWeightedMloScheduler::WouldHarmResident(AcIndex ac, const Mac48Address& sta,
+                                            uint8_t linkId,
                                             AcIndex* harmedAcOut,
                                             double* worstSatOut) const
 {
-    // Find the worst-affected resident AC on linkId (excluding ac itself)
-    // using the SAME composite satisfaction index (m_currentSatisfaction)
-    // used everywhere else in the scheduler — all four QoS dimensions count,
-    // weighted per that resident's own AcWeights, not just loss in isolation.
-    //
-    // We deliberately use the CURRENT measured satisfaction of residents
-    // (not a re-projection), because the question here is "is anyone HERE
-    // already struggling", which is what currentSat already answers — the
-    // preventive headroom check inside ComputeExpectedQosSatisfaction (the
-    // altruisticPenalty term) is a separate, complementary signal already
-    // folded into the score; this function answers the cascade's explicit
-    // "would I actively harm someone" question on its own terms.
+    // Find the worst-affected resident (STA, AC) pair on linkId, excluding
+    // this (sta, ac) entry. Uses the same composite satisfaction index as
+    // the rest of the scheduler — all four QoS dimensions count.
     double worstSat = 1.0;
-    AcIndex worstAc = ac;
+    uint8_t worstAcIdx = static_cast<uint8_t>(ac);
     bool foundResident = false;
 
-    for (AcIndex otherAc : {AC_BK, AC_BE, AC_VI, AC_VO}) {
-        if (otherAc == ac) continue;
-        uint8_t otherAcIdx = static_cast<uint8_t>(otherAc);
-        auto lastIt = m_lastSelectedLink.find(otherAcIdx);
-        if (lastIt == m_lastSelectedLink.end() || lastIt->second != linkId) continue;
+    for (const auto& [key, residentLink] : m_lastSelectedLink) {
+        if (residentLink != linkId) continue;
+        // Skip self
+        if (key.second == static_cast<uint8_t>(ac)) continue; // skip ALL same-AC (cross-AC harm only)
 
-        double otherSat = m_currentSatisfaction.count(otherAcIdx)
-                              ? m_currentSatisfaction.at(otherAcIdx).index : 1.0;
+        double otherSat = m_currentSatisfaction.count(key)
+                              ? m_currentSatisfaction.at(key).index : 1.0;
         foundResident = true;
         if (otherSat < worstSat) {
-            worstSat = otherSat;
-            worstAc  = otherAc;
+            worstSat   = otherSat;
+            worstAcIdx = key.second;
         }
     }
 
-    if (harmedAcOut)  *harmedAcOut  = worstAc;
-    if (worstSatOut)  *worstSatOut  = foundResident ? worstSat : 1.0;
+    if (harmedAcOut) *harmedAcOut = static_cast<AcIndex>(worstAcIdx);
+    if (worstSatOut) *worstSatOut = foundResident ? worstSat : 1.0;
 
-    if (!foundResident) return false; // nobody else there — can't harm anyone
+    if (!foundResident) return false;
     return worstSat <= m_harmThreshold;
 }
 
 inline uint8_t
-QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac,
+QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta,
                                               const std::list<uint8_t>& eligibleLinks)
 {
-    if (eligibleLinks.empty())       return m_slowLinkId;
-    if (eligibleLinks.size() == 1)   {
+    if (eligibleLinks.empty()) return m_slowLinkId;
+    if (eligibleLinks.size() == 1) {
         uint8_t onlyLink = eligibleLinks.front();
-        m_lastSelectedLink[static_cast<uint8_t>(ac)] = onlyLink;
+        m_lastSelectedLink[{sta, static_cast<uint8_t>(ac)}] = onlyLink;
         m_metrics[onlyLink][static_cast<uint8_t>(ac)].enqueueCount++;
         return onlyLink;
     }
 
     uint8_t acIdx = static_cast<uint8_t>(ac);
+    StaAcKey staAcKey = {sta, acIdx};
 
     // Determine current link (anchor)
-    auto lastIt = m_lastSelectedLink.find(acIdx);
+    auto lastIt = m_lastSelectedLink.find(staAcKey);
     bool hasAnchor = (lastIt != m_lastSelectedLink.end())
                   && (std::find(eligibleLinks.begin(), eligibleLinks.end(),
                                 lastIt->second) != eligibleLinks.end());
     uint8_t currentLink = hasAnchor ? lastIt->second : eligibleLinks.front();
 
     // ---- Phase 5: check if we can stay ----
-    double currentSat = m_currentSatisfaction.count(acIdx)
-                            ? m_currentSatisfaction.at(acIdx).index : 0.0;
+    double currentSat = m_currentSatisfaction.count(staAcKey)
+                            ? m_currentSatisfaction.at(staAcKey).index : 0.0;
 
     std::string decision = "STAY_SATISFIED";
     uint8_t selectedLink = currentLink;
     double  selectedExpSat = currentSat;
 
+    // ---- Priority bootstrap, held until first measured satisfaction ----
+    // Até existir uma amostra de satisfação MEDIDA para este (STA,AC),
+    // mantém a alocação por prioridade EDCA (VO/VI -> fast, BE/BK -> slow).
+    // Isto impede que o transiente de cold-start (effCap=capacidade total nos
+    // links vazios) puxe ACs de baixa prioridade para o fast e contamine a
+    // primeira medição dos residentes de alta prioridade.
+    bool useBootstrap = false;
+    if (m_hasMeasuredSat.count(staAcKey) == 0) {
+        uint8_t bootLink = (acIdx >= static_cast<uint8_t>(AC_VI))
+                           ? m_fastLinkId : m_slowLinkId;
+        if (std::find(eligibleLinks.begin(), eligibleLinks.end(), bootLink)
+                != eligibleLinks.end()) {
+            selectedLink = bootLink;
+            decision = "BOOTSTRAP_PRIORITY";
+            useBootstrap = true;
+        }
+    }
+
+    if (!useBootstrap) {
     if (currentSat >= m_stayThreshold && hasAnchor) {
-        // Satisfied — keep current link
         decision = "STAY_SATISFIED";
     } else {
-        // ---- Explicit priority cascade across eligible links ----
-        // Category 1: meets own goals AND doesn't harm any resident beyond
-        //             the harm threshold — the ideal outcome.
-        // Category 2: meets own goals but DOES harm a resident — acceptable
-        //             only because ac has no Category-1 alternative; EDCA
-        //             priority is real and ac is not required to sacrifice
-        //             its own goals for a lower/equal-priority resident.
-        // Category 3: doesn't meet own goals anywhere — fall back to
-        //             best-achievable score (previous behaviour).
-        //
-        // Within whichever category has candidates, pick the link with the
-        // highest ComputeExpectedQosSatisfaction score.
         uint8_t bestCat1Link = 0; double bestCat1Score = -1.0; bool hasCat1 = false;
         uint8_t bestCat2Link = 0; double bestCat2Score = -1.0; bool hasCat2 = false;
-        uint8_t bestCat3Link = currentLink; double bestCat3Score = ComputeBestAchievableScore(ac, currentLink);
+        uint8_t bestCat3Link = currentLink; double bestCat3Score = ComputeBestAchievableScore(ac, sta, currentLink);
 
         for (uint8_t linkId : eligibleLinks) {
-            bool meetsOwn = MeetsOwnGoals(ac, linkId);
-            bool harms    = WouldHarmResident(ac, linkId);
-            double score  = ComputeExpectedQosSatisfaction(ac, linkId);
+            bool meetsOwn = MeetsOwnGoals(ac, sta, linkId);
+            bool harms    = WouldHarmResident(ac, sta, linkId);
+            double score  = ComputeExpectedQosSatisfaction(ac, sta, linkId);
 
             if (meetsOwn && !harms) {
                 if (!hasCat1 || score > bestCat1Score) { bestCat1Score = score; bestCat1Link = linkId; hasCat1 = true; }
             } else if (meetsOwn && harms) {
                 if (!hasCat2 || score > bestCat2Score) { bestCat2Score = score; bestCat2Link = linkId; hasCat2 = true; }
             }
-            // Category 3 fallback always tracks the best achievable score
-            // regardless of meetsOwn/harms, as a safety net.
-            double bestScoreSoFar = ComputeBestAchievableScore(ac, linkId);
+            double bestScoreSoFar = ComputeBestAchievableScore(ac, sta, linkId);
             if (bestScoreSoFar > bestCat3Score) { bestCat3Score = bestScoreSoFar; bestCat3Link = linkId; }
         }
 
@@ -1154,6 +1207,34 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac,
         else              { bestLink = bestCat3Link; bestScore = bestCat3Score; categoryTag = "CAT3_BEST_EFFORT"; }
 
         selectedExpSat = bestScore;
+
+        // Anti-downgrade guard para VO/VI. Um AC de alta prioridade no fast
+        // não deve descer para o slow (a) por ruído de cold-start se for o
+        // único do seu AC no fast, ou (b) para um link onde resida um BE/BK
+        // (esfomeá-los-ia por EDCA — regra: BE/BK nunca partilham com VO/VI).
+        // EXCEÇÃO: se o VO/VI estiver genuinamente a não cumprir os objetivos
+        // no fast (esfomeado), cede e pode descer — tem prioridade sobre o BE.
+        // O sinal de fome usa a satisfação PROJETADA no fast (estável), não o
+        // curSat medido (ruidoso no cold-start).
+        bool isHighPrio = (acIdx >= static_cast<uint8_t>(AC_VI));
+        if (isHighPrio && bestLink == m_slowLinkId && currentLink == m_fastLinkId) {
+            // Sinal de fome = satisfação MEDIDA no fast (currentSat, fiável após
+            // o warmup de 2 janelas), não a projecção (instável no 6GHz).
+            constexpr double kStarvationFloor = 0.60; // tunável
+            bool starvingOnFast = (currentSat < kStarvationFloor);
+
+            bool soleOccupant = CountCoResidents(ac, sta, m_fastLinkId) == 0;
+            bool wouldStarveLowPrio = false;
+            for (const auto& [key, resLink] : m_lastSelectedLink) {
+                if (resLink == bestLink && key.second < static_cast<uint8_t>(AC_VI)) {
+                    wouldStarveLowPrio = true;
+                    break;
+                }
+            }
+            if ((soleOccupant || wouldStarveLowPrio) && !starvingOnFast) {
+                bestLink = currentLink; // veto: mantém no fast
+            }
+        }
 
         if (bestLink != currentLink) {
             double improvement = bestScore - currentSat;
@@ -1168,8 +1249,9 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac,
             decision = hasAnchor ? "STAY_HYSTERESIS" : "STAY_BEST";
         }
     }
+    } // end if (!useBootstrap)
 
-    m_lastSelectedLink[acIdx] = selectedLink;
+    m_lastSelectedLink[staAcKey] = selectedLink;
     m_metrics[selectedLink][acIdx].enqueueCount++;
 
     // ---- CSV logging ----
@@ -1179,15 +1261,27 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac,
         auto& edca = m_edca[selectedLink][acIdx];
         auto& cap  = m_linkCapability[selectedLink];
 
+        // Métricas REAIS por-STA (as que alimentam a satisfação); fallback aos
+        // proxies per-link quando ainda não há amostra real.
+        double logDelay = lm.avgQueueDelayMs, logJitter = lm.avgJitterMs;
+        double logPer   = lm.packetErrorRate, logTp = lm.achievedThroughputMbps;
+        auto qIt = m_staQos.find(staAcKey);
+        if (qIt != m_staQos.end() && qIt->second.valid) {
+            logDelay  = qIt->second.delayMs;
+            logJitter = qIt->second.jitterMs;
+            logPer    = qIt->second.lossRate;
+            logTp     = qIt->second.tpMbps;
+        }
+
         m_decisionCsv << now << ',' << m_nodeContext << ',' << +ac << ','
                       << +selectedLink << ',' << decision << ','
                       << currentSat << ',' << selectedExpSat << ','
                       << edca.competitionPressure << ','
                       << edca.effectiveAvailableCapacityMbps << ','
                       << cap.capabilityScore << ','
-                      << lm.avgQueueDelayMs << ',' << lm.avgJitterMs << ','
-                      << lm.packetErrorRate << ',' << lm.channelUtilization << ','
-                      << lm.achievedThroughputMbps << '\n';
+                      << logDelay << ',' << logJitter << ','
+                      << logPer << ',' << lm.channelUtilization << ','
+                      << logTp << '\n';
     }
 
     return selectedLink;
@@ -1241,8 +1335,11 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
             // zero attempts, leave the estimate unchanged rather than
             // snapping it to 0 (no evidence either way).
             if (ls.txAttempts > 0) {
-                double windowPer = 1.0 - std::min(1.0,
-                    static_cast<double>(ls.txSuccess) / ls.txAttempts);
+                // PER a partir de drops REAIS (FeedLinkDrop) sobre tentativas.
+                // NÃO usar txSuccess: vem do trace AckedMpdu, que subconta ~5%
+                // dos MPDUs entregues, inflando o PER para ~95% falsamente.
+                double windowPer = std::min(1.0,
+                    static_cast<double>(ls.dropFrames) / ls.txAttempts);
                 constexpr double perAlpha = 0.3; // smoothing factor
                 if (!ls.perInitialized) {
                     ls.packetErrorRate = windowPer; // first-ever sample
@@ -1281,12 +1378,16 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
         UpdateEdcaCompetition(linkId);
     }
 
-    // Phase 1 — update current satisfaction for each AC on its current link
-    for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
-        uint8_t acIdx = static_cast<uint8_t>(ac);
-        auto lastIt   = m_lastSelectedLink.find(acIdx);
-        if (lastIt != m_lastSelectedLink.end()) {
-            m_currentSatisfaction[acIdx] = ComputeQosSatisfaction(ac, lastIt->second);
+    // Phase 1 — update current satisfaction for each (STA, AC) on its current link
+    for (const auto& [key, linkId] : m_lastSelectedLink) {
+        AcIndex ac = static_cast<AcIndex>(key.second);
+        m_currentSatisfaction[key] = ComputeQosSatisfaction(ac, key.first, linkId);
+        // "Medido" = já existem >=2 amostras reais por-STA (FeedStaQos). Saltar
+        // a 1ª janela (contaminada pelo ramp-up) evita migrações prematuras de
+        // cold-start; o bootstrap sticky mantém a alocação por prioridade até lá.
+        constexpr uint32_t kWarmupSamples = 2;
+        if (m_staQos.count(key) && m_staQos.at(key).samples >= kWarmupSamples) {
+            m_hasMeasuredSat.insert(key);
         }
     }
 
@@ -1343,7 +1444,10 @@ QosWeightedMloScheduler::GetLinkIds(AcIndex ac, Ptr<const WifiMpdu> mpdu,
     EnsureDelegate();
     const auto eligible = m_delegate->GetLinkIds(ac, mpdu, ignoredReasons);
     if (eligible.empty()) return {};
-    return {DecideLinkMigration(ac, eligible)};
+    Mac48Address dest = (mpdu && !mpdu->GetHeader().GetAddr1().IsBroadcast())
+                          ? mpdu->GetHeader().GetAddr1()
+                          : Mac48Address("ff:ff:ff:ff:ff:ff");
+    return {DecideLinkMigration(ac, dest, eligible)};
 }
 
 inline void
@@ -1454,19 +1558,21 @@ QosWeightedMloScheduler::NotifyDequeue(AcIndex ac, const std::list<Ptr<WifiMpdu>
     double   nowMs      = Simulator::Now().GetMilliSeconds();
     auto&    acSt       = m_acStates[acIdx];
 
-    // Determine the link this AC is currently using for per-link delay/jitter
-    uint8_t  txLinkId   = m_slowLinkId; // fallback
-    auto lastIt = m_lastSelectedLink.find(acIdx);
-    if (lastIt != m_lastSelectedLink.end())
-        txLinkId = lastIt->second;
-
-    auto lIt = m_metrics.find(txLinkId);
-
     for (const auto& mpdu : mpdus) {
         if (!mpdu || !mpdu->GetPacket()) continue;
 
         acSt.bytesSent   += mpdu->GetSize();
         acSt.packetsSent += 1;
+
+        // Per-STA link lookup for delay/jitter attribution
+        Mac48Address destMac = mpdu->GetHeader().GetAddr1();
+        StaAcKey key = {destMac, acIdx};
+        uint8_t txLinkId = m_slowLinkId; // fallback
+        {
+            auto lastIt2 = m_lastSelectedLink.find(key);
+            if (lastIt2 != m_lastSelectedLink.end()) txLinkId = lastIt2->second;
+        }
+        auto lIt = m_metrics.find(txLinkId);
 
         uint64_t uid = mpdu->GetPacket()->GetUid();
         auto eqIt    = m_packetEnqueueTimes.find(uid);
@@ -1540,16 +1646,13 @@ inline void
 QosWeightedMloScheduler::PrintFinalScores()
 {
     std::cout << "\n=== FINAL MLO SCHEDULER SATISFACTION (" << m_nodeContext << ") ===\n";
-    for (auto ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
-        uint8_t acIdx = static_cast<uint8_t>(ac);
-        std::cout << "AC " << +acIdx << ": ";
-        for (uint8_t linkId : {m_slowLinkId, m_fastLinkId}) {
-            double sat = ComputeExpectedQosSatisfaction(ac, linkId);
-            std::cout << "Link" << +linkId << "=" << sat << " | ";
-        }
-        double curSat = m_currentSatisfaction.count(acIdx)
-                            ? m_currentSatisfaction.at(acIdx).index : 0.0;
-        std::cout << "CurrentSat=" << curSat << "\n";
+    for (const auto& [key, sat] : m_currentSatisfaction) {
+        const Mac48Address& mac = key.first;
+        uint8_t acIdx = key.second;
+        auto lastIt = m_lastSelectedLink.find(key);
+        uint8_t curLink = (lastIt != m_lastSelectedLink.end()) ? lastIt->second : 255;
+        std::cout << "STA " << mac << " AC " << +acIdx
+                  << " Link" << +curLink << " CurrentSat=" << sat.index << "\n";
     }
 }
 
