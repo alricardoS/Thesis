@@ -358,6 +358,7 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     std::map<StaAcKey, QosSatisfaction> m_currentSatisfaction; // per (STA, AC), current link
     std::set<StaAcKey> m_hasMeasuredSat; // (STA,AC) com pelo menos uma medição real de throughput
     std::map<StaAcKey, StaQos> m_staQos; // (STA,AC) -> métricas reais end-to-end (dos sinks)
+    std::map<StaAcKey, std::pair<uint8_t,double>> m_pendingMigration; // (targetLink, tPrimeiraIntençãoSec) — debounce
 
     // ---- Phase 2 state ----
     std::map<uint8_t, LinkCapability> m_linkCapability; // per link
@@ -1239,14 +1240,31 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
         if (bestLink != currentLink) {
             double improvement = bestScore - currentSat;
             if (improvement > m_migrationThreshold) {
-                selectedLink = bestLink;
-                decision     = "MIGRATE_" + categoryTag;
+                // Debounce: só migra se a intenção persistir >= dwell (sobreviver
+                // a >=1 nova janela de medição). Filtra blips de 1 janela.
+                constexpr double kMigrationDwellSec = 1.0; // tunável
+                double now = Simulator::Now().GetSeconds();
+                auto pit = m_pendingMigration.find(staAcKey);
+                if (pit == m_pendingMigration.end() || pit->second.first != bestLink) {
+                    m_pendingMigration[staAcKey] = {bestLink, now};
+                    selectedLink = currentLink;
+                    decision     = "MIGRATE_PENDING";
+                } else if (now - pit->second.second >= kMigrationDwellSec) {
+                    selectedLink = bestLink;
+                    decision     = "MIGRATE_" + categoryTag;
+                    m_pendingMigration.erase(staAcKey);
+                } else {
+                    selectedLink = currentLink;
+                    decision     = "MIGRATE_PENDING";
+                }
             } else {
                 selectedLink = currentLink;
                 decision     = "STAY_HYSTERESIS";
+                m_pendingMigration.erase(staAcKey);
             }
         } else {
             decision = hasAnchor ? "STAY_HYSTERESIS" : "STAY_BEST";
+            m_pendingMigration.erase(staAcKey);
         }
     }
     } // end if (!useBootstrap)

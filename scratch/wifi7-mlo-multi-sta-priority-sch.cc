@@ -801,6 +801,10 @@ std::vector<uint64_t> g_lastTotalRx;
 std::vector<std::vector<Mac48Address>> g_staIndexToMacs; // todos os MACs (MLD + link) por STA
 std::vector<AcIndex> g_staAc;                             // AC de cada STA
 double g_offeredMbpsPerSta = 150.0;                       // taxa oferecida por STA
+// FlowMonitor para loss REAL acumulada por-STA (alimentada ao scheduler)
+Ptr<FlowMonitor> g_flowMonitor;
+Ptr<Ipv4FlowClassifier> g_flowClassifier;
+std::map<Ipv4Address, uint32_t> g_staIpToIndex;          // IP destino -> índice STA
 // Baselines por janela (para converter somas cumulativas em médias por janela)
 std::vector<double>   g_lastDelaySumMs;
 std::vector<uint64_t> g_lastDelaySamples;
@@ -881,6 +885,20 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
     double totalJitter = 0.0;
     uint32_t validStas = 0;
 
+    // Loss REAL acumulada por-STA (FlowMonitor, downlink) — mesma fonte do relatório final.
+    std::vector<uint64_t> staTx(g_numStas, 0), staRx(g_numStas, 0);
+    if (g_flowMonitor && g_flowClassifier) {
+        auto fstats = g_flowMonitor->GetFlowStats();
+        for (const auto& kv : fstats) {
+            Ipv4FlowClassifier::FiveTuple tup = g_flowClassifier->FindFlow(kv.first);
+            auto it = g_staIpToIndex.find(tup.destinationAddress);
+            if (it != g_staIpToIndex.end() && it->second < g_numStas) {
+                staTx[it->second] += kv.second.txPackets;
+                staRx[it->second] += kv.second.rxPackets;
+            }
+        }
+    }
+
     for (uint32_t i = 0; i < g_numStas; ++i) {
         uint64_t currentTotalRx = sinks[i]->GetTotalRx();
         double throughput = ((currentTotalRx - g_lastTotalRx[i]) * 8.0) / (1.0 * 1e6);
@@ -898,8 +916,9 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
 
         double winDelay  = (dSamples > 0) ? (dDelaySum / dSamples) : 0.0;
         double winJitter = (jSamples > 0) ? (dJitterSum / jSamples) : 0.0;
-        double winLoss   = (g_offeredMbpsPerSta > 0.0)
-                             ? std::min(1.0, std::max(0.0, 1.0 - throughput / g_offeredMbpsPerSta))
+        double winLoss   = (staTx[i] > 0)
+                             ? std::min(1.0, std::max(0.0,
+                                 double(staTx[i] - staRx[i]) / double(staTx[i])))
                              : 0.0;
 
         // Alimentar o scheduler do AP com a QoS real deste STA (para todos os
@@ -1602,6 +1621,7 @@ int main(int argc, char* argv[])
             }
             if (i < staPriorities.size())
                 g_staAc[i] = PriorityClassToAc(staPriorities[i]);
+            g_staIpToIndex[ifSta.GetAddress(i)] = i; // para loss real do FlowMonitor
         }
     }
 
@@ -1693,6 +1713,8 @@ int main(int argc, char* argv[])
     // Flow monitor
     FlowMonitorHelper fm;
     Ptr<FlowMonitor> monitor = fm.InstallAll();
+    g_flowMonitor = monitor;
+    g_flowClassifier = DynamicCast<Ipv4FlowClassifier>(fm.GetClassifier());
 
     // Estatísticas periódicas
     Simulator::Schedule(Seconds(2), &CalculateStats, sinks);
