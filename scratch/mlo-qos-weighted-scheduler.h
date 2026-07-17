@@ -1,13 +1,25 @@
 /*
  * Goal-Oriented Traffic-Aware MLO Scheduler
  *
- * Evolução do QosWeightedMloScheduler para um scheduler orientado a objetivos QoS,
- * com cinco motores internos:
- *   1. Goal-Awareness Engine      — ComputeQosSatisfaction por AC
+ * Evolução do QosWeightedMloScheduler para um scheduler orientado a objetivos QoS.
+ * O routing é feito por (STA, AC) — chave StaAcKey — para que duas STAs do mesmo
+ * AC possam ser encaminhadas para links diferentes.
+ *
+ * Seis motores internos:
+ *   1. Goal-Awareness Engine      — ComputeQosSatisfaction por (STA, AC), a partir
+ *                                   das métricas REAIS end-to-end (m_staQos)
  *   2. Link Capability Engine     — estimatedCapacity, availableCapacity, capabilityScore
  *   3. Traffic Composition Engine — throughput/airtime/flows por (link, AC)
  *   4. EDCA Competition Engine    — CompetitionPressure, ExpectedAccessOpportunity
- *   5. Migration Decision Engine  — DecideLinkMigration com histerese e Best-Achievable
+ *   5. Projection Engine          — ComputeExpectedQosSatisfaction (+ co-occupancy
+ *                                   e penalidade altruísta)
+ *   6. Migration Decision Engine  — DecideLinkMigration: cascata Cat1/2/3 + histerese
+ *
+ * Camada de estabilidade (ver README_scheduler.md para o porquê de cada uma):
+ *   - Bootstrap por prioridade, mantido até haver 2 janelas de medição (warmup)
+ *   - Debounce de migração (dwell) — filtra ruído de 1 janela
+ *   - Veto anti-downgrade VO/VI (com exceção de fome) e veto simétrico BE/BK
+ *   - Exclusão de frames broadcast/beacons das verificações de residência
  *
  * Escopo: AP-only (downlink). STAs usam FcfsWifiQueueScheduler.
  */
@@ -143,25 +155,20 @@ struct EdcaCompetition {
 // ---------------------------------------------------------------------------
 // Legacy per-(link, AC) raw metric counters (kept for HOL delay and PER)
 // ---------------------------------------------------------------------------
+/// Métricas por (link, AC). NOTA: são PROXIES usados apenas pela projecção
+/// (ComputeExpectedQosSatisfaction) e pelo CSV. A satisfação MEDIDA de cada
+/// (STA, AC) vem de m_staQos (métricas reais end-to-end), não daqui.
 struct LinkState {
     // Throughput counters (reset each window)
     uint64_t txBytes{0};
     uint64_t txAttempts{0};
-    uint64_t txSuccess{0};
     uint64_t dropFrames{0};
 
-    // Queue snapshot
-    uint32_t queueLength{0};
-    uint32_t queueBytes{0};
-    uint64_t enqueueCount{0};
-    double   lastEnqueueTimeMs{0.0};
-
     // Derived metrics (updated each window)
-    double achievedThroughputMbps{0.0};
-    double packetErrorRate{0.0};
-    bool   perInitialized{false}; // true once at least one PER sample has been taken
+    double achievedThroughputMbps{0.0}; // só diagnóstico/CSV
+    double packetErrorRate{0.0};        // de dropFrames/txAttempts (EWMA)
+    bool   perInitialized{false};       // true once at least one PER sample has been taken
     double channelUtilization{0.0};
-    double holDelay{0.0};
 
     // Average delay per packet (EWMA, updated in NotifyDequeue for correct link)
     double avgQueueDelayMs{0.0};
@@ -170,19 +177,9 @@ struct LinkState {
     double lastDelayMs{-1.0}; // -1 means no prior sample
 };
 
-// Per-AC global state (bytes sent, packets sent)
-struct AcState {
-    uint64_t bytesSent{0};
-    uint64_t packetsSent{0};
-    double   throughputMbps{0.0};
-};
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const double MAX_QUEUE_LENGTH = 500.0;
-const double MAX_DELAY_MS     = 200.0; //ALETEREI era 1000
-const double MAX_THROUGHPUT   = 600.0; // Mbps (6 GHz 320 MHz 2SS EHT)
 
 // ---------------------------------------------------------------------------
 // Main scheduler class
@@ -287,7 +284,6 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     QosSatisfaction ComputeQosSatisfaction(AcIndex ac, const Mac48Address& sta,
                                            uint8_t linkId) const;
     /// Returns the weighted satisfaction index for (STA, AC) on its current link
-    double CurrentQosSatisfaction(AcIndex ac, const Mac48Address& sta) const;
 
     // ---- Phase 2: Link Capability Engine ----
     void UpdateLinkCapability(uint8_t linkId, double dt);
@@ -310,11 +306,10 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     /// Best-achievable score when no link meets goals (used as tiebreaker)
     double ComputeBestAchievableScore(AcIndex ac, const Mac48Address& sta, uint8_t linkId) const;
 
-    /// Returns true if ac's own QoS satisfaction on linkId clears a
-    /// "goals met" threshold — using the same composite index as
-    /// m_currentSatisfaction (CurrentQosSatisfaction), not a borrowed Mbps
-    /// comparison. Generic across any AC: each AC's own weights/goals
-    /// already encode what "meeting goals" means for it.
+    /// Returns true if ac's own projected QoS satisfaction on linkId clears a
+    /// "goals met" threshold — usa o mesmo índice composto do resto do
+    /// scheduler, não uma comparação de Mbps. Genérico para qualquer AC: os
+    /// pesos/objetivos de cada AC já codificam o que "cumprir objetivos" significa.
     bool MeetsOwnGoals(AcIndex ac, const Mac48Address& sta, uint8_t linkId) const;
 
     /// Returns true if placing ac on linkId would harm the worst-affected
@@ -391,8 +386,6 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     };
 
     // ---- Per-AC global state ----
-    std::map<uint8_t, AcState>   m_acStates;
-    std::map<uint8_t, uint64_t>  m_lastAcBytesSent;
 
     // ---- Airtime tracking for channel utilisation ----
     std::map<uint8_t, Time>     m_linkTxStartTime;
@@ -400,8 +393,10 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     std::map<uint8_t, uint32_t> m_linkTxDepth;
 
     // ---- Decision thresholds ----
-    double m_stayThreshold{0.75};       // stay if currentSatisfaction >= this //ALTEREI ERA 0.85
-    double m_migrationThreshold{0.25};  // migrate if expectedGain > this      //ALTEREI ERA 0.15
+    // NOTA: o script de simulação sobrepõe estes valores via SetAttribute
+    // (globais g_stayThreshold / g_migrationThreshold, também expostos na CLI).
+    double m_stayThreshold{0.75};       // stay if currentSatisfaction >= this
+    double m_migrationThreshold{0.25};  // migrate if expectedGain > this
     double m_metricsIntervalSec{0.5};
     double m_lastPeriodicUpdateTime{0.0};
     EventId m_updateEvent;
@@ -494,13 +489,8 @@ QosWeightedMloScheduler::QosWeightedMloScheduler()
     m_weights[AC_BE] = {0.20, 0.05, 0.15, 0.60};
     m_weights[AC_BK] = {0.05, 0.05, 0.10, 0.80};
 
-    // ---- Init AC state ----
-    for (auto ac : {AC_VO, AC_VI, AC_BE, AC_BK}) {
-        m_acStates[static_cast<uint8_t>(ac)] = {};
-        m_lastAcBytesSent[static_cast<uint8_t>(ac)] = 0;
-        // m_currentSatisfaction is keyed by (STA MAC, AC) and populated
-        // lazily as STAs are discovered — no per-AC init needed here.
-    }
+    // Nota: m_currentSatisfaction / m_staQos são chaveados por (STA MAC, AC) e
+    // preenchidos à medida que as STAs são descobertas — não há init por-AC.
 }
 
 inline
@@ -606,9 +596,12 @@ QosWeightedMloScheduler::FeedLinkMetrics(uint8_t linkId, AcIndex ac,
                                           uint32_t txBytes, uint32_t txFrames,
                                           uint32_t dropFrames)
 {
+    // txFrames é ignorado: era usado para o antigo PER baseado em txSuccess,
+    // que subcontava ~5% dos MPDUs (trace AckedMpdu). O PER usa agora dropFrames.
+    // O parâmetro mantém-se para não quebrar a assinatura pública.
+    (void)txFrames;
     auto& s = m_metrics[linkId][static_cast<uint8_t>(ac)];
     s.txBytes    += txBytes;
-    s.txSuccess  += txFrames;
     s.dropFrames += dropFrames;
 }
 
@@ -763,14 +756,6 @@ QosWeightedMloScheduler::ComputeQosSatisfaction(AcIndex ac, const Mac48Address& 
                + w.lossWeight       * sat.loss) / totalW;
 
     return sat;
-}
-
-inline double
-QosWeightedMloScheduler::CurrentQosSatisfaction(AcIndex ac, const Mac48Address& sta) const
-{
-    auto it = m_currentSatisfaction.find({sta, static_cast<uint8_t>(ac)});
-    if (it == m_currentSatisfaction.end()) return 0.0;
-    return it->second.index;
 }
 
 // ===========================================================================
@@ -1120,8 +1105,9 @@ QosWeightedMloScheduler::WouldHarmResident(AcIndex ac, const Mac48Address& sta,
     for (const auto& [key, residentLink] : m_lastSelectedLink) {
         if (!IsRoutableSta(key.first)) continue; // ignora beacons/broadcast
         if (residentLink != linkId) continue;
-        // Skip self
-        if (key.second == static_cast<uint8_t>(ac)) continue; // skip ALL same-AC (cross-AC harm only)
+        // Salta todos os do mesmo AC (só interessa harm cross-AC): a partilha
+        // entre STAs do mesmo AC é tratada pela co-occupancy penalty.
+        if (key.second == static_cast<uint8_t>(ac)) continue;
 
         double otherSat = m_currentSatisfaction.count(key)
                               ? m_currentSatisfaction.at(key).index : 1.0;
@@ -1147,7 +1133,6 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
     if (eligibleLinks.size() == 1) {
         uint8_t onlyLink = eligibleLinks.front();
         m_lastSelectedLink[{sta, static_cast<uint8_t>(ac)}] = onlyLink;
-        m_metrics[onlyLink][static_cast<uint8_t>(ac)].enqueueCount++;
         return onlyLink;
     }
 
@@ -1222,12 +1207,12 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
         // (esfomeá-los-ia por EDCA — regra: BE/BK nunca partilham com VO/VI).
         // EXCEÇÃO: se o VO/VI estiver genuinamente a não cumprir os objetivos
         // no fast (esfomeado), cede e pode descer — tem prioridade sobre o BE.
-        // O sinal de fome usa a satisfação PROJETADA no fast (estável), não o
-        // curSat medido (ruidoso no cold-start).
         bool isHighPrio = (acIdx >= static_cast<uint8_t>(AC_VI));
         if (isHighPrio && bestLink == m_slowLinkId && currentLink == m_fastLinkId) {
-            // Sinal de fome = satisfação MEDIDA no fast (currentSat, fiável após
-            // o warmup de 2 janelas), não a projecção (instável no 6GHz).
+            // Sinal de fome = satisfação MEDIDA no fast (currentSat), fiável após
+            // o warmup de 2 janelas. NÃO usar a projecção: é instável e chegou a
+            // dar quase empate entre links (0.963223 vs 0.963183), abrindo a
+            // excepção por ruído.
             constexpr double kStarvationFloor = 0.60; // tunável
             bool starvingOnFast = (currentSat < kStarvationFloor);
 
@@ -1297,7 +1282,6 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
     } // end if (!useBootstrap)
 
     m_lastSelectedLink[staAcKey] = selectedLink;
-    m_metrics[selectedLink][acIdx].enqueueCount++;
 
     // ---- CSV logging ----
     if (m_csvEnabled && m_decisionCsv.is_open()) {
@@ -1342,15 +1326,6 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
     double dt  = now - m_lastPeriodicUpdateTime;
     if (dt <= 0.0) dt = m_metricsIntervalSec;
 
-    // ---- Update global AC throughput ----
-    for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
-        uint8_t acIdx = static_cast<uint8_t>(ac);
-        auto&   acSt  = m_acStates[acIdx];
-        uint64_t bytes = acSt.bytesSent - m_lastAcBytesSent[acIdx];
-        acSt.throughputMbps = (bytes * 8.0) / (dt * 1e6);
-        m_lastAcBytesSent[acIdx] = acSt.bytesSent;
-    }
-
     for (auto& [linkId, acMap] : m_metrics) {
         // ---- Channel utilization ----
         double util = 0.0;
@@ -1362,27 +1337,19 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
             ls.achievedThroughputMbps = (ls.txBytes * 8.0) / (dt * 1e6);
             ls.txBytes = 0;
 
-            // PER — use EWMA instead of a hard per-window reset.
+            // PER por-(link, AC) — proxy usado APENAS pela projecção
+            // (ComputeExpectedQosSatisfaction). A satisfação medida de cada
+            // (STA, AC) vem de m_staQos, não daqui.
             //
-            // BUG THIS FIXES: txAttempts is incremented at PHY TX START
-            // (FeedLinkTxAttempt), while txSuccess is incremented only when
-            // the ACK/BlockAck confirms success (FeedLinkMetrics) — which
-            // can arrive AFTER this 0.5s window has already reset both
-            // counters to zero, especially under high delay/contention
-            // (exactly when an accurate PER matters most). A hard reset
-            // every window systematically inflates PER under load, because
-            // a TX attempted near the end of a window whose confirmation
-            // lands in the NEXT window is counted as 100% loss in the
-            // window it started in, and contributes nothing to the window
-            // it actually succeeded in.
+            // Calculado a partir de drops REAIS (FeedLinkDrop) sobre tentativas.
+            // NÃO usar txSuccess: é alimentado pelo trace AckedMpdu, que capta
+            // apenas ~5% dos MPDUs entregues, o que inflacionava o PER para
+            // ~95% falsamente e capava a satisfação de todos os ACs.
             //
-            // Fix: keep a running (EWMA) estimate instead. If a window has
-            // zero attempts, leave the estimate unchanged rather than
-            // snapping it to 0 (no evidence either way).
+            // EWMA em vez de reset duro por janela: uma janela sem tentativas
+            // deixa a estimativa inalterada (não há evidência), em vez de a
+            // atirar para 0.
             if (ls.txAttempts > 0) {
-                // PER a partir de drops REAIS (FeedLinkDrop) sobre tentativas.
-                // NÃO usar txSuccess: vem do trace AckedMpdu, que subconta ~5%
-                // dos MPDUs entregues, inflando o PER para ~95% falsamente.
                 double windowPer = std::min(1.0,
                     static_cast<double>(ls.dropFrames) / ls.txAttempts);
                 constexpr double perAlpha = 0.3; // smoothing factor
@@ -1394,20 +1361,9 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
                 }
             }
             ls.txAttempts = 0;
-            ls.txSuccess  = 0;
             ls.dropFrames = 0;
-            ls.enqueueCount = 0;
 
             ls.channelUtilization = util;
-
-            // HOL delay estimate
-            if (ls.queueLength > 0) {
-                double nowMs  = Simulator::Now().GetMilliSeconds();
-                double waitMs = nowMs - ls.lastEnqueueTimeMs;
-                ls.holDelay   = std::min(waitMs, MAX_DELAY_MS);
-            } else {
-                ls.holDelay = 0.0;
-            }
         }
 
         // Phase 3 — traffic composition
@@ -1433,26 +1389,6 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
         constexpr uint32_t kWarmupSamples = 2;
         if (m_staQos.count(key) && m_staQos.at(key).samples >= kWarmupSamples) {
             m_hasMeasuredSat.insert(key);
-        }
-    }
-
-    // Update queue lengths from MAC
-    Ptr<WifiMac> mac = GetMac();
-    if (mac) {
-        for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
-            Ptr<QosTxop> txop = mac->GetQosTxop(ac);
-            if (!txop) continue;
-            Ptr<WifiMacQueue> q = txop->GetWifiMacQueue();
-            if (!q) continue;
-            uint32_t nPkts  = q->GetNPackets();
-            uint32_t nBytes = q->GetNBytes();
-            for (auto& [linkId, acMap] : m_metrics) {
-                auto aIt = acMap.find(static_cast<uint8_t>(ac));
-                if (aIt != acMap.end()) {
-                    aIt->second.queueLength = nPkts;
-                    aIt->second.queueBytes  = nBytes;
-                }
-            }
         }
     }
 
@@ -1568,29 +1504,11 @@ QosWeightedMloScheduler::NotifyEnqueue(AcIndex ac, Ptr<WifiMpdu> mpdu)
     EnsureDelegate();
     m_delegate->NotifyEnqueue(ac, mpdu);
 
+    // Regista o instante de enqueue: alimenta o EWMA de delay/jitter por-(link,AC)
+    // em NotifyDequeue, que a projecção (ComputeExpectedQosSatisfaction) lê.
     double nowMs = Simulator::Now().GetMilliSeconds();
     if (mpdu && mpdu->GetPacket())
         m_packetEnqueueTimes[mpdu->GetPacket()->GetUid()] = nowMs;
-
-    // Update queue snapshot on all links (per-AC)
-    Ptr<WifiMac> mac = GetMac();
-    if (mac) {
-        Ptr<QosTxop> txop = mac->GetQosTxop(ac);
-        if (txop) {
-            Ptr<WifiMacQueue> q = txop->GetWifiMacQueue();
-            if (q) {
-                uint32_t nPkts  = q->GetNPackets();
-                uint32_t nBytes = q->GetNBytes();
-                for (auto& [linkId, acMap] : m_metrics) {
-                    auto& ls = acMap[static_cast<uint8_t>(ac)];
-                    ls.queueLength       = nPkts;
-                    ls.queueBytes        = nBytes;
-                    ls.enqueueCount++;
-                    ls.lastEnqueueTimeMs = nowMs;
-                }
-            }
-        }
-    }
 }
 
 inline void
@@ -1601,13 +1519,9 @@ QosWeightedMloScheduler::NotifyDequeue(AcIndex ac, const std::list<Ptr<WifiMpdu>
 
     uint8_t  acIdx      = static_cast<uint8_t>(ac);
     double   nowMs      = Simulator::Now().GetMilliSeconds();
-    auto&    acSt       = m_acStates[acIdx];
 
     for (const auto& mpdu : mpdus) {
         if (!mpdu || !mpdu->GetPacket()) continue;
-
-        acSt.bytesSent   += mpdu->GetSize();
-        acSt.packetsSent += 1;
 
         // Per-STA link lookup for delay/jitter attribution
         Mac48Address destMac = mpdu->GetHeader().GetAddr1();

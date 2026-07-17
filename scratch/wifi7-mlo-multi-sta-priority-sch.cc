@@ -800,7 +800,6 @@ std::vector<uint64_t> g_lastTotalRx;
 // Per-STA identity/goal, for feeding real per-STA QoS to the AP scheduler
 std::vector<std::vector<Mac48Address>> g_staIndexToMacs; // todos os MACs (MLD + link) por STA
 std::vector<AcIndex> g_staAc;                             // AC de cada STA
-double g_offeredMbpsPerSta = 150.0;                       // taxa oferecida por STA
 // FlowMonitor para loss REAL acumulada por-STA (alimentada ao scheduler)
 Ptr<FlowMonitor> g_flowMonitor;
 Ptr<Ipv4FlowClassifier> g_flowClassifier;
@@ -1214,13 +1213,6 @@ int main(int argc, char* argv[])
     g_lastDelaySamples.resize(g_numStas, 0);
     g_lastJitterSumMs.resize(g_numStas, 0.0);
     g_lastJitterSamples.resize(g_numStas, 0);
-    // Taxa oferecida por STA (para calcular loss = 1 - recebido/oferecido)
-    {
-        double v = std::atof(dataRateStr.c_str());
-        if (dataRateStr.find("Gbps") != std::string::npos) v *= 1000.0;
-        else if (dataRateStr.find("Kbps") != std::string::npos) v /= 1000.0;
-        if (v > 0.0) g_offeredMbpsPerSta = v;
-    }
     g_queueOccupancyCsvPath = queueOccupancyCsvPath;
     g_queueSampleInterval = queueSampleInterval;
     g_linkTrafficCsvPath = linkTrafficCsvPath;
