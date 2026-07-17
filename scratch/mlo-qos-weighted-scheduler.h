@@ -274,6 +274,10 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     static int GetFrequencyRank(int frequency);
     void EnsureDelegate();
 
+    /// Chaves broadcast/multicast (ex.: beacons) não são fluxos encaminhados
+    /// por-STA e não devem contar como "residentes" de um link.
+    static bool IsRoutableSta(const Mac48Address& a) { return !a.IsGroup(); }
+
     /// Sigmoid utility: maps value/target to [0,1]
     double UtilityFunction(double value, double target, bool lowerIsBetter) const;
 
@@ -1020,6 +1024,7 @@ QosWeightedMloScheduler::ComputeExpectedQosSatisfaction(AcIndex ac,
         bool anyResident = false;
         double worstOtherSat = 1.0;
         for (const auto& [key, resLink] : m_lastSelectedLink) {
+            if (!IsRoutableSta(key.first)) continue; // ignora beacons/broadcast
             if (key.second != otherAcIdx || resLink != linkId) continue;
             anyResident = true;
             double sat = m_currentSatisfaction.count(key)
@@ -1069,6 +1074,7 @@ QosWeightedMloScheduler::CountCoResidents(AcIndex ac, const Mac48Address& sta,
     uint8_t acIdx = static_cast<uint8_t>(ac);
     uint32_t count = 0;
     for (const auto& [key, link] : m_lastSelectedLink) {
+        if (!IsRoutableSta(key.first)) continue; // ignora beacons/broadcast
         if (link == linkId && key.second == acIdx && key.first != sta) ++count;
     }
     return count;
@@ -1112,6 +1118,7 @@ QosWeightedMloScheduler::WouldHarmResident(AcIndex ac, const Mac48Address& sta,
     bool foundResident = false;
 
     for (const auto& [key, residentLink] : m_lastSelectedLink) {
+        if (!IsRoutableSta(key.first)) continue; // ignora beacons/broadcast
         if (residentLink != linkId) continue;
         // Skip self
         if (key.second == static_cast<uint8_t>(ac)) continue; // skip ALL same-AC (cross-AC harm only)
@@ -1227,6 +1234,7 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
             bool soleOccupant = CountCoResidents(ac, sta, m_fastLinkId) == 0;
             bool wouldStarveLowPrio = false;
             for (const auto& [key, resLink] : m_lastSelectedLink) {
+                if (!IsRoutableSta(key.first)) continue; // ignora beacons/broadcast
                 if (resLink == bestLink && key.second < static_cast<uint8_t>(AC_VI)) {
                     wouldStarveLowPrio = true;
                     break;
@@ -1234,6 +1242,25 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
             }
             if ((soleOccupant || wouldStarveLowPrio) && !starvingOnFast) {
                 bestLink = currentLink; // veto: mantém no fast
+            }
+        }
+
+        // Guard simétrico para BE/BK: um AC de baixa prioridade não deve migrar
+        // para um link onde residam VO/VI — seria esfomeado por EDCA (regra:
+        // BE/BK nunca partilham link com VO/VI). Sem excepção: para o BE/BK
+        // essa migração nunca é benéfica. Corrige a projecção demasiado
+        // optimista, que só vê capacidade bruta livre e ignora a prioridade.
+        if (!isHighPrio && bestLink != currentLink) {
+            bool highPrioOnTarget = false;
+            for (const auto& [key, resLink] : m_lastSelectedLink) {
+                if (!IsRoutableSta(key.first)) continue; // ignora beacons/broadcast
+                if (resLink == bestLink && key.second >= static_cast<uint8_t>(AC_VI)) {
+                    highPrioOnTarget = true;
+                    break;
+                }
+            }
+            if (highPrioOnTarget) {
+                bestLink = currentLink; // veto: BE/BK não sobe para o link do VO/VI
             }
         }
 
