@@ -477,10 +477,13 @@ inline
 QosWeightedMloScheduler::QosWeightedMloScheduler()
     : m_delegate(CreateObject<FcfsWifiQueueScheduler>())
 {
-    // ---- Default goals per AC ----
-    m_goals[AC_VO] = {150.0, 15.0,  0.1,  0.01};  //ALTEREI a loss
-    m_goals[AC_VI] = {150.0, 30.0, 0.1,  0.01};  //ALTEREI a loss
-    m_goals[AC_BE] = {150.0, 200.0, 1.0, 0.10};  //ALTEREI a loss
+    // ---- Default goals per AC ----   {targetTp, maxDelayMs, maxJitterMs, maxLoss}
+    // maxJitterMs de VO/VI subido de 0.1 (100µs, fisicamente inatingível numa
+    // rede partilhada — garantia de nunca pontuar bem em jitter) para valores
+    // realistas (VoIP real tolera ~30ms).
+    m_goals[AC_VO] = {150.0, 15.0,   5.0,  0.01};
+    m_goals[AC_VI] = {150.0, 30.0,  10.0,  0.01};
+    m_goals[AC_BE] = {150.0, 200.0,  1.0,  0.10};
     m_goals[AC_BK] = {150.0, 300.0, 100.0, 0.10};
 
     // ---- Default weights per AC ----
@@ -584,7 +587,8 @@ QosWeightedMloScheduler::EnableDecisionCsv(const std::string& filename,
         m_decisionCsv << "Timestamp,NodeContext,AC,SelectedLink,Decision,"
                          "CurrentSat,ExpectedSat,CompetitionPressure,"
                          "EffectiveCapMbps,CapabilityScore,"
-                         "AvgDelayMs,AvgJitterMs,PER,ChannelUtil,Throughput\n";
+                         "AvgDelayMs,AvgJitterMs,PER,ChannelUtil,Throughput,"
+                         "ProjCurrentLink\n";
     }
 }
 
@@ -712,9 +716,13 @@ QosWeightedMloScheduler::UtilityFunction(double value, double target,
     if (target <= 0.0) return 0.5;
     double ratio = value / target;
     if (lowerIsBetter)
+        // Máximo tolerável: estar no limite = 0.5 é semântica correta.
         return 1.0 / (1.0 + std::exp(5.0 * (ratio - 1.0)));
     else
-        return 1.0 / (1.0 + std::exp(5.0 * (1.0 - ratio)));
+        // Alvo desejado ("preciso de X"): inflexão a 50% do alvo → cumprir o
+        // alvo ≈ 0.99, metade do alvo = 0.5. Antes a inflexão estava no alvo
+        // (cumprir = só 0.5), o que exigia ~2× o alvo para saturar.
+        return 1.0 / (1.0 + std::exp(10.0 * (0.5 - ratio)));
 }
 
 // ===========================================================================
@@ -766,19 +774,26 @@ QosWeightedMloScheduler::UpdateLinkCapability(uint8_t linkId, double dt)
 {
     auto& cap = m_linkCapability[linkId];
     auto& phy = m_phyState[linkId];
+    auto& tc  = m_traffic[linkId];
 
-    // Estimated capacity from PHY state
-    if (phy.valid) {
-        cap.estimatedCapacityMbps = phy.ewmaDataRateMbps * (1.0 - phy.ewmaPer);
-    } else {
-        // Fallback: use static max for the band
-        cap.estimatedCapacityMbps = (linkId == m_fastLinkId) ? 400.0 : 150.0;
-    }
-
-    // Occupied capacity = sum of throughputs across all ACs on this link
-    auto& tc = m_traffic[linkId];
+    // Throughput agregado e fração de airtime OCUPADO (real, com overhead MAC).
+    // NOTA: m_linkBusyTime só é zerado DEPOIS desta função; tc.*ThroughputMbps
+    // já foi calculado por UpdateTrafficComposition. Ambos válidos aqui.
     double occupied = tc.voThroughputMbps + tc.viThroughputMbps
                     + tc.beThroughputMbps + tc.bkThroughputMbps;
+    double busyFrac = (dt > 0.0) ? std::min(1.0, m_linkBusyTime[linkId] / dt) : 0.0;
+
+    // Capacidade ALCANÇÁVEL medida = goodput por unidade de airtime ocupado,
+    // extrapolado para 100%. Capta TODO o overhead MAC (preâmbulo, AIFS,
+    // backoff, SIFS, BlockAck) que a taxa PHY nominal ignora — que a
+    // inflacionava ~5× (ex.: 3722 vs ~708 Mbps reais no 6GHz/320MHz).
+    if (busyFrac > 0.05 && occupied > 0.0) {
+        cap.estimatedCapacityMbps = occupied / busyFrac;              // medido
+    } else if (phy.valid) {
+        cap.estimatedCapacityMbps = phy.ewmaDataRateMbps * (1.0 - phy.ewmaPer); // fallback PHY
+    } else {
+        cap.estimatedCapacityMbps = (linkId == m_fastLinkId) ? 400.0 : 150.0;   // cold-start
+    }
 
     cap.availableCapacityMbps = std::max(0.0, cap.estimatedCapacityMbps - occupied);
 
@@ -802,12 +817,8 @@ QosWeightedMloScheduler::UpdateLinkCapability(uint8_t linkId, double dt)
     cap.availableCapacityPerAcMbps[static_cast<uint8_t>(AC_BK)] =
         std::max(0.0, cap.estimatedCapacityMbps - voTp - viTp - beTp - bkTp);
 
-    // Free airtime
-    double util = 0.0;
-    if (dt > 0.0) {
-        util = std::min(1.0, m_linkBusyTime[linkId] / dt);
-    }
-    cap.freeAirtime = std::max(0.0, 1.0 - util);
+    // Free airtime (reutiliza busyFrac já calculado)
+    cap.freeAirtime = std::max(0.0, 1.0 - busyFrac);
 
     // Capability score = normalised available fraction
     cap.capabilityScore = (cap.estimatedCapacityMbps > 0.0)
@@ -829,13 +840,20 @@ QosWeightedMloScheduler::UpdateTrafficComposition(uint8_t linkId, double dt)
     tc.beThroughputMbps = tc.beBytes * 8.0 * invDt / 1e6;
     tc.bkThroughputMbps = tc.bkBytes * 8.0 * invDt / 1e6;
 
-    double totalAirtime = tc.voAirtimeSec + tc.viAirtimeSec
-                        + tc.beAirtimeSec + tc.bkAirtimeSec;
-    double invTA = (totalAirtime > 0.0) ? 1.0 / totalAirtime : 0.0;
-    tc.voAirtimeFrac = tc.voAirtimeSec * invTA;
-    tc.viAirtimeFrac = tc.viAirtimeSec * invTA;
-    tc.beAirtimeFrac = tc.beAirtimeSec * invTA;
-    tc.bkAirtimeFrac = tc.bkAirtimeSec * invTA;
+    // AirtimeFrac = UTILIZAÇÃO REAL do link por AC, em [0,1] (somam a
+    // utilização do link), não a MISTURA entre ACs.
+    // Antes normalizava-se pelo airtime usado (invTA) → as frações somavam
+    // sempre 1.0, e um AC num link ocioso "pesava" o mesmo que num saturado.
+    // Agora escala-se a mistura de payload (que capta bem o RÁCIO entre ACs)
+    // para o busy real do PHY (que contém o overhead), via m_linkBusyTime.
+    double payloadSum = tc.voAirtimeSec + tc.viAirtimeSec
+                      + tc.beAirtimeSec + tc.bkAirtimeSec;
+    double busyFrac   = (dt > 0.0) ? std::min(1.0, m_linkBusyTime[linkId] / dt) : 0.0;
+    double scale      = (payloadSum > 0.0) ? busyFrac / payloadSum : 0.0;
+    tc.voAirtimeFrac = tc.voAirtimeSec * scale;
+    tc.viAirtimeFrac = tc.viAirtimeSec * scale;
+    tc.beAirtimeFrac = tc.beAirtimeSec * scale;
+    tc.bkAirtimeFrac = tc.bkAirtimeSec * scale;
 
     tc.voFlows = static_cast<uint32_t>(tc.voFlowSet.size());
     tc.viFlows = static_cast<uint32_t>(tc.viFlowSet.size());
@@ -1302,6 +1320,11 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
             logTp     = qIt->second.tpMbps;
         }
 
+        // Diagnóstico: projeção do link ONDE O FLUXO ESTÁ. Deve aproximar-se
+        // do CurrentSat medido — se divergir, a projeção está errada (é a
+        // mesma que julga os outros links). Ver §8.1 do plano.
+        double projCurrent = ComputeExpectedQosSatisfaction(ac, sta, selectedLink);
+
         m_decisionCsv << now << ',' << m_nodeContext << ',' << +ac << ','
                       << +selectedLink << ',' << decision << ','
                       << currentSat << ',' << selectedExpSat << ','
@@ -1310,7 +1333,7 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
                       << cap.capabilityScore << ','
                       << logDelay << ',' << logJitter << ','
                       << logPer << ',' << lm.channelUtilization << ','
-                      << logTp << '\n';
+                      << logTp << ',' << projCurrent << '\n';
     }
 
     return selectedLink;

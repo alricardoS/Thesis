@@ -94,23 +94,25 @@ Se ainda não houver uma amostra válida em `m_staQos` (arranque), devolve zeros
 
 ```cpp
 ratio = valor / alvo
-lowerIsBetter:     utilidade = 1 / (1 + e^(5·(ratio − 1)))
-maior é melhor:    utilidade = 1 / (1 + e^(5·(1 − ratio)))
+lowerIsBetter (máximo tolerável):   utilidade = 1 / (1 + e^(5·(ratio − 1)))    → 0.5 no limite
+higherIsBetter (alvo desejado):     utilidade = 1 / (1 + e^(10·(0.5 − ratio))) → 0.99 ao cumprir
 ```
 
-- Quando `valor == alvo` (`ratio = 1`), a utilidade é exatamente **0.5** — o ponto de inflexão.
-- A constante `5` controla a inclinação.
-- Se `alvo <= 0`, devolve `0.5` (neutro, evita divisão por zero).
+- **`lowerIsBetter`** (delay, jitter, loss): o alvo é um *máximo tolerável*, logo estar no limite = **0.5** é semântica correta.
+- **`higherIsBetter`** (throughput): o alvo é *o que se precisa*. A inflexão está a **50% do alvo** → cumprir o alvo ≈ **0.99**, metade do alvo = 0.5. *(Antes a inflexão estava no alvo, o que dava só 0.5 ao cumprir e exigia ~2× o alvo para saturar — ver limitação #4.)*
+- Se `alvo <= 0`, devolve `0.5`.
 - Por ser assintótica, nunca atinge exatamente 0 ou 1.
 
 ### `AcGoals` — objetivos por AC (construtor; `SetGoals` **não** é chamado pelo script)
 
 | AC | targetThroughputMbps | maxDelayMs | maxJitterMs | maxPacketLoss |
 |----|----------------------|------------|-------------|----------------|
-| VO | 150.0 | 15.0 | 0.1 | 0.01 (1%) |
-| VI | 150.0 | 30.0 | 0.1 | 0.01 (1%) |
+| VO | 150.0 | 15.0 | **5.0** | 0.01 (1%) |
+| VI | 150.0 | 30.0 | **10.0** | 0.01 (1%) |
 | BE | 150.0 | 200.0 | 1.0 | 0.10 (10%) |
 | BK | 150.0 | 300.0 | 100.0 | 0.10 (10%) |
+
+> `maxJitterMs` de VO/VI foi subido de 0.1 ms (100 µs, fisicamente inatingível numa rede partilhada) para 5/10 ms — antes garantia que o VO nunca pontuava bem em jitter, custando-lhe ~0.22 de satisfação permanentes.
 
 ### `AcWeights` — pesos por AC (definidos pelo `.cc` via `SetWeights`)
 
@@ -127,14 +129,20 @@ Não precisam de somar 1 — o código normaliza pela soma. VO prioriza delay+ji
 
 ## Motor 2 — Link Capability Engine
 
-### `estimatedCapacityMbps`
+### `estimatedCapacityMbps` — capacidade ALCANÇÁVEL medida
 
 ```cpp
-se houver dados PHY reais (EWMA de MCS/PER do PhyTxPsduBegin):
-    estimatedCapacityMbps = dataRate_PHY × (1 − PER_EWMA)
-senão (fallback):
-    estimatedCapacityMbps = 400.0 Mbps (link rápido)  ou  150.0 Mbps (link lento)
+busyFrac = min(1, m_linkBusyTime[link] / dt)          // airtime ocupado real (com overhead)
+occupied = Σ throughput de todos os ACs               // goodput agregado
+se busyFrac > 0.05 e occupied > 0:
+    estimatedCapacityMbps = occupied / busyFrac        // MEDIDO
+senão se houver dados PHY:
+    estimatedCapacityMbps = dataRate_PHY × (1 − PER)   // fallback
+senão:
+    estimatedCapacityMbps = 400 (rápido) ou 150 (lento) // cold-start
 ```
+
+> **Porquê medido e não a taxa PHY.** `dataRate_PHY × (1−PER)` é a taxa **nominal** (símbolos de payload no ar) e **ignora todo o overhead MAC** (preâmbulo, AIFS, backoff, SIFS, BlockAck), que no 6 GHz/320 MHz consome a maior parte do tempo. Isso inflacionava a capacidade **~5×** (ex.: 3722 vs ~708 Mbps reais) e fazia a projeção do BE dar 0.97 num link onde ele viria a colapsar. Medir `goodput / airtime ocupado` extrapola a capacidade real e capta o overhead automaticamente. **Fonte crítica**: `m_linkBusyTime` (de `FeedLinkTxStart/End`, tempo real de PHY ocupado) — os proxies de airtime por-AC não servem, porque são tempo de payload puro (sem overhead) e dariam um cálculo circular de volta à taxa PHY.
 
 `ConfigureForPair` ordena os dois links por `GetFrequencyRank` (6 GHz > 5 GHz > 2.4 GHz) e define `m_fastLinkId` / `m_slowLinkId`.
 
@@ -165,8 +173,10 @@ capabilityScore = min(1, availableCapacityMbps / estimatedCapacityMbps)
 Mede, por janela de 0.5 s, o tráfego real de cada AC em cada link:
 
 - `voThroughputMbps`, `viThroughputMbps`, `beThroughputMbps`, `bkThroughputMbps`
-- `voAirtimeFrac`, etc. — fração de airtime consumida (proxy de carga para o Motor 4)
+- `voAirtimeFrac`, etc. — **utilização real** do link por AC, em [0,1] (proxy de carga para o Motor 4)
 - `voFlows`, etc. — nº de fluxos distintos (STA+TID) ativos
+
+> **`*AirtimeFrac` = utilização real, não mistura.** O airtime de payload por-AC (de `FeedPacketTransmitted`) capta bem o *rácio* entre ACs, mas é tempo de payload puro. É escalado para o `busyFrac` real do PHY (`m_linkBusyTime/dt`) → cada fração fica em [0,1] e todas juntas somam a utilização do link. *(Antes normalizava-se pelo airtime usado, o que fazia as frações somarem sempre 1.0: um AC num link ocioso "pesava" o mesmo que num saturado, e a `pressure` não distinguia os dois — ver limitação #1.)*
 
 Alimenta o Motor 2 (consumo absoluto) e o Motor 4 (carga normalizada).
 
@@ -323,7 +333,9 @@ Cada um destes existe por causa de um bug **observado em simulação**. Estão d
 
 ### 2. Vetos de prioridade (BE/BK nunca partilham link com VO/VI)
 
-A regra física: **BE/BK num link com VO/VI saturante nunca têm oportunidade de transmissão** (EDCA). Ambos os lados são vetados, mas com rigor diferente.
+> **Estes vetos não são um workaround temporário — são a modelação deliberada de uma física que o modelo analítico não consegue exprimir.** A fome do EDCA é um fenómeno de **acesso ao canal**, não de largura de banda: um BE que compete com um VO no mesmo link **não obtém oportunidades de transmissão** (o VO, com AIFSN=2/CWmin=3, reapanha o canal quase imediatamente; o AIFS+backoff do BE quase nunca expira), mesmo que haja airtime livre no agregado. Um BE que colapsa para 4.95 Mbps num link com ~57% de airtime "livre" prova-o. Nenhum modelo baseado em **capacidade ou airtime** (que é o que os motores 2–5 medem) captaria isto — só um modelo de saturação EDCA tipo Bianchi, que está fora do âmbito. Os vetos codificam essa física diretamente e são **permanentes**.
+
+A regra física: **BE/BK num link com VO/VI nunca têm oportunidade de transmissão** (EDCA). Ambos os lados são vetados, mas com rigor diferente.
 
 **(a) Veto anti-downgrade VO/VI** — um VO/VI no link rápido não desce para o lento se:
 - for o **único do seu AC** no rápido (`CountCoResidents == 0`), **ou**
@@ -444,10 +456,12 @@ O scheduler não lê diretamente do PHY/MAC — o script de simulação liga *tr
 ```
 Timestamp, NodeContext, AC, SelectedLink, Decision, CurrentSat, ExpectedSat,
 CompetitionPressure, EffectiveCapMbps, CapabilityScore, AvgDelayMs, AvgJitterMs,
-PER, ChannelUtil, Throughput
+PER, ChannelUtil, Throughput, ProjCurrentLink
 ```
 
 As colunas `AvgDelayMs`, `AvgJitterMs`, `PER` e `Throughput` mostram as **métricas reais por-STA** (de `m_staQos`) quando disponíveis, com fallback aos proxies por-link.
+
+A coluna **`ProjCurrentLink`** é a projeção (`ComputeExpectedQosSatisfaction`) do link **onde o fluxo está**. Serve de teste de consistência interna: deve aproximar-se de `CurrentSat` (a satisfação medida no mesmo link). Se divergirem muito, a projeção está errada — e é a mesma projeção que julga os *outros* links. É a melhor métrica para avaliar a correção da capacidade (limitação #1).
 
 Valores possíveis de `Decision`:
 
@@ -472,13 +486,17 @@ Valores possíveis de `Decision`:
 
 Análise honesta do estado atual. Nada aqui impede os cenários testados de convergir, mas são fraquezas estruturais reais.
 
-1. **A projeção é otimista demais para ACs de baixa prioridade.** `ComputeExpectedQosSatisfaction` deu **0.97** ao BE num link 6 GHz onde ele viria a colapsar para 4.95 Mbps: vê capacidade bruta livre e **não modela a fome por EDCA**. Isto está **contornado** pelos vetos de prioridade, não corrigido na raiz. É a limitação mais significativa.
+1. **A projeção mede capacidade/airtime, não *acesso* — e por isso não modela a fome do EDCA.** Este é o limite de fundo: os motores 2–5 estimam *quanto do meio está ocupado*, não *quem consegue aceder ao canal*. A fome do BE junto a VO/VI (colapso para 4.95 Mbps com 57% de airtime livre) é um fenómeno de acesso que **nenhum modelo de capacidade capta** — só um modelo de saturação EDCA tipo Bianchi (fora do âmbito). É por isso que os **vetos de prioridade são permanentes** (ver §2 dos mecanismos), não um remendo.
+   > **Correção aplicada e validada**: a *inflação* da capacidade — um problema **separado** da fome de acesso — foi corrigida. O `estimatedCapacityMbps` deixou de ser a taxa PHY nominal (que inflacionava ~5×) e passa a ser **medido** (`goodput / airtime ocupado`) — verificado no 6 GHz: de **3722 → ~655 Mbps**. O `NormalisedLoad` passou de "mistura entre ACs" (somava sempre 1) para "utilização real". A projeção do link atual convergiu com a satisfação medida para VO/VI (erro ~0.11, ver coluna `ProjCurrentLink` do CSV). **Não** dispensa os vetos (a fome de acesso mantém-se).
 
-2. **Assimetria medido-vs-projetado.** O `currentSat` (link atual) vem de métricas reais por-STA; a projeção dos *outros* links usa proxies por-(link,AC). Comparar os dois em `improvement = bestScore − currentSat` é comparar grandezas diferentes, e enviesa a decisão.
+2. **Assimetria medido-vs-projetado + `effCap` mede *o que sobra*, não *o que eu receberia*.** Dois defeitos da projeção que coexistem:
+   - *Assimetria*: o `currentSat` (link atual) vem de métricas reais por-STA; a projeção dos *outros* links usa proxies por-(link,AC). Comparar os dois em `improvement = bestScore − currentSat` é comparar grandezas diferentes.
+   - *effCap residual*: a projeção pergunta *"quanto sobra aqui?"* em vez de *"quanto é que EU receberia aqui?"*. Um fluxo **bem servido**, que usa tudo o que precisa, vê "nada a sobrar" no seu próprio link e projeta-se mal lá.
+   > **Impacto medido — real mas inofensivo**: a projeção do BE no seu próprio link diverge da satisfação medida (projetado **0.46** vs medido **0.99**) em links de **baixa capacidade** (2.4GHz, onde o BE consome quase tudo); no 5GHz, com folga, converge (erro 0.07). Não causa decisão errada porque o `STAY_SATISFIED` (0.99) dispara sempre e a projeção má nunca chega a ser usada. Corrigi-lo exigiria um modelo de partilha de airtime — não vale o esforço.
 
 3. **O `avgQueueDelayMs` proxy (por-link) é ≈ 0 mesmo sob congestão.** Só conta pacotes que chegam ao dequeue; os que ficam presos ou são dropados por fila cheia nunca entram na estatística. Só o caminho per-STA foi corrigido — o proxy que a projeção usa continua cego à congestão.
 
-4. **`UtilityFunction` dá 0.5 no alvo.** Um AC que cumpre *exatamente* o objetivo fica "meio satisfeito" nessa dimensão; é preciso **exceder** o alvo para saturar perto de 1. Consequência prática: VO/VI estabilizam em ~0.66–0.87 e **raramente atingem `StayThreshold = 0.75`** de forma folgada, ficando dependentes dos vetos em vez do `STAY_SATISFIED`.
+4. **~~`UtilityFunction` dá 0.5 no alvo~~ — CORRIGIDO e VALIDADO.** *Problema original*: para throughput, cumprir exatamente o alvo dava só 0.5 (era preciso ~2× o alvo para saturar), o que fazia VO/VI estabilizarem em ~0.69–0.75, colados ao `StayThreshold`, dependentes dos vetos em vez do `STAY_SATISFIED`. *Correção*: (a) no ramo *higher-is-better* a inflexão passou para 50% do alvo (`1/(1+e^{10(0.5−ratio)})`) → cumprir o alvo ≈ 0.99; (b) as metas de jitter de VO/VI (`maxJitterMs`) subiram de 0.1 ms (inatingível) para 5/10 ms. *Resultado medido*: VO/VI/BE bem servidos passaram a ~**0.99** e o `STAY_SATISFIED` voltou a dominar (zero migrações no steady state). O `StayThreshold=0.75` **não** precisou de mudar — com os satisfeitos a ~0.99, continua a separar bem servido de esfomeado.
 
 5. **As métricas end-to-end são medidas nos sinks das STAs** — um AP real não teria acesso a elas. É legítimo em simulação e foi a forma de obter valores fiáveis, mas o scheduler **não é diretamente transponível para hardware** sem uma fonte equivalente do lado do AP.
 
