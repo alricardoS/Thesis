@@ -797,6 +797,13 @@ std::vector<bool> g_firstPacket;
 // Per-STA throughput tracking
 std::vector<uint64_t> g_lastTotalRx;
 
+// Per-second per-STA QoS metrics time series (CSV opcional, puramente observacional)
+std::ofstream g_perStaMetricsStream;
+std::string g_perStaMetricsCsvPath;
+std::string g_perStaMetricsRunLabel;
+std::vector<uint64_t> g_lastStaTx;
+std::vector<uint64_t> g_lastStaRx;
+
 // Per-STA identity/goal, for feeding real per-STA QoS to the AP scheduler
 std::vector<std::vector<Mac48Address>> g_staIndexToMacs; // todos os MACs (MLD + link) por STA
 std::vector<AcIndex> g_staAc;                             // AC de cada STA
@@ -929,6 +936,27 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
             }
         }
 
+        // ---- Série temporal por-STA (opcional; não afecta nenhum cálculo acima) ----
+        if (g_perStaMetricsStream.is_open() && i < g_staAc.size()) {
+            // Subtracção em double (com sinal): evita o underflow de uint64_t quando
+            // uma janela "sobre-entrega" (dRx > dTx, pacotes in-flight da janela
+            // anterior chegam agora), que gerava 100% de loss falso.
+            double dTxD = double(staTx[i]) - double(g_lastStaTx[i]);
+            double dRxD = double(staRx[i]) - double(g_lastStaRx[i]);
+            g_lastStaTx[i] = staTx[i];
+            g_lastStaRx[i] = staRx[i];
+            double winLossPct = (dTxD > 0.0)
+                                  ? std::min(100.0, std::max(0.0,
+                                      100.0 * (dTxD - dRxD) / dTxD))
+                                  : 0.0;
+
+            g_perStaMetricsStream << '"' << g_perStaMetricsRunLabel << "\","
+                                  << currentTime << ',' << i << ','
+                                  << AcIndexToShortName(g_staAc[i]) << ','
+                                  << throughput << ',' << winDelay << ','
+                                  << winJitter << ',' << winLossPct << '\n';
+        }
+
         if (throughput > 0) {
             totalThroughput += throughput;
             validStas++;
@@ -946,6 +974,10 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
 
     NS_LOG_UNCOND("TIME_STATS: Time=" << currentTime << "s TotalThroughput=" << static_cast<int>(totalThroughput)
                   << "Mbps AvgDelay=" << avgDelay << "ms AvgJitter=" << avgJitter << "ms ActiveSTAs=" << validStas);
+
+    if (g_perStaMetricsStream.is_open()) {
+        g_perStaMetricsStream.flush();
+    }
 
     Simulator::Schedule(Seconds(1), &CalculateStats, sinks);
 }
@@ -1188,6 +1220,9 @@ int main(int argc, char* argv[])
     cmd.AddValue("bkJitterWeight", "BK Jitter Weight", g_bkJitterWeight);
     cmd.AddValue("bkLossWeight", "BK Loss Weight", g_bkLossWeight);
     cmd.AddValue("bkTpWeight", "BK Throughput Weight", g_bkTpWeight);
+    cmd.AddValue("perStaMetricsCsv",
+                 "CSV path for per-second per-STA QoS metrics time series",
+                 g_perStaMetricsCsvPath);
     cmd.Parse(argc, argv);
 
     if (queueSampleInterval <= 0.0)
@@ -1213,6 +1248,8 @@ int main(int argc, char* argv[])
     g_lastDelaySamples.resize(g_numStas, 0);
     g_lastJitterSumMs.resize(g_numStas, 0.0);
     g_lastJitterSamples.resize(g_numStas, 0);
+    g_lastStaTx.resize(g_numStas, 0);
+    g_lastStaRx.resize(g_numStas, 0);
     g_queueOccupancyCsvPath = queueOccupancyCsvPath;
     g_queueSampleInterval = queueSampleInterval;
     g_linkTrafficCsvPath = linkTrafficCsvPath;
@@ -1498,6 +1535,25 @@ int main(int argc, char* argv[])
                                        ? std::to_string(freq1) + "+" + std::to_string(freq2) + "|" + protocol
                                        : queueOccupancyLabel + "|" + std::to_string(freq1) + "+" + std::to_string(freq2) + "|" + protocol;
         g_queueOccupancyEndTime = Seconds(simTime);
+    }
+
+    if (!g_perStaMetricsCsvPath.empty())
+    {
+        g_perStaMetricsStream.open(g_perStaMetricsCsvPath, std::ios::out | std::ios::app);
+        if (!g_perStaMetricsStream.is_open())
+        {
+            NS_FATAL_ERROR("Could not open per-STA metrics CSV: " << g_perStaMetricsCsvPath);
+        }
+        if (g_perStaMetricsStream.tellp() == std::streampos(0))
+        {
+            g_perStaMetricsStream
+                << "run_label,time_s,sta_id,ac,throughput_mbps,delay_ms,jitter_ms,loss_pct\n";
+        }
+        g_perStaMetricsRunLabel =
+            queueOccupancyLabel.empty()
+                ? std::to_string(freq1) + "+" + std::to_string(freq2) + "|" + protocol
+                : queueOccupancyLabel + "|" + std::to_string(freq1) + "+" + std::to_string(freq2) +
+                      "|" + protocol;
     }
 
     // ===== CONFIGURAÇÃO ESTÁTICA (WifiStaticSetupHelper) =====
@@ -1998,7 +2054,12 @@ int main(int argc, char* argv[])
     {
         g_frameDistributionStream.close();
     }
-    
+
+    if (g_perStaMetricsStream.is_open())
+    {
+        g_perStaMetricsStream.close();
+    }
+
     if (g_apScheduler) {
         g_apScheduler->PrintFinalScores();
     }

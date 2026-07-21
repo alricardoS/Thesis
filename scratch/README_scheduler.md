@@ -129,7 +129,7 @@ Não precisam de somar 1 — o código normaliza pela soma. VO prioriza delay+ji
 
 ## Motor 2 — Link Capability Engine
 
-### `estimatedCapacityMbps` — capacidade ALCANÇÁVEL medida
+### `estimatedCapacityMbps` — rate efetivo à carga atual (medido)
 
 ```cpp
 busyFrac = min(1, m_linkBusyTime[link] / dt)          // airtime ocupado real (com overhead)
@@ -142,7 +142,20 @@ senão:
     estimatedCapacityMbps = 400 (rápido) ou 150 (lento) // cold-start
 ```
 
-> **Porquê medido e não a taxa PHY.** `dataRate_PHY × (1−PER)` é a taxa **nominal** (símbolos de payload no ar) e **ignora todo o overhead MAC** (preâmbulo, AIFS, backoff, SIFS, BlockAck), que no 6 GHz/320 MHz consome a maior parte do tempo. Isso inflacionava a capacidade **~5×** (ex.: 3722 vs ~708 Mbps reais) e fazia a projeção do BE dar 0.97 num link onde ele viria a colapsar. Medir `goodput / airtime ocupado` extrapola a capacidade real e capta o overhead automaticamente. **Fonte crítica**: `m_linkBusyTime` (de `FeedLinkTxStart/End`, tempo real de PHY ocupado) — os proxies de airtime por-AC não servem, porque são tempo de payload puro (sem overhead) e dariam um cálculo circular de volta à taxa PHY.
+> **O que este valor É (e o que NÃO é).** `occupied / busyFrac` mede o **rate efetivo no ponto de operação atual** — quanto goodput o link entrega por unidade de airtime, à carga que está a ver *agora*. **Não** é o máximo saturado do link.
+>
+> **Porquê medir em vez de usar a taxa PHY.** `dataRate_PHY × (1−PER)` é a taxa **nominal** (símbolos de payload no ar) e **ignora todo o overhead MAC** (preâmbulo, AIFS, backoff, SIFS, BlockAck). Isso **sobrestimava** a capacidade ~5× (ex.: 3722 Mbps no 6 GHz). A correção substituiu essa **sobrestimação grosseira** por uma **subestimação conservadora** — muito mais seguro, porque o scheduler nunca passa a achar que um link tem mais folga do que tem.
+>
+> **Porquê subestima (e sobe com a carga).** A eficiência do WiFi depende da **agregação A-MPDU**, que cresce com a profundidade das filas: mais carga → A-MPDUs maiores → menos overhead por byte → rate efetivo maior. Medido no 6 GHz:
+> | Carga no link | `estimatedCapacity` medida |
+> |---|---|
+> | ~300 Mbps (1VO+1VI) | ~655 Mbps |
+> | ~450 Mbps (2VO+1VI) | ~982 Mbps |
+> | saturação de link único | ~1600 Mbps (máximo real) |
+>
+> O valor **sobe monotonamente com a carga** e **nunca sobrestima**. É o rate relevante para a carga que o scheduler realmente vê — não o máximo teórico. Consequência (ver limitação #2): a projeção de "quanto caberia aqui" é **pessimista**.
+>
+> **Fonte crítica**: `m_linkBusyTime` (de `FeedLinkTxStart/End`, tempo real de PHY ocupado) — os proxies de airtime por-AC não servem, porque são tempo de payload puro (sem overhead) e dariam um cálculo circular de volta à taxa PHY.
 
 `ConfigureForPair` ordena os dois links por `GetFrequencyRank` (6 GHz > 5 GHz > 2.4 GHz) e define `m_fastLinkId` / `m_slowLinkId`.
 
@@ -486,12 +499,14 @@ Valores possíveis de `Decision`:
 
 Análise honesta do estado atual. Nada aqui impede os cenários testados de convergir, mas são fraquezas estruturais reais.
 
-1. **A projeção mede capacidade/airtime, não *acesso* — e por isso não modela a fome do EDCA.** Este é o limite de fundo: os motores 2–5 estimam *quanto do meio está ocupado*, não *quem consegue aceder ao canal*. A fome do BE junto a VO/VI (colapso para 4.95 Mbps com 57% de airtime livre) é um fenómeno de acesso que **nenhum modelo de capacidade capta** — só um modelo de saturação EDCA tipo Bianchi (fora do âmbito). É por isso que os **vetos de prioridade são permanentes** (ver §2 dos mecanismos), não um remendo.
-   > **Correção aplicada e validada**: a *inflação* da capacidade — um problema **separado** da fome de acesso — foi corrigida. O `estimatedCapacityMbps` deixou de ser a taxa PHY nominal (que inflacionava ~5×) e passa a ser **medido** (`goodput / airtime ocupado`) — verificado no 6 GHz: de **3722 → ~655 Mbps**. O `NormalisedLoad` passou de "mistura entre ACs" (somava sempre 1) para "utilização real". A projeção do link atual convergiu com a satisfação medida para VO/VI (erro ~0.11, ver coluna `ProjCurrentLink` do CSV). **Não** dispensa os vetos (a fome de acesso mantém-se).
+1. **A projeção mede capacidade/airtime, não *acesso* — e por isso não modela a fome do EDCA.** Este é o limite de fundo: os motores 2–5 estimam *quanto do meio está ocupado*, não *quem consegue aceder ao canal*. A fome do BE junto a VO/VI (colapso para 4.95 Mbps com 57% de airtime livre) é um fenómeno de acesso que **nenhum modelo de capacidade capta** — só um modelo de saturação EDCA tipo Bianchi (fora do âmbito).
+   > **O que impede o colapso do BE é o veto, não a capacidade.** Historicamente (antes do veto simétrico existir), a projeção do BE dava ~0.97 num link com VO/VI e o BE migrava para lá e colapsava. Hoje o **veto simétrico** impede o BE/BK de migrar para um link com VO/VI **independentemente de qualquer número de capacidade** — é a única representação viável da fome de acesso e é **permanente** (ver §2 dos mecanismos).
+   > **O que a correção da capacidade faz (separado do acima)**: torna a projeção honesta nas *outras* decisões (cascata Cat1/2/3, `MeetsOwnGoals`, co-occupancy), que **não** têm um veto a protegê-las. O `estimatedCapacityMbps` deixou de ser a taxa PHY nominal (que **sobrestimava** ~5×: 3722 Mbps) e passa a ser **medido** (subestimação conservadora, ~655–982 conforme a carga — ver Motor 2). O `NormalisedLoad` passou de "mistura entre ACs" (somava sempre 1) para "utilização real". A projeção do link atual convergiu com a satisfação medida para VO/VI (erro ~0.11, ver coluna `ProjCurrentLink` do CSV).
 
 2. **Assimetria medido-vs-projetado + `effCap` mede *o que sobra*, não *o que eu receberia*.** Dois defeitos da projeção que coexistem:
    - *Assimetria*: o `currentSat` (link atual) vem de métricas reais por-STA; a projeção dos *outros* links usa proxies por-(link,AC). Comparar os dois em `improvement = bestScore − currentSat` é comparar grandezas diferentes.
    - *effCap residual*: a projeção pergunta *"quanto sobra aqui?"* em vez de *"quanto é que EU receberia aqui?"*. Um fluxo **bem servido**, que usa tudo o que precisa, vê "nada a sobrar" no seu próprio link e projeta-se mal lá.
+   - *capacidade subestimada*: `estimatedCapacity` é o rate efetivo à carga atual (limitado pela agregação A-MPDU), que **subestima o máximo saturado** (~655–982 medidos vs ~1600 reais no 6 GHz — ver Motor 2). É conservador (nunca sobrestima), logo a projeção de "quanto caberia aqui" é **pessimista** — o que é seguro, mas significa que o scheduler acha os links mais cheios do que estão.
    > **Impacto medido — real mas inofensivo**: a projeção do BE no seu próprio link diverge da satisfação medida (projetado **0.46** vs medido **0.99**) em links de **baixa capacidade** (2.4GHz, onde o BE consome quase tudo); no 5GHz, com folga, converge (erro 0.07). Não causa decisão errada porque o `STAY_SATISFIED` (0.99) dispara sempre e a projeção má nunca chega a ser usada. Corrigi-lo exigiria um modelo de partilha de airtime — não vale o esforço.
 
 3. **O `avgQueueDelayMs` proxy (por-link) é ≈ 0 mesmo sob congestão.** Só conta pacotes que chegam ao dequeue; os que ficam presos ou são dropados por fila cheia nunca entram na estatística. Só o caminho per-STA foi corrigido — o proxy que a projeção usa continua cego à congestão.

@@ -27,11 +27,7 @@ APPEND_TIMESTAMP="${APPEND_TIMESTAMP:-false}"
 # Formato: "nome|staTrafficTypesCsv"
 # ==============================
 EXPERIMENTS=(
-  "one_vi_one_be_two_vo|voice,voice,besteffort,video",
-  "two_vo_two_vi|video,video,voice,voice",
-  "one_vo_one_vi_one_be_one_bg|voice,video,besteffort,background",
-  "one_vo_three_be|voice,besteffort,besteffort,besteffort",
-  "all_be|besteffort,besteffort,besteffort,besteffort"
+  "one_vi_one_be_two_vo|voice,voice,besteffort,video"
 )
   #"two_vo_two_vi|video,video,voice,voice"
   #"one_vo_one_vi_one_be_one_bg|voice,video,besteffort,background"

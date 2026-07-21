@@ -107,6 +107,10 @@ for DATA_RATE in "${DATA_RATES[@]}"; do
 
     CSV_MLO_QUEUE_OCC="$OUTPUTS_DIR/mlo_multi_sta_queue_occupancy.csv"
     echo "run_label,time_s,role,node_id,ac,packets,bytes" > "$CSV_MLO_QUEUE_OCC"
+
+    # Per-second per-STA QoS metrics time series (header written by the simulation)
+    CSV_MLO_PER_STA_TS="$OUTPUTS_DIR/mlo_multi_sta_per_sta_timeseries_${TIMESTAMP}.csv"
+    rm -f "$CSV_MLO_PER_STA_TS"
     
     # Apenas UDP (TCP comentado para uso futuro)
     declare -a PROTOS=("UDP")
@@ -120,7 +124,7 @@ for DATA_RATE in "${DATA_RATES[@]}"; do
             echo "Running MLO Multi-STA: $NAME ($proto) @ $DATA_RATE per STA $OFDMA_LABEL..."
             OUTFILE="$OUTPUTS_DIR/mlo_multi_sta_${F1}_${F2}_${proto}_${TIMESTAMP}.txt"
             CSV_MLO_DECISIONS="$OUTPUTS_DIR/scheduler_decisions_${F1}_${F2}_${proto}_${TIMESTAMP}.csv"
-            ./ns3 run "scratch/wifi7-mlo-multi-sta-priority-sch --freq1=$F1 --freq2=$F2 --protocol=$proto --dataRate=$DATA_RATE --simTime=$SIM_TIME --staticSetup=true --enablePcaps=false --numStas=$NSTAS --staTrafficTypes=$STA_TRAFFIC_TYPES --queueOccupancyCsv=$CSV_MLO_QUEUE_OCC --linkTrafficCsv=$CSV_MLO_LINK_TRAFFIC$QUEUE_LABEL_ARG --queueSampleInterval=0.1 --linkTrafficSampleInterval=0.1 --useCustomMloScheduler=true --schedulerDecisionCsv=$CSV_MLO_DECISIONS" 2>&1 | tee "$OUTFILE"
+            ./ns3 run "scratch/wifi7-mlo-multi-sta-priority-sch --freq1=$F1 --freq2=$F2 --protocol=$proto --dataRate=$DATA_RATE --simTime=$SIM_TIME --staticSetup=true --enablePcaps=false --numStas=$NSTAS --staTrafficTypes=$STA_TRAFFIC_TYPES --queueOccupancyCsv=$CSV_MLO_QUEUE_OCC --linkTrafficCsv=$CSV_MLO_LINK_TRAFFIC$QUEUE_LABEL_ARG --queueSampleInterval=0.1 --linkTrafficSampleInterval=0.1 --useCustomMloScheduler=true --schedulerDecisionCsv=$CSV_MLO_DECISIONS --perStaMetricsCsv=$CSV_MLO_PER_STA_TS" 2>&1 | tee "$OUTFILE"
 
             if [ ! -s "$OUTFILE" ]; then
                 echo "[WARN] Missing or empty output file, skipping post-processing: $OUTFILE"
@@ -507,6 +511,9 @@ PY
         "$PYTHON_BIN" "$BASE_DIR/generate_link_frame_types_distribution_table.py" "$OUTPUTS_DIR" "$SCENARIO_TAG" "$PLOTS_DIR/link_frame_types_distribution_table.txt"
         if [ -f "$CSV_MLO_QUEUE_OCC" ]; then
             "$PYTHON_BIN" "$BASE_DIR/generate_queue_occupancy_plots.py" "$CSV_MLO_QUEUE_OCC" "$PLOTS_DIR/queue_occupancy_mlo" "MLO Queue Occupancy"
+        fi
+        if [ -f "$CSV_MLO_PER_STA_TS" ]; then
+            "$PYTHON_BIN" "$BASE_DIR/generate_multi_sta_timeseries_plots.py" "$CSV_MLO_PER_STA_TS" "$PLOTS_DIR/Individual_plots_by_time" "$SCENARIO_TAG" "$OUTPUTS_DIR"
         fi
         
         echo "Plots/tables generated in: $PLOTS_DIR"
