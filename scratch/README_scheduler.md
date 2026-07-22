@@ -417,21 +417,23 @@ Este é o mecanismo mais subtil, e vale a pena perceber em detalhe.
 
 ### Constantes hardcoded (não são atributos ns-3)
 
-| Constante | Valor | Local | Significado |
-|-----------|-------|-------|-------------|
-| `kWarmupSamples` | 2 | `UpdatePeriodicMetrics` | Janelas de medição antes de libertar o bootstrap |
-| `kMigrationDwellSec` | 1.0 s | `DecideLinkMigration` | Persistência exigida a uma intenção de migração |
-| `kStarvationFloor` | 0.60 | `DecideLinkMigration` | `currentSat` abaixo do qual um VO/VI é "esfomeado" (abre a exceção do veto) |
-| `perAlpha` | 0.3 | `UpdatePeriodicMetrics` | Suavização EWMA do PER proxy |
-| Blend final | 0.65 / 0.25 / 0.10 | `ComputeExpectedQosSatisfaction` | `baseSat` / `capabilityScore` / `perPenalty` |
-| Limiar "esfomeado" (altruísta A) | 0.45 | idem | Residente tratado como esfomeado |
-| Penalidade base (altruísta A) | 0.6 | idem | `(0.6 − otherSat)`, máx. 0.6 |
-| Limiar headroom (altruísta B) | 0.75 | idem | Satisfação abaixo da qual a preventiva pode disparar |
-| Teto da preventiva (B) | 0.5 | idem | Máximo que (B) subtrai |
-| Carga proxy em cold-start | 0.15 | idem | `NormalisedLoad` assumida sem medição |
-| Fator pressão → delay | 0.3 | idem | `delay × (1 + pressure×0.3)` |
-| Fator pressão → jitter | 0.2 | idem | `jitter × (1 + pressure×0.2)` |
-| `m_edcaWeights[4][4]` | ver Motor 4 | construtor | Matriz de pressão de contenção |
+| Constante | Valor | Local | Significado | Justificação |
+|-----------|-------|-------|-------------|--------------|
+| `kWarmupSamples` | 2 | `UpdatePeriodicMetrics` | Janelas de medição antes de libertar o bootstrap | **(P)** A 1ª janela vem contaminada pelo ramp-up; é preciso saltá-la e usar a 2ª (limpa). 2 é o **mínimo** para haver uma janela limpa antes de libertar — 1 não saltaria nada, mais alto atrasaria a convergência sem ganho. |
+| `kMigrationDwellSec` | 1.0 s | `DecideLinkMigration` | Persistência exigida a uma intenção de migração | **(P)** Igual à cadência do `FeedStaQos` (1 s). Garante que a intenção sobrevive a **≥1 janela de medição nova** antes de executar → filtra blips de 1 janela. Menor não veria medição fresca; maior atrasaria migrações genuínas. |
+| `kStarvationFloor` | 0.60 | `DecideLinkMigration` | `currentSat` abaixo do qual um VO/VI é "esfomeado" (abre a exceção do veto) | **(P/E)** Fronteiras lógicas: **< `StayThreshold` (0.75)** (senão um fluxo satisfeito abriria o veto) e **> degradação transitória**. 0.60 fica na banda "claramente mal, mas não catastrófico"; o dígito exato não é crítico dentro dela. |
+| `perAlpha` | 0.3 | `UpdatePeriodicMetrics` | Suavização EWMA do PER proxy | **(E)** Fator EWMA convencional: 30% amostra nova / 70% histórico. Equilibra reatividade e estabilidade. Mais alto = mais ruidoso; mais baixo = mais lento a reagir. Não crítico. |
+| Blend final | 0.65 / 0.25 / 0.10 | `ComputeExpectedQosSatisfaction` | `baseSat` / `capabilityScore` / `perPenalty` | **(E)** Afinado (era 0.8/0.1/0.1). A satisfação QoS **domina** (0.65, sinal primário); a capacidade do link é um **secundário forte** (0.25, subido para dar mais peso a links capazes/com folga); o PER é um empurrão menor (0.10). **Soma 1.** Importa a *proporção*, não os dígitos. |
+| Limiar "esfomeado" (altruísta A) | 0.45 | idem | Residente tratado como esfomeado | **(P/E)** Abaixo do ponto médio 0.5 → o residente está claramente na **metade insatisfeita**. Marca "este AC já sofre" para disparar a penalidade reativa. |
+| Penalidade base (altruísta A) | 0.6 | idem | `(0.6 − otherSat)`, máx. 0.6 | **(E)** Define a magnitude: penalidade máx. 0.6 (residente a 0), mín. 0.15 (residente a 0.45). Forte para afastar candidatos de um residente esfomeado, sem aniquilar o score (em [0,1]). |
+| Limiar headroom (altruísta B) | 0.75 | idem | Satisfação abaixo da qual a preventiva pode disparar | **(P/E)** Coincide com o antigo `StayThreshold`: **acima de 0.75** o residente está confortável e um recém-chegado não é ameaça; **abaixo**, é. Fronteira "confortável vs apertado". |
+| Teto da preventiva (B) | 0.5 | idem | Máximo que (B) subtrai | **(P)** Salvaguarda: a preventiva nunca corta mais de **metade** do score → sozinha não decide uma migração de forma catastrófica. |
+| Carga proxy em cold-start | 0.15 | idem | `NormalisedLoad` assumida sem medição | **(E)** Sem medição, assume-se ~15% de carga para a preventiva **não ser nula só por falta de dados**. Pequeno e conservador. |
+| Fator pressão → delay | 0.3 | idem | `delay × (1 + pressure×0.3)` | **(P/E)** O delay é **diretamente** agravado pela contenção (mais competição → mais espera na fila) → fator maior. Subido de 0.2 → 0.3 empiricamente. |
+| Fator pressão → jitter | 0.2 | idem | `jitter × (1 + pressure×0.2)` | **(P/E)** O jitter (variação do delay) sofre com a contenção mas de forma **menos direta** que o delay médio → fator **menor** (0.2 < 0.3). |
+| `m_edcaWeights[4][4]` | ver Motor 4 | construtor | Matriz de pressão de contenção | **(P/E)** Codifica a assimetria real do EDCA (AIFS/CW): VO (AIFSN=2/CWmin=3) sente pouco os de baixo; BE/BK (AIFS/CW longos) sentem muito os de cima. A **ordem de grandeza** (VO/VI ≫ BK/BE na coluna) é física; os valores exatos (8.0, 6.0…) são afinados. |
+
+> **P = princípio** (o valor deriva de algo concreto — cadência, fronteira lógica, soma = 1; defensável com rigor) · **E = empírico** (afinado por observação; o que importa é a *banda*, não o dígito). A distinção é deliberada: um scheduler heurístico assume que várias constantes são afinadas dentro de uma gama razoável, e o comportamento é robusto a pequenas variações delas.
 
 Para alterar qualquer uma destas é preciso editar o `.h` e recompilar.
 
