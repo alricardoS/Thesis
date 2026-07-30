@@ -399,6 +399,25 @@ Este é o mecanismo mais subtil, e vale a pena perceber em detalhe.
 
   O **encaminhamento** dos beacons não muda — apenas deixam de contar como "residentes" de um link.
 
+### 5. Balanceamento de links ociosos (`RebalanceIdleLinks`)
+
+> **Nota de filosofia**: este mecanismo adiciona um **segundo objetivo** — até aqui o scheduler só *satisfazia QoS*; agora também *aproveita links ociosos*. É uma escolha deliberada.
+
+- **Sintoma**: em cenários homogéneos (all-BE) ou onde vários fluxos cabem no melhor link (2VO+2VI), **todos os STAs acabam no mesmo link e o outro fica parado**. Espalhar a carga melhora as métricas (menos contenção, menos delay).
+- **Causa**: depois de a `UtilityFunction` dar ~0.99 a um fluxo bem servido, o `STAY_SATISFIED` trava-o e ele deixa de explorar o link vazio. O balanceamento tem de ser **explícito**.
+- **Mecanismo** (em `UpdatePeriodicMetrics`, um movimento por janela):
+  1. **Gate**: **todos** os fluxos routáveis satisfeitos (`curSat ≥ StayThreshold`). Se algum não está, o cascade está a resgatá-lo → não se balanceia.
+  2. **Alvo homogéneo**: só se move para um link **vazio** ou que **só contenha fluxos da mesma AC** do candidato.
+  3. Move o fluxo de **menor prioridade EDCA** (não-VO — voz pinada) de um link com ≥2 fluxos, **e apenas se reduzir o desequilíbrio** (`flows(source) > flows(target)+1`).
+  4. **Teste de folga**: se o alvo estiver **vazio**, o 1º fluxo entra sempre (fica com o link todo — um link ocioso não tem capacidade medível). Se já tiver fluxos, exige `folga medida ≥ targetThroughput`.
+
+  **A regra do alvo homogéneo é o núcleo de segurança** — substitui um "veto bidirecional" por algo mais forte: **o balanceador nunca mistura ACs**. Consequências:
+  - Nunca cria BE/BK com VO/VI (em nenhum sentido). *(Foi o bug de uma versão anterior: um VI era movido para cima de um BE. Aqui não acontece — o link do BE não é vazio nem "só-VI".)*
+  - Um grupo novo **só arranca num link vazio**; depois enche-se com a mesma AC enquanto houver folga → **iterativo**, o "quantos migram" emerge da capacidade medida (ex.: 2VO+2VI → 2 VIs no 5GHz, mas só 1 no 2.4GHz).
+  - Impede a **consolidação inversa** (mover um VI de volta para o link dos VOs) → sem ping-pong.
+
+  **Anti-oscilação**: cooldown global (`kRebalanceCooldownSec = 2 s`) + por-fluxo (`kFlowBalanceCooldownSec = 10 s`). Se um movimento degradar um fluxo, o cascade puxa-o de volta e o cooldown impede o re-empurrão.
+
 ---
 
 ## Tabela de todas as variáveis configuráveis
@@ -422,6 +441,8 @@ Este é o mecanismo mais subtil, e vale a pena perceber em detalhe.
 | `kWarmupSamples` | 2 | `UpdatePeriodicMetrics` | Janelas de medição antes de libertar o bootstrap | **(P)** A 1ª janela vem contaminada pelo ramp-up; é preciso saltá-la e usar a 2ª (limpa). 2 é o **mínimo** para haver uma janela limpa antes de libertar — 1 não saltaria nada, mais alto atrasaria a convergência sem ganho. |
 | `kMigrationDwellSec` | 1.0 s | `DecideLinkMigration` | Persistência exigida a uma intenção de migração | **(P)** Igual à cadência do `FeedStaQos` (1 s). Garante que a intenção sobrevive a **≥1 janela de medição nova** antes de executar → filtra blips de 1 janela. Menor não veria medição fresca; maior atrasaria migrações genuínas. |
 | `kStarvationFloor` | 0.60 | `DecideLinkMigration` | `currentSat` abaixo do qual um VO/VI é "esfomeado" (abre a exceção do veto) | **(P/E)** Fronteiras lógicas: **< `StayThreshold` (0.75)** (senão um fluxo satisfeito abriria o veto) e **> degradação transitória**. 0.60 fica na banda "claramente mal, mas não catastrófico"; o dígito exato não é crítico dentro dela. |
+| `kRebalanceCooldownSec` | 2.0 s | `RebalanceIdleLinks` | Intervalo mínimo entre movimentos de balanceamento | **(E)** Deixa as métricas estabilizar entre movimentos. Conservador; qualquer valor de alguns segundos serve. |
+| `kFlowBalanceCooldownSec` | 10.0 s | `RebalanceIdleLinks` | Tempo mínimo antes de re-mexer no mesmo fluxo | **(E)** Anti-ping-pong: se o cascade puxar um fluxo de volta, não o re-empurramos logo. Valor folgado, não crítico. |
 | `perAlpha` | 0.3 | `UpdatePeriodicMetrics` | Suavização EWMA do PER proxy | **(E)** Fator EWMA convencional: 30% amostra nova / 70% histórico. Equilibra reatividade e estabilidade. Mais alto = mais ruidoso; mais baixo = mais lento a reagir. Não crítico. |
 | Blend final | 0.65 / 0.25 / 0.10 | `ComputeExpectedQosSatisfaction` | `baseSat` / `capabilityScore` / `perPenalty` | **(E)** Afinado (era 0.8/0.1/0.1). A satisfação QoS **domina** (0.65, sinal primário); a capacidade do link é um **secundário forte** (0.25, subido para dar mais peso a links capazes/com folga); o PER é um empurrão menor (0.10). **Soma 1.** Importa a *proporção*, não os dígitos. |
 | Limiar "esfomeado" (altruísta A) | 0.45 | idem | Residente tratado como esfomeado | **(P/E)** Abaixo do ponto médio 0.5 → o residente está claramente na **metade insatisfeita**. Marca "este AC já sofre" para disparar a penalidade reativa. |
@@ -527,4 +548,8 @@ Análise honesta do estado atual. Nada aqui impede os cenários testados de conv
 
 10. **O dwell de 1 s está acoplado ao intervalo de medição.** Foi escolhido para garantir que uma intenção sobrevive a ≥ 1 janela nova. Se o `MetricsInterval` ou a cadência do `FeedStaQos` (1 s) mudarem, o dwell tem de ser reavaliado.
 
-11. **Cobertura de teste.** Validado em cenários de **4 STAs** (2VO+1VI+1BE, 2VO+2VI, 1VO+1VI+1BE+1BK, all-BE) × **3 pares de frequências** (2.4+5, 2.4+6, 5+6), com tráfego UDP saturante de 150 Mbps por STA e STAs estáticos. Fora deste envelope — mais links, mais STAs, mobilidade, tráfego variável, TCP — não há garantias. Vários mecanismos (bootstrap, vetos) assumem implicitamente **exatamente 2 links**.
+11. **Balanceamento — voz pinada.** O `RebalanceIdleLinks` **nunca move VO** (voz fica no melhor link, por ser a mais sensível a delay). Consequência: num cenário all-VO os VOs não se espalham por um link vazio. Escolha conservadora; relaxá-la é trivial (remover o guard `acIdx == AC_VO`).
+
+12. **Balanceamento — link vazio recebe o 1º fluxo incondicionalmente.** A capacidade de um link ocioso **não é medível** (`estimatedCapacity = goodput/airtime` precisa de tráfego → fica 0 se nunca foi usado, ou estagnada se o foi cedo). Por isso o 1º fluxo entra sem teste de capacidade — fica com o link todo — e confia-se na **medição da janela seguinte** (para decidir sobre um 2º) e na **auto-correção do cascade** (que o puxa de volta se o link for mesmo fraco). Sem isto, o teste `folga ≥ target` bloqueava sempre a 1ª migração.
+
+13. **Cobertura de teste.** Validado em cenários de **4 STAs** (2VO+1VI+1BE, 2VO+2VI, 1VO+1VI+1BE+1BK, all-BE) × **3 pares de frequências** (2.4+5, 2.4+6, 5+6), com tráfego UDP saturante de 150 Mbps por STA e STAs estáticos. Fora deste envelope — mais links, mais STAs, mobilidade, tráfego variável, TCP — não há garantias. Vários mecanismos (bootstrap, vetos, balanceamento) assumem implicitamente **exatamente 2 links**.

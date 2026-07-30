@@ -339,6 +339,12 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     // ---- Periodic update ----
     void UpdatePeriodicMetrics();
 
+    /// Balanceamento de recursos: quando todos os fluxos estão satisfeitos e há
+    /// um link vazio, move o fluxo de menor prioridade EDCA para lá, enchendo-o
+    /// até à capacidade medida. Alvo tem de ser homogéneo (vazio ou só da mesma
+    /// AC) — nunca mistura ACs. Corre por janela, um movimento de cada vez.
+    void RebalanceIdleLinks();
+
     // ---- Delegate (FCFS) ----
     Ptr<WifiMacQueueScheduler> m_delegate;
 
@@ -400,6 +406,10 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     double m_metricsIntervalSec{0.5};
     double m_lastPeriodicUpdateTime{0.0};
     EventId m_updateEvent;
+
+    // ---- Balanceamento de links ociosos (idle-link load balancing) ----
+    double m_lastRebalanceSec{0.0};                  // cooldown global
+    std::map<StaAcKey, double> m_lastFlowBalanceSec; // cooldown por-fluxo
 
     // ---- Priority-cascade thresholds (DecideLinkMigration) ----
     // "Meets own goals" threshold for MeetsOwnGoals() — a candidate clears
@@ -1415,10 +1425,100 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
         }
     }
 
+    // Balanceamento de recursos: espalhar carga para links vazios/homogéneos.
+    RebalanceIdleLinks();
+
     m_lastPeriodicUpdateTime = now;
     m_updateEvent = Simulator::Schedule(
         Seconds(m_metricsIntervalSec),
         &QosWeightedMloScheduler::UpdatePeriodicMetrics, this);
+}
+
+inline void
+QosWeightedMloScheduler::RebalanceIdleLinks()
+{
+    constexpr double kRebalanceCooldownSec   = 2.0;  // no máximo 1 movimento / 2s
+    constexpr double kFlowBalanceCooldownSec = 10.0; // um fluxo não é re-mexido em 10s
+
+    double now = Simulator::Now().GetSeconds();
+    if (now - m_lastRebalanceSec < kRebalanceCooldownSec) return;
+
+    // Fluxos routáveis por link (ignora beacons/broadcast)
+    std::map<uint8_t, std::vector<StaAcKey>> flowsByLink;
+    for (const auto& [key, link] : m_lastSelectedLink) {
+        if (!IsRoutableSta(key.first)) continue;
+        flowsByLink[link].push_back(key);
+    }
+
+    // GATE: todos os fluxos routáveis satisfeitos (senão o cascade está a resgatar
+    // alguém — não é altura de otimizar/espalhar).
+    for (const auto& [key, link] : m_lastSelectedLink) {
+        if (!IsRoutableSta(key.first)) continue;
+        double cs = m_currentSatisfaction.count(key)
+                        ? m_currentSatisfaction.at(key).index : 0.0;
+        if (cs < m_stayThreshold) return;
+    }
+
+    auto linkLoad = [&](uint8_t l) {
+        auto& t = m_traffic[l];
+        return t.voThroughputMbps + t.viThroughputMbps
+             + t.beThroughputMbps + t.bkThroughputMbps;
+    };
+    // Rank de prioridade EDCA: VO=3 > VI=2 > BE=1 > BK=0. Menor prioridade = menor rank.
+    auto edcaRank = [](uint8_t a) -> int {
+        switch (static_cast<AcIndex>(a)) {
+            case AC_VO: return 3; case AC_VI: return 2;
+            case AC_BE: return 1; case AC_BK: return 0; default: return 1;
+        }
+    };
+    // Classe do alvo: -1 vazio (aceita qualquer AC); -2 misto (nunca é alvo);
+    // caso contrário o acIdx homogéneo do link.
+    auto targetAcClass = [&](uint8_t l) -> int {
+        if (flowsByLink[l].empty()) return -1;
+        uint8_t a = flowsByLink[l][0].second;
+        for (const auto& k : flowsByLink[l]) if (k.second != a) return -2;
+        return static_cast<int>(a);
+    };
+
+    for (uint8_t T : {m_slowLinkId, m_fastLinkId}) {
+        int cls = targetAcClass(T);
+        if (cls == -2) continue;  // alvo misto → nunca mistura ACs
+        bool targetEmpty = flowsByLink[T].empty();
+        double spare = m_linkCapability[T].estimatedCapacityMbps - linkLoad(T);
+        for (uint8_t S : {m_fastLinkId, m_slowLinkId}) {
+            if (S == T) continue;
+            if (flowsByLink[S].size() < 2) continue;  // não esvaziar a fonte
+            // Balanceamento: só mover se reduz o desequilíbrio (mantém S >= T).
+            // Evita sobre-migração para um link vazio capaz (ex.: all-BE @ 5+6).
+            if (flowsByLink[S].size() <= flowsByLink[T].size() + 1) continue;
+
+            StaAcKey best{};
+            int bestRank = 99;
+            bool found = false;
+            for (const auto& key : flowsByLink[S]) {
+                uint8_t acIdx = key.second;
+                if (acIdx == static_cast<uint8_t>(AC_VO)) continue;  // voz pinada no melhor link
+                if (cls != -1 && acIdx != static_cast<uint8_t>(cls)) continue; // alvo homogéneo
+                double lastBal = m_lastFlowBalanceSec.count(key)
+                                     ? m_lastFlowBalanceSec.at(key) : -1e9;
+                if (now - lastBal < kFlowBalanceCooldownSec) continue;  // anti-ping-pong
+                double tgt = m_goals.count(acIdx)
+                                 ? m_goals.at(acIdx).targetThroughputMbps : 150.0;
+                // Link vazio recebe sempre o 1º fluxo (fica com o link todo — a
+                // capacidade de um link ocioso não é medível). Só se exige folga
+                // quando o alvo JÁ tem tráfego (capacidade medida, fiável).
+                if (!targetEmpty && spare < tgt) continue;
+                int r = edcaRank(acIdx);
+                if (r < bestRank) { bestRank = r; best = key; found = true; }
+            }
+            if (found) {
+                m_lastSelectedLink[best] = T;
+                m_lastFlowBalanceSec[best] = now;
+                m_lastRebalanceSec = now;
+                return;  // um movimento por janela
+            }
+        }
+    }
 }
 
 // ===========================================================================
