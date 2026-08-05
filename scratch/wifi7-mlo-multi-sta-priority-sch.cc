@@ -99,6 +99,23 @@ Mac48Address g_apAddress;
 std::set<Mac48Address> g_apRxAddresses;
 std::map<std::string, uint8_t> g_apLinkAddressToLinkId;
 std::map<std::string, uint32_t> g_staAddressToIndex;
+std::vector<std::vector<Mac48Address>> g_staIndexToMacs; // todos os MACs (MLD + link) por STA
+
+// ---- Estimativa QoS SÓ-AP: acumuladores da janela (por staId+AC), medidos nas
+//      filas MAC do AP via traces FIÁVEIS Enqueue/Dequeue. Chave = (staId, acIdx).
+using ApKey = std::pair<uint32_t, uint8_t>;
+std::map<ApKey, uint64_t> g_apOffered;      // MPDUs enfileirados (oferecidos)
+std::map<ApKey, uint64_t> g_apDelivered;    // MPDUs dequeued (= entregues/ACKed)
+std::map<ApKey, uint64_t> g_apDelivBytes;   // bytes entregues
+std::map<ApKey, double>   g_apDelaySumMs;   // soma delay enqueue→dequeue
+std::map<ApKey, uint64_t> g_apDelayN;
+std::map<ApKey, double>   g_apJitterSumMs;  // soma |Δdelay|
+std::map<ApKey, uint64_t> g_apJitterN;
+std::map<ApKey, double>   g_apLastDelayMs;  // último delay (persiste p/ jitter)
+std::map<uint64_t, double> g_apEnqTimeMs;   // uid -> instante de enqueue (ms)
+std::map<ApKey, uint64_t> g_apDropped;      // drops PRÉ-entrega (TC overlimit + MAC pré-enqueue)
+uint32_t g_payloadBytes = 1440;             // payload da app (p/ goodput exato; = payloadSize)
+std::string g_decisionMetrics = "ap";       // "ap" (estimativa do AP) | "sink" (feedback STA)
 uint64_t g_ctrlTxRequestsRegistered = 0;
 uint64_t g_ctrlRxControlSeen = 0;
 
@@ -304,6 +321,56 @@ RecordLinkTrafficFromMpdu(Ptr<const WifiMpdu> mpdu)
         g_apScheduler->FeedLinkMetrics(linkId, ac, mpdu->GetSize(), 1, 0);
     }
 }
+
+// ---- Estimativa QoS SÓ-AP: callbacks das filas MAC do AP (traces fiáveis) ----
+// Devolve o índice do STA a partir de um endereço (MLD ou de-link); -1 se desconhecido.
+static int ApStaIndexOf(const Mac48Address& addr)
+{
+    if (addr.IsGroup()) return -1;
+    auto it = g_staAddressToIndex.find(MacAddressToString(addr));
+    return (it == g_staAddressToIndex.end()) ? -1 : static_cast<int>(it->second);
+}
+
+// Dequeue da fila MAC do AP: MPDU sai da fila = entregue/ACKed (falhas ficam na
+// fila p/ retx; retry-limit sai por Expired/Drop, não por Dequeue). O delay usa o
+// instante de TC-enqueue (topo da pilha) → capta a espera TC + MAC.
+void ApQueueDequeue(AcIndex ac, Ptr<const WifiMpdu> mpdu)
+{
+    if (!mpdu || !mpdu->GetHeader().IsQosData() || !mpdu->GetPacket()) return;
+    int sta = ApStaIndexOf(mpdu->GetHeader().GetAddr1());
+    if (sta < 0) return;
+    ApKey k{static_cast<uint32_t>(sta), static_cast<uint8_t>(ac)};
+    g_apDelivered[k]++;
+    g_apDelivBytes[k] += mpdu->GetSize();
+
+    auto it = g_apEnqTimeMs.find(mpdu->GetPacket()->GetUid());
+    if (it != g_apEnqTimeMs.end()) {
+        double d = Simulator::Now().GetMilliSeconds() - it->second;
+        if (d >= 0.0) {
+            g_apDelaySumMs[k] += d;
+            g_apDelayN[k]++;
+            auto lit = g_apLastDelayMs.find(k);
+            if (lit != g_apLastDelayMs.end()) {
+                g_apJitterSumMs[k] += std::fabs(d - lit->second);
+                g_apJitterN[k]++;
+            }
+            g_apLastDelayMs[k] = d;
+        }
+        g_apEnqTimeMs.erase(it);
+    }
+}
+
+// Drop na fila MAC do AP ANTES do enqueue (fila cheia) — conta como oferecido-não-entregue.
+// NÃO ligar ao "Expired" (esses já entraram na fila e já contam via Enqueue).
+void ApMacPreDrop(AcIndex ac, Ptr<const WifiMpdu> mpdu)
+{
+    if (!mpdu || !mpdu->GetHeader().IsQosData()) return;
+    int sta = ApStaIndexOf(mpdu->GetHeader().GetAddr1());
+    if (sta < 0) return;
+    g_apDropped[ApKey{static_cast<uint32_t>(sta), static_cast<uint8_t>(ac)}]++;
+}
+
+// (ApTcDrop definido mais abaixo, após g_staIpToIndex/g_numStas/g_staAc.)
 
 void
 RecordFrameDistribution(uint8_t linkId, Ptr<const WifiPsdu> psdu)
@@ -801,16 +868,48 @@ std::vector<uint64_t> g_lastTotalRx;
 std::ofstream g_perStaMetricsStream;
 std::string g_perStaMetricsCsvPath;
 std::string g_perStaMetricsRunLabel;
+
+// Comparação sink (verdade) vs estimativa SÓ-AP das métricas de QoS (validação)
+std::ofstream g_metricCompStream;
+std::string g_metricCompCsvPath;
+std::string g_metricCompRunLabel;
 std::vector<uint64_t> g_lastStaTx;
 std::vector<uint64_t> g_lastStaRx;
+std::vector<uint64_t> g_lastStaTxC;   // baseline dedicado à comparação (loss_sink por-janela)
+std::vector<uint64_t> g_lastStaRxC;
 
 // Per-STA identity/goal, for feeding real per-STA QoS to the AP scheduler
-std::vector<std::vector<Mac48Address>> g_staIndexToMacs; // todos os MACs (MLD + link) por STA
 std::vector<AcIndex> g_staAc;                             // AC de cada STA
 // FlowMonitor para loss REAL acumulada por-STA (alimentada ao scheduler)
 Ptr<FlowMonitor> g_flowMonitor;
 Ptr<Ipv4FlowClassifier> g_flowClassifier;
 std::map<Ipv4Address, uint32_t> g_staIpToIndex;          // IP destino -> índice STA
+
+// Enqueue no traffic-control do AP (topo da pilha) — pacote OFERECIDO. Timestamp por UID
+// (o delay TC→ACK capta a espera TC + MAC). Atribui por-STA via IP destino.
+void ApTcEnqueue(Ptr<const QueueDiscItem> item)
+{
+    auto ip = DynamicCast<const Ipv4QueueDiscItem>(item);
+    if (!ip || !item->GetPacket()) return;
+    auto it = g_staIpToIndex.find(ip->GetHeader().GetDestination());
+    if (it == g_staIpToIndex.end() || it->second >= g_numStas) return;
+    uint32_t s = it->second;
+    g_apOffered[ApKey{s, static_cast<uint8_t>(g_staAc[s])}]++;
+    g_apEnqTimeMs[item->GetPacket()->GetUid()] = Simulator::Now().GetMilliSeconds();
+}
+
+// Drop no traffic-control do AP (downlink) ANTES do enqueue — a fonte de perda dominante
+// no all-BE (overlimit). Atribui por-STA via IP destino. (Aqui porque usa g_staIpToIndex/g_staAc.)
+void ApTcDrop(Ptr<const QueueDiscItem> item, const char* /*reason*/)
+{
+    auto ip = DynamicCast<const Ipv4QueueDiscItem>(item);
+    if (!ip) return;
+    auto it = g_staIpToIndex.find(ip->GetHeader().GetDestination());
+    if (it == g_staIpToIndex.end() || it->second >= g_numStas) return;
+    uint32_t s = it->second;
+    g_apDropped[ApKey{s, static_cast<uint8_t>(g_staAc[s])}]++;
+}
+
 // Baselines por janela (para converter somas cumulativas em médias por janela)
 std::vector<double>   g_lastDelaySumMs;
 std::vector<uint64_t> g_lastDelaySamples;
@@ -927,14 +1026,63 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
                                  double(staTx[i] - staRx[i]) / double(staTx[i])))
                              : 0.0;
 
-        // Alimentar o scheduler do AP com a QoS real deste STA (para todos os
-        // seus MACs, para casar com o Addr1 que o scheduler observa).
+        // ---- Estimativa SÓ-AP desta janela (camada TC do AP; sem feedback dos STAs) ----
+        ApKey k{i, static_cast<uint8_t>(g_staAc[i])};
+        uint64_t enq = g_apOffered.count(k)   ? g_apOffered[k]   : 0;
+        uint64_t del = g_apDelivered.count(k) ? g_apDelivered[k] : 0;
+        uint64_t drp = g_apDropped.count(k)   ? g_apDropped[k]   : 0;
+        uint64_t dN  = g_apDelayN.count(k)    ? g_apDelayN[k]    : 0;
+        uint64_t jN  = g_apJitterN.count(k)   ? g_apJitterN[k]   : 0;
+        uint64_t off = enq + drp; // oferecidos = enfileirados no TC + dropados antes
+
+        // Throughput = GOODPUT exato: nº entregues × payload da app (o AP conhece-o) → sem o
+        // overhead de cabeçalhos (+4.6% se usasse bytes de frame). Janela de 1 s.
+        double apTp = double(del) * double(g_payloadBytes) * 8.0 / 1e6;
+        double apDe = (dN > 0) ? (g_apDelaySumMs[k]  / dN) : 0.0;
+        double apJi = (jN > 0) ? (g_apJitterSumMs[k] / jN) : 0.0;
+        double apLo = (off > 0)
+                        ? std::min(1.0, std::max(0.0, 1.0 - double(del) / double(off)))
+                        : 0.0;
+
+        // Alimentar a DECISÃO: por defeito com a estimativa do AP (remove a dependência dos
+        // sinks); com --decisionMetrics=sink usa o feedback dos STAs (para comparação).
         if (g_apScheduler && i < g_staIndexToMacs.size()) {
+            bool useAp = (g_decisionMetrics == "ap");
+            double fTp = useAp ? apTp : throughput;
+            double fDe = useAp ? apDe : winDelay;
+            double fJi = useAp ? apJi : winJitter;
+            double fLo = useAp ? apLo : winLoss;
             for (const auto& mac : g_staIndexToMacs[i]) {
-                g_apScheduler->FeedStaQos(mac, g_staAc[i],
-                                          throughput, winDelay, winJitter, winLoss);
+                g_apScheduler->FeedStaQos(mac, g_staAc[i], fTp, fDe, fJi, fLo);
             }
         }
+
+        // ---- Comparação (observacional): SINK (verdade) vs estimativa SÓ-AP ----
+        if (g_metricCompStream.is_open() && i < g_staAc.size()) {
+            // loss_sink POR-JANELA (delta de tx/rx), para comparar com o apLo por-janela
+            // (o winLoss é cumulativo). Baseline dedicado, atualizado aqui.
+            double dTxC = double(staTx[i]) - double(g_lastStaTxC[i]);
+            double dRxC = double(staRx[i]) - double(g_lastStaRxC[i]);
+            g_lastStaTxC[i] = staTx[i];
+            g_lastStaRxC[i] = staRx[i];
+            double lossSinkWin = (dTxC > 0.0)
+                                   ? std::min(1.0, std::max(0.0, (dTxC - dRxC) / dTxC))
+                                   : 0.0;
+
+            g_metricCompStream << '"' << g_metricCompRunLabel << "\","
+                               << currentTime << ',' << i << ','
+                               << AcIndexToShortName(g_staAc[i]) << ','
+                               << throughput << ',' << apTp << ','
+                               << winDelay   << ',' << apDe << ','
+                               << winJitter  << ',' << apJi << ','
+                               << lossSinkWin << ',' << apLo << '\n';
+        }
+
+        // Reset dos acumuladores da janela (sempre; mantém g_apLastDelayMs p/ jitter).
+        g_apOffered.erase(k); g_apDelivered.erase(k); g_apDelivBytes.erase(k);
+        g_apDropped.erase(k);
+        g_apDelaySumMs.erase(k); g_apDelayN.erase(k);
+        g_apJitterSumMs.erase(k); g_apJitterN.erase(k);
 
         // ---- Série temporal por-STA (opcional; não afecta nenhum cálculo acima) ----
         if (g_perStaMetricsStream.is_open() && i < g_staAc.size()) {
@@ -977,6 +1125,16 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
 
     if (g_perStaMetricsStream.is_open()) {
         g_perStaMetricsStream.flush();
+    }
+    if (g_metricCompStream.is_open()) {
+        g_metricCompStream.flush();
+        // Poda de instantes de enqueue órfãos (oferecidos mas nunca entregues):
+        // evita crescimento do mapa. Remove os mais antigos que 3 s.
+        double cutoff = Simulator::Now().GetMilliSeconds() - 3000.0;
+        for (auto it = g_apEnqTimeMs.begin(); it != g_apEnqTimeMs.end(); ) {
+            if (it->second < cutoff) it = g_apEnqTimeMs.erase(it);
+            else ++it;
+        }
     }
 
     Simulator::Schedule(Seconds(1), &CalculateStats, sinks);
@@ -1200,6 +1358,8 @@ int main(int argc, char* argv[])
     cmd.AddValue("queueOccupancyLabel", "Label prefix for MAC queue occupancy samples", queueOccupancyLabel);
     cmd.AddValue("linkTrafficCsv", "CSV file for per-link per-STA traffic samples", linkTrafficCsvPath);
     cmd.AddValue("frameDistributionCsv", "CSV file for link frame distribution samples", frameDistributionCsvPath);
+    cmd.AddValue("metricComparisonCsv", "CSV comparing sink (ground truth) vs AP-only QoS estimate", g_metricCompCsvPath);
+    cmd.AddValue("decisionMetrics", "Fonte das métricas da decisão: 'ap' (estimativa do AP, sem sinks) | 'sink'", g_decisionMetrics);
     cmd.AddValue("useCustomMloScheduler", "Enable custom MLO scheduler (VO/VI prefer fast link, BE/BK prefer slow link)", g_useCustomMloScheduler);
     cmd.AddValue("schedulerDecisionCsv", "CSV file for scheduler decisions", g_schedulerDecisionCsvPath);
     cmd.AddValue("stayThreshold", "Satisfaction index above which the AP scheduler keeps the current link (0..1)", g_stayThreshold);
@@ -1250,6 +1410,8 @@ int main(int argc, char* argv[])
     g_lastJitterSamples.resize(g_numStas, 0);
     g_lastStaTx.resize(g_numStas, 0);
     g_lastStaRx.resize(g_numStas, 0);
+    g_lastStaTxC.resize(g_numStas, 0);
+    g_lastStaRxC.resize(g_numStas, 0);
     g_queueOccupancyCsvPath = queueOccupancyCsvPath;
     g_queueSampleInterval = queueSampleInterval;
     g_linkTrafficCsvPath = linkTrafficCsvPath;
@@ -1460,10 +1622,16 @@ int main(int argc, char* argv[])
             Ptr<WifiMacQueue> queue = qosTxop->GetWifiMacQueue();
             if (queue) {
                 // Passamos o 'ac' para a nova função com MakeBoundCallback
-                queue->TraceConnectWithoutContext("DropBeforeEnqueue", 
+                queue->TraceConnectWithoutContext("DropBeforeEnqueue",
                     MakeBoundCallback(&WifiQueueDropCallbackReal, ac));
-                queue->TraceConnectWithoutContext("Expired", 
+                queue->TraceConnectWithoutContext("Expired",
                     MakeBoundCallback(&WifiQueueDropCallbackReal, ac));
+                // Estimativa QoS SÓ-AP: dequeue MAC (entregue/ACKed) + drop pré-enqueue
+                // na fila MAC. (Os OFERECIDOS e o timestamp são no TC — ver rootQdAp.)
+                queue->TraceConnectWithoutContext("Dequeue",
+                    MakeBoundCallback(&ApQueueDequeue, ac));
+                queue->TraceConnectWithoutContext("DropBeforeEnqueue",
+                    MakeBoundCallback(&ApMacPreDrop, ac));
             }
         }
     }
@@ -1550,6 +1718,27 @@ int main(int argc, char* argv[])
                 << "run_label,time_s,sta_id,ac,throughput_mbps,delay_ms,jitter_ms,loss_pct\n";
         }
         g_perStaMetricsRunLabel =
+            queueOccupancyLabel.empty()
+                ? std::to_string(freq1) + "+" + std::to_string(freq2) + "|" + protocol
+                : queueOccupancyLabel + "|" + std::to_string(freq1) + "+" + std::to_string(freq2) +
+                      "|" + protocol;
+    }
+
+    if (!g_metricCompCsvPath.empty())
+    {
+        g_metricCompStream.open(g_metricCompCsvPath, std::ios::out | std::ios::app);
+        if (!g_metricCompStream.is_open())
+        {
+            NS_FATAL_ERROR("Could not open metric comparison CSV: " << g_metricCompCsvPath);
+        }
+        if (g_metricCompStream.tellp() == std::streampos(0))
+        {
+            g_metricCompStream
+                << "run_label,time_s,sta_id,ac,"
+                   "tp_sink_mbps,tp_ap_mbps,delay_sink_ms,delay_ap_ms,"
+                   "jitter_sink_ms,jitter_ap_ms,loss_sink_frac,loss_ap_frac\n";
+        }
+        g_metricCompRunLabel =
             queueOccupancyLabel.empty()
                 ? std::to_string(freq1) + "+" + std::to_string(freq2) + "|" + protocol
                 : queueOccupancyLabel + "|" + std::to_string(freq1) + "+" + std::to_string(freq2) +
@@ -1682,6 +1871,9 @@ int main(int argc, char* argv[])
         if (rootQdAp) {
             rootQdAp->TraceConnectWithoutContext("DropBeforeEnqueue", MakeCallback(&TcDropBeforeEnqueueCallback));
             rootQdAp->TraceConnectWithoutContext("DropAfterDequeue", MakeCallback(&TcDropAfterDequeueCallback));
+            // Estimativa QoS SÓ-AP: OFERECIDOS + timestamp no TC-enqueue, e drops TC por-STA.
+            rootQdAp->TraceConnectWithoutContext("Enqueue", MakeCallback(&ApTcEnqueue));
+            rootQdAp->TraceConnectWithoutContext("DropBeforeEnqueue", MakeCallback(&ApTcDrop));
         }
     }
     
@@ -1711,6 +1903,7 @@ int main(int argc, char* argv[])
     uint16_t basePort = 5001;
     std::vector<Ptr<PacketSink>> sinks(g_numStas);
     uint32_t payloadSize = 1440;
+    g_payloadBytes = payloadSize; // p/ goodput exato na estimativa SÓ-AP
     
     for (uint32_t i = 0; i < g_numStas; ++i) {
         uint16_t port = basePort + i;
@@ -2058,6 +2251,10 @@ int main(int argc, char* argv[])
     if (g_perStaMetricsStream.is_open())
     {
         g_perStaMetricsStream.close();
+    }
+    if (g_metricCompStream.is_open())
+    {
+        g_metricCompStream.close();
     }
 
     if (g_apScheduler) {

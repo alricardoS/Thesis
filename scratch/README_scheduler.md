@@ -20,7 +20,7 @@ Todo o estado de decisão é chaveado assim:
 |---|---|---|
 | `m_lastSelectedLink` | `map<StaAcKey, uint8_t>` | Link atual (âncora) de cada fluxo |
 | `m_currentSatisfaction` | `map<StaAcKey, QosSatisfaction>` | Satisfação **medida** no link atual |
-| `m_staQos` | `map<StaAcKey, StaQos>` | Métricas **reais** end-to-end (throughput, delay, jitter, loss) |
+| `m_staQos` | `map<StaAcKey, StaQos>` | Métricas de QoS (throughput, delay, jitter, loss) — por defeito **estimadas pelo próprio AP** (camada TC); opcionalmente dos sinks (`--decisionMetrics=sink`) |
 | `m_hasMeasuredSat` | `set<StaAcKey>` | Fluxos que já passaram o warmup |
 | `m_pendingMigration` | `map<StaAcKey, pair<uint8_t,double>>` | Intenção de migração pendente (link alvo, instante) — debounce |
 
@@ -310,15 +310,34 @@ senão:
 
 ---
 
-## Métricas reais por-STA
+## Métricas por-STA — estimadas pelo próprio AP (sem feedback dos STAs)
 
-A satisfação **medida** (`currentSat`) não vem do MAC do AP — vem de medições reais end-to-end feitas nos sinks das STAs e alimentadas ao scheduler via `FeedStaQos`, a cada 1 s (em `CalculateStats`, no `.cc`).
+A satisfação **medida** (`currentSat`) é estimada **só com informação do AP**, na sua própria
+**camada de traffic-control** (queue-disc do AP), e alimentada ao scheduler via `FeedStaQos` a
+cada 1 s (em `CalculateStats`, no `.cc`). **Não precisa de feedback dos STAs.** Isto remove a
+antiga dependência dos sinks (ver o ponto #5 em [Limitações conhecidas](#limitações-conhecidas)).
 
-| Dimensão | Fonte | Granularidade |
+Cada pacote é seguido do **topo da pilha do AP** (enqueue no traffic-control) até ser **confirmado
+(ACK)** no MAC — captando toda a espera (fila TC **+** fila MAC + acesso ao canal) e os drops.
+
+| Dimensão | Fonte (só-AP, downlink) | Como |
 |---|---|---|
-| **Throughput** | `sinks[i]->GetTotalRx()` (delta da janela) | por janela de 1 s |
-| **Delay / Jitter** | `MonitorPacketSinkRx` via `SeqTsSizeHeader` (`Now − txTime`) | por janela de 1 s |
-| **Loss** | **FlowMonitor**, `(txPackets − rxPackets) / txPackets` por fluxo downlink, mapeado ao STA por IP de destino | **acumulada** desde o início |
+| **Throughput** | `Dequeue` do MAC (entregues) × `payloadSize` | goodput exato = `nEntregues × payload × 8 / dt` (o AP conhece o payload da sua app → sem overhead de cabeçalhos) |
+| **Delay / Jitter** | `Enqueue` do TC → `Dequeue` do MAC (ACK) | por pacote, `t_ACK − t_TCenqueue` (o `uid` do pacote casa entre as duas camadas → 100% match) |
+| **Loss** | `Enqueue`/`DropBeforeEnqueue` do TC + `Dequeue` do MAC | `1 − entregues / oferecidos`, `oferecidos = TC-enfileirados + drops pré-fila` (overlimit do TC + pré-enqueue do MAC) |
+
+> **Validação vs sinks (all-BE, N=192).** Comparado com as medições end-to-end dos sinks (verdade):
+> **loss** erro médio 0.0001; **delay** erro 0.19 ms (mesmo com os ~200 ms de espera na saturação
+> do arranque); **throughput** exato após a correção de goodput; **jitter** mesma ordem. A flag
+> `--decisionMetrics=ap|sink` alterna a fonte da decisão (`ap` por defeito); o CSV
+> `metric_comparison` regista sempre ambas (sink vs AP) para auditoria.
+
+> ### Nota histórica: porquê medir na camada TC (e não no MAC)?
+>
+> Medir só na **fila MAC** subestimava delay e loss **sob congestão**: no all-BE, 100% dos drops e
+> ~90% da espera estão **acima** do MAC, na fila do traffic-control (overlimit). Medir no **topo**
+> (TC-enqueue) até ao ACK capta tudo → bate com o sink. As métricas dos sinks foram a **referência**
+> que validou esta estimativa-AP.
 
 > ### Porquê métricas reais? (bug encontrado)
 >
@@ -418,6 +437,52 @@ Este é o mecanismo mais subtil, e vale a pena perceber em detalhe.
 
   **Anti-oscilação**: cooldown global (`kRebalanceCooldownSec = 2 s`) + por-fluxo (`kFlowBalanceCooldownSec = 10 s`). Se um movimento degradar um fluxo, o cascade puxa-o de volta e o cooldown impede o re-empurrão.
 
+  > **Importante — a decisão do balanceador é *consultiva*, não *vinculativa*.** Como o `RebalanceIdleLinks` só altera o `m_lastSelectedLink` (que enviesa o pedido de acesso ao canal no enqueue), o resultado observado no tráfego físico pode diferir da atribuição decidida. Ver [Conselho vs. execução](#conselho-enqueue-vs-execução-dequeue-porque-o-all-be-usa-os-dois-links).
+
+---
+
+## Conselho (enqueue) vs. execução (dequeue): porque o all-BE usa os dois links
+
+Esta secção explica um comportamento que **surpreende**: apesar de o scheduler decidir **um link por (STA, AC)**, no cenário **all-BE** cada STA acaba a transmitir nos **dois** links em simultâneo (~28% no 2.4GHz / ~72% no 5GHz em 2+5; ~50/50 em 5+6). **Isto não é uma decisão do scheduler** — é uma consequência da arquitetura do ns-3 por baixo dele.
+
+### A decisão do scheduler só actua no *enqueue*
+
+`GetLinkIds(ac, mpdu)` é chamado quando o MAC tem um MPDU pronto a **enfileirar** (`Txop::Queue`). Devolve **1 link** (via `DecideLinkMigration`), mas esse valor só serve para decidir **em que link se pede acesso ao canal**. **Não fixa o frame a esse link.**
+
+### O *dequeue* é feito pelo delegate Fcfs, que ignora a decisão
+
+A parte crítica está em quem serve a fila no momento da transmissão. Ao fazer `m_delegate->SetWifiMac(mac)`, é o **delegate `FcfsWifiQueueScheduler`** que se regista como scheduler de cada `WifiMacQueue` (`WifiMacQueueSchedulerImpl::SetWifiMac` → `queue->SetScheduler(this)`). O `QosWeightedMloScheduler` estende `WifiMacQueueScheduler` **diretamente** e não faz esse wiring. Logo:
+
+- **`WifiMacQueue::m_scheduler == delegate` (Fcfs)**, não o nosso scheduler.
+- No caminho de transmissão, `Peek`/`PeekFirstAvailable(linkId)` chamam `GetNext` do **delegate** — **Fcfs puro** sobre a fila partilhada da AC, que serve **qualquer** STA a **qualquer** link com acesso. O nosso override de `GetNext` **nunca é chamado pela fila**, e o `m_lastSelectedLink` **nunca** é consultado no dequeue.
+
+### Porque isto espalha o tráfego
+
+O acesso ao canal é **por-AC** (há um `Txop` por AC), não por-STA. No all-BE, o balanceador aconselha 1 BE ao 2.4GHz e 3 ao 5GHz → **ambos** os links passam a pedir acesso para a AC BE → **ambos** os `Txop`-BE ganham acesso → cada um, ao transmitir, puxa da fila BE partilhada **o próximo frame de qualquer STA** (Fcfs). Resultado: os frames de cada STA saem pelos dois links.
+
+### Evidência medida (prova *bound-vs-real*)
+
+Instrumentámos temporariamente cada frame **confirmado (ACKed)** a comparar o link **decidido** (`m_lastSelectedLink`) com o link **real** (lido do endereço do AP em `Addr2`). No **all-BE 2+5**, o scheduler decidiu **exatamente o 1-3 pretendido — STA0→2.4GHz, STA1/2/3→5GHz** — mas fisicamente:
+
+| STA | decidido | 2.4GHz (real) | 5GHz (real) |
+|-----|----------|---------------|-------------|
+| 0 | 2.4GHz | 829 | **732** (≠ decidido) |
+| 1 | 5GHz | **807** (≠ decidido) | 752 |
+| 2 | 5GHz | **836** (≠ decidido) | 807 |
+| 3 | 5GHz | **804** (≠ decidido) | 791 |
+
+Ou seja: **intenção = 1-3 limpo; execução = ~50/50**. O STA0, decidido para o 2.4GHz, enviou quase metade dos frames no 5GHz; os STA1/2/3, decididos para o 5GHz, enviaram quase metade no 2.4GHz.
+
+### Porque os cenários de prioridade (2VO+2VI, …) *parecem* limpos
+
+O espalhamento só acontece quando fluxos da **mesma AC** estão separados por links diferentes. Nos cenários de prioridade, cada AC fica **junta** num link (os 2 VO juntos no rápido, os 2 VI juntos no 5GHz) → o outro link **nunca** contende por essa AC → praticamente **sem espalhamento**. O 73/27 residual dos VI é apenas o **transiente de bootstrap** (o VI arranca no link rápido e assenta no 5GHz), não partilha em regime.
+
+Da mesma forma, o **bootstrap parece "vinculativo"** (link rápido a 0% para os BE) só porque **todos** os fluxos aconselham o **mesmo** link — o outro nunca pede acesso a essa AC. A "regra" vem da ausência de contenção, não de o binding ser aplicado.
+
+### Como se tornaria vinculativo (não implementado)
+
+Seria preciso pôr **máscaras de bloqueio no delegate** (`m_delegate->BlockQueues`) para bloquear a fila de cada (STA, TID) nos links não-escolhidos — o único mecanismo que o `GetNext` do delegate respeita — o que exigiria **uma razão de bloqueio nova no enum do core** do ns-3 (todas as existentes são geridas pelo MAC). Não foi implementado: o espalhamento **satisfaz todos os STAs** e é, na prática, **agregação de links MLO legítima**. Forçar o binding limpo poria o BE sozinho no 2.4GHz no **limite** da capacidade, com risco de piorar as métricas e introduzir ping-pong.
+
 ---
 
 ## Tabela de todas as variáveis configuráveis
@@ -473,7 +538,7 @@ O scheduler não lê diretamente do PHY/MAC — o script de simulação liga *tr
 
 | Função | Quando chamar | Alimenta |
 |--------|----------------|----------|
-| `FeedStaQos(sta, ac, tp, delay, jitter, loss)` | periodicamente (1 s, em `CalculateStats`) | **`m_staQos`** — as métricas reais que definem `currentSat` |
+| `FeedStaQos(sta, ac, tp, delay, jitter, loss)` | periodicamente (1 s, em `CalculateStats`) | **`m_staQos`** — as métricas que definem `currentSat` (por defeito estimadas pelo AP na camada TC; sinks só com `--decisionMetrics=sink`) |
 | `FeedLinkPhyState(linkId, txVector, per)` | `PhyTxPsduBegin` | EWMA de data rate e PER (Motor 2) |
 | `FeedLinkTxAttempt(linkId, ac, nFrames)` | `PhyTxPsduBegin` | `txAttempts` (denominador do PER proxy) |
 | `FeedLinkDrop(linkId, ac)` | drops de fila/MAC | `dropFrames` (numerador do PER proxy) |
@@ -536,7 +601,7 @@ Análise honesta do estado atual. Nada aqui impede os cenários testados de conv
 
 4. **~~`UtilityFunction` dá 0.5 no alvo~~ — CORRIGIDO e VALIDADO.** *Problema original*: para throughput, cumprir exatamente o alvo dava só 0.5 (era preciso ~2× o alvo para saturar), o que fazia VO/VI estabilizarem em ~0.69–0.75, colados ao `StayThreshold`, dependentes dos vetos em vez do `STAY_SATISFIED`. *Correção*: (a) no ramo *higher-is-better* a inflexão passou para 50% do alvo (`1/(1+e^{10(0.5−ratio)})`) → cumprir o alvo ≈ 0.99; (b) as metas de jitter de VO/VI (`maxJitterMs`) subiram de 0.1 ms (inatingível) para 5/10 ms. *Resultado medido*: VO/VI/BE bem servidos passaram a ~**0.99** e o `STAY_SATISFIED` voltou a dominar (zero migrações no steady state). O `StayThreshold=0.75` **não** precisou de mudar — com os satisfeitos a ~0.99, continua a separar bem servido de esfomeado.
 
-5. **As métricas end-to-end são medidas nos sinks das STAs** — um AP real não teria acesso a elas. É legítimo em simulação e foi a forma de obter valores fiáveis, mas o scheduler **não é diretamente transponível para hardware** sem uma fonte equivalente do lado do AP.
+5. **Métricas estimadas pelo próprio AP** *(RESOLVIDO — antes era uma limitação)*. O scheduler já **não depende do feedback dos STAs**: estima as 4 métricas na sua própria **camada de traffic-control** (`Enqueue`/`Dequeue`/`DropBeforeEnqueue` do queue-disc do AP), seguindo cada pacote do TC-enqueue até ao ACK no MAC. Validado quase na perfeição vs os sinks (ver [Métricas por-STA](#métricas-por-sta--estimadas-pelo-próprio-ap-sem-feedback-dos-stas)): loss erro 0.0001, delay erro 0.19 ms, throughput exato. Como usa apenas informação que um AP **real também tem** (a sua própria pilha), é **transponível para hardware**. Os sinks ficam só como referência de validação (`--decisionMetrics=sink` para A/B; CSV `metric_comparison`). *Caveat residual:* o jitter estimado fica ligeiramente acima do real (mesma ordem de grandeza).
 
 6. **A loss acumulada é estável mas lenta.** Uma degradação súbita demora a refletir-se, e depois de um fluxo melhorar o histórico mau só se dilui gradualmente. Foi uma troca deliberada (estabilidade > reatividade).
 
@@ -553,3 +618,5 @@ Análise honesta do estado atual. Nada aqui impede os cenários testados de conv
 12. **Balanceamento — link vazio recebe o 1º fluxo incondicionalmente.** A capacidade de um link ocioso **não é medível** (`estimatedCapacity = goodput/airtime` precisa de tráfego → fica 0 se nunca foi usado, ou estagnada se o foi cedo). Por isso o 1º fluxo entra sem teste de capacidade — fica com o link todo — e confia-se na **medição da janela seguinte** (para decidir sobre um 2º) e na **auto-correção do cascade** (que o puxa de volta se o link for mesmo fraco). Sem isto, o teste `folga ≥ target` bloqueava sempre a 1ª migração.
 
 13. **Cobertura de teste.** Validado em cenários de **4 STAs** (2VO+1VI+1BE, 2VO+2VI, 1VO+1VI+1BE+1BK, all-BE) × **3 pares de frequências** (2.4+5, 2.4+6, 5+6), com tráfego UDP saturante de 150 Mbps por STA e STAs estáticos. Fora deste envelope — mais links, mais STAs, mobilidade, tráfego variável, TCP — não há garantias. Vários mecanismos (bootstrap, vetos, balanceamento) assumem implicitamente **exatamente 2 links**.
+
+14. **O binding é consultivo, não vinculativo.** A decisão por (STA, AC) só enviesa o **pedido de acesso ao canal** no enqueue; o **dequeue** é feito pelo delegate Fcfs, que serve qualquer STA em qualquer link com acesso. Por isso a distribuição física observada por-fluxo **pode usar ambos os links** em simultâneo (medido no all-BE). Ver [Conselho vs. execução](#conselho-enqueue-vs-execução-dequeue-porque-o-all-be-usa-os-dois-links).

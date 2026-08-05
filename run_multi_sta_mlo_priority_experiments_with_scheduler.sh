@@ -111,7 +111,11 @@ for DATA_RATE in "${DATA_RATES[@]}"; do
     # Per-second per-STA QoS metrics time series (header written by the simulation)
     CSV_MLO_PER_STA_TS="$OUTPUTS_DIR/mlo_multi_sta_per_sta_timeseries_${TIMESTAMP}.csv"
     rm -f "$CSV_MLO_PER_STA_TS"
-    
+
+    # Comparação sink (verdade) vs estimativa SÓ-AP das métricas de QoS (validação)
+    CSV_MLO_METRIC_COMP="$OUTPUTS_DIR/mlo_multi_sta_metric_comparison_${TIMESTAMP}.csv"
+    rm -f "$CSV_MLO_METRIC_COMP"
+
     # Apenas UDP (TCP comentado para uso futuro)
     declare -a PROTOS=("UDP")
 
@@ -124,7 +128,7 @@ for DATA_RATE in "${DATA_RATES[@]}"; do
             echo "Running MLO Multi-STA: $NAME ($proto) @ $DATA_RATE per STA $OFDMA_LABEL..."
             OUTFILE="$OUTPUTS_DIR/mlo_multi_sta_${F1}_${F2}_${proto}_${TIMESTAMP}.txt"
             CSV_MLO_DECISIONS="$OUTPUTS_DIR/scheduler_decisions_${F1}_${F2}_${proto}_${TIMESTAMP}.csv"
-            ./ns3 run "scratch/wifi7-mlo-multi-sta-priority-sch --freq1=$F1 --freq2=$F2 --protocol=$proto --dataRate=$DATA_RATE --simTime=$SIM_TIME --staticSetup=true --enablePcaps=false --numStas=$NSTAS --staTrafficTypes=$STA_TRAFFIC_TYPES --queueOccupancyCsv=$CSV_MLO_QUEUE_OCC --linkTrafficCsv=$CSV_MLO_LINK_TRAFFIC$QUEUE_LABEL_ARG --queueSampleInterval=0.1 --linkTrafficSampleInterval=0.1 --useCustomMloScheduler=true --schedulerDecisionCsv=$CSV_MLO_DECISIONS --perStaMetricsCsv=$CSV_MLO_PER_STA_TS" 2>&1 | tee "$OUTFILE"
+            ./ns3 run "scratch/wifi7-mlo-multi-sta-priority-sch --freq1=$F1 --freq2=$F2 --protocol=$proto --dataRate=$DATA_RATE --simTime=$SIM_TIME --staticSetup=true --enablePcaps=false --numStas=$NSTAS --staTrafficTypes=$STA_TRAFFIC_TYPES --queueOccupancyCsv=$CSV_MLO_QUEUE_OCC --linkTrafficCsv=$CSV_MLO_LINK_TRAFFIC$QUEUE_LABEL_ARG --queueSampleInterval=0.1 --linkTrafficSampleInterval=0.1 --useCustomMloScheduler=true --schedulerDecisionCsv=$CSV_MLO_DECISIONS --perStaMetricsCsv=$CSV_MLO_PER_STA_TS --metricComparisonCsv=$CSV_MLO_METRIC_COMP" 2>&1 | tee "$OUTFILE"
 
             if [ ! -s "$OUTFILE" ]; then
                 echo "[WARN] Missing or empty output file, skipping post-processing: $OUTFILE"
