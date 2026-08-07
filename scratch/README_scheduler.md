@@ -8,6 +8,17 @@ A cada pacote (MPDU) que o AP precisa de enviar, o scheduler decide **a que link
 
 O scheduler não decide *quando* transmitir (isso continua a ser gerido pelo EDCA/CSMA-CA real do ns-3) — decide apenas **em qual link** colocar cada pacote, na fila MAC apropriada.
 
+### Suporte N-link (dualband e triband) — Fase B
+
+O scheduler é **agnóstico ao número de links**. Internamente mantém `m_linksByRank` — a lista dos linkIds ordenada por qualidade da banda (**melhor primeiro**, pior último), construída em `ConfigureForLinks(freqs)` a partir de `GetFrequencyRank` (6 GHz > 5 GHz > 2.4 GHz). Os aliases `m_fastLinkId` (=`m_linksByRank.front()`, o melhor) e `m_slowLinkId` (=`m_linksByRank.back()`, o pior) são derivados daí. `ConfigureForPair(f1, f2)` é apenas um wrapper de `ConfigureForLinks({f1, f2})`, pelo que o comportamento a 2 links é **idêntico** ao anterior.
+
+Todos os mecanismos que iteravam explicitamente "fast/slow" passaram a iterar `m_linksByRank` (bootstrap, balanceador, cascata, cold-start por frequência) e os vetos de downgrade passaram a ser **baseados em rank** via `LinkRankPos(linkId)` (0 = melhor). Assim, adicionar um 3º link (triband) não requer alterações à lógica de decisão.
+
+- **2 links (dualband)**: correr com `--freq1`/`--freq2` (ex.: `5`+`6`). `--freq3=0` (default) mantém o modo 2-link.
+- **3 links (triband)**: passar `--freq3` (ex.: `--freq1=2 --freq2=5 --freq3=6`). O `.cc` cria a 3ª PHY/canal e chama o overload `InstallQosWeightedScheduler(mac, {f1,f2,f3})`. No runner/suite, a banda `tri` ativa este modo.
+
+> **Cold-start por frequência** (antes de haver medições): a capacidade inicial de cada link é estimada pela sua banda — 2.4 GHz→150, 5 GHz→400, 6 GHz→500 Mbps — em vez do antigo binário fast/slow.
+
 ### Granularidade: por (STA, AC), não por AC
 
 A chave de decisão é `StaAcKey = std::pair<Mac48Address, uint8_t>` — o **MAC de destino** + o índice do AC.
@@ -58,7 +69,7 @@ Esta é a ordem exata do código em `DecideLinkMigration`:
 3. Extrai o **MAC de destino** (`mpdu->GetHeader().GetAddr1()`); se for broadcast, usa a chave `ff:ff:ff:ff:ff:ff`. Chama `DecideLinkMigration(ac, dest, eligible)`.
 4. **Atalhos**: se só houver 1 link elegível, grava a âncora e devolve-o (é por aqui que os beacons passam — ver [exclusão de beacons](#4-exclusão-de-beacons-isroutablesta)).
 5. Determina o **link atual** (âncora) e o `currentSat` (satisfação **medida**, de `m_staQos`).
-6. **Bootstrap por prioridade** — se o fluxo ainda não tem 2 amostras medidas (`m_hasMeasuredSat`), força VO/VI → link rápido, BE/BK → link lento, e **termina aqui**.
+6. **Bootstrap por prioridade** — se o fluxo ainda não tem 2 amostras medidas (`m_hasMeasuredSat`), força VO/VI → melhor link; BE/BK → em **triband** (≥3 links) o **2º melhor** link (ex.: 5 GHz, deixando o 2.4 GHz livre), em **dualband** o pior link. E **termina aqui**.
 7. **`STAY_SATISFIED`** — se `currentSat >= StayThreshold` e há âncora, fica sem avaliar mais nada.
 8. **Cascata Cat1/Cat2/Cat3** — avalia todos os links elegíveis e escolhe o melhor da melhor categoria.
 9. **Veto anti-downgrade VO/VI** — pode reverter `bestLink` para o link atual.
@@ -156,6 +167,8 @@ senão:
 > O valor **sobe monotonamente com a carga** e **nunca sobrestima**. É o rate relevante para a carga que o scheduler realmente vê — não o máximo teórico. Consequência (ver limitação #2): a projeção de "quanto caberia aqui" é **pessimista**.
 >
 > **Fonte crítica**: `m_linkBusyTime` (de `FeedLinkTxStart/End`, tempo real de PHY ocupado) — os proxies de airtime por-AC não servem, porque são tempo de payload puro (sem overhead) e dariam um cálculo circular de volta à taxa PHY.
+
+> **⚠️ Agregação A-MPDU por AC (config. do `.cc`).** Todos os quatro ACs usam agora `MaxAmpduSize = 65535` — incluindo o **BK** (`bkMaxAmpduBytes = 65535`; anteriormente era `0`/desligado). Com a agregação desligada, o BK enviava frame-a-frame e ficava limitado a **~50 Mbps mesmo estando sozinho num link** (cada frame paga todo o overhead MAC: preâmbulo, AIFS, backoff, SIFS, BlockAck), saturando a fila TC → delay de segundos e loss elevada. Com A-MPDU ativo o BK acompanha os restantes ACs até ao rate oferecido. Ajustável por CLI: `--bkMaxAmpdu=<bytes>` (`0` volta a desligar). Este teto de agregação é uma característica de **MAC**, independente da decisão de link do scheduler.
 
 `ConfigureForPair` ordena os dois links por `GetFrequencyRank` (6 GHz > 5 GHz > 2.4 GHz) e define `m_fastLinkId` / `m_slowLinkId`.
 
@@ -361,7 +374,8 @@ Cada um destes existe por causa de um bug **observado em simulação**. Estão d
 
 - **Sintoma**: no cold-start (t≈2.5 s) o BE e o VO **trocavam de link ao mesmo tempo** — o BE fugia para o rápido, o VO para o lento — e ficavam presos na configuração errada.
 - **Causa**: a **1.ª janela de medição está contaminada pelo ramp-up**. O VO media `curSat = 0.469` em vez do seu valor real (~0.87). Com todos a parecerem mal no link atual e o outro link (vazio) a projetar bem, todos migravam ao mesmo tempo.
-- **Mecanismo**: até um fluxo ter **2 amostras** reais (`StaQos::samples >= 2`), a alocação é forçada por prioridade EDCA (VO/VI → rápido, BE/BK → lento) e a cascata **nem corre**. Salta-se a janela contaminada; quando a cascata arranca, o `curSat` já reflete a realidade e o `STAY_SATISFIED` trava todos no sítio certo.
+- **Mecanismo**: até um fluxo ter **2 amostras** reais (`StaQos::samples >= 2`), a alocação é forçada por prioridade EDCA (VO/VI → melhor link; BE/BK → 2º melhor link em triband, pior link em dualband) e a cascata **nem corre**. Salta-se a janela contaminada; quando a cascata arranca, o `curSat` já reflete a realidade e o `STAY_SATISFIED` trava todos no sítio certo.
+  - **Triband — porquê BE/BK no 2º melhor link (5 GHz), não no pior (2.4 GHz)**: o link de 2.4 GHz é o de menor capacidade; arrancar aí os ACs de baixa prioridade sub-utilizava logo à partida o 5 GHz e sobrecarregava o 2.4 GHz. Com o bootstrap em `m_linksByRank[1]` (=5 GHz), o BE/BK partem de um link com muito mais capacidade e o 2.4 GHz fica disponível para o balanceador/cascata o preencher conforme a carga.
 
 ### 2. Vetos de prioridade (BE/BK nunca partilham link com VO/VI)
 
@@ -620,3 +634,5 @@ Análise honesta do estado atual. Nada aqui impede os cenários testados de conv
 13. **Cobertura de teste.** Validado em cenários de **4 STAs** (2VO+1VI+1BE, 2VO+2VI, 1VO+1VI+1BE+1BK, all-BE) × **3 pares de frequências** (2.4+5, 2.4+6, 5+6), com tráfego UDP saturante de 150 Mbps por STA e STAs estáticos. Fora deste envelope — mais links, mais STAs, mobilidade, tráfego variável, TCP — não há garantias. Vários mecanismos (bootstrap, vetos, balanceamento) assumem implicitamente **exatamente 2 links**.
 
 14. **O binding é consultivo, não vinculativo.** A decisão por (STA, AC) só enviesa o **pedido de acesso ao canal** no enqueue; o **dequeue** é feito pelo delegate Fcfs, que serve qualquer STA em qualquer link com acesso. Por isso a distribuição física observada por-fluxo **pode usar ambos os links** em simultâneo (medido no all-BE). Ver [Conselho vs. execução](#conselho-enqueue-vs-execução-dequeue-porque-o-all-be-usa-os-dois-links).
+
+    > **Consequência importante (mudar a decisão NÃO muda o físico).** Como o dequeue é Fcfs, **alterar** o `m_lastSelectedLink` de um fluxo (via migração, balanceador, etc.) **não** altera a distribuição física se o outro link estiver ativo para essa AC. Caso concreto medido (cenário de *switch* 2VO+2VI→2BE+2VI, fase 2): tentou-se uma **"expulsão considerada"** — mover o VI que partilhava o 2.4GHz com os BEs para o 5GHz. A **decisão** ficou perfeita (VI 100% no 5GHz no log de decisões), mas o **físico manteve o VI ~40% no 2.4GHz** (constante, não transiente) porque o 2.4GHz — ocupado a servir os BEs — continua a puxar frames de VI da fila partilhada. Resultado: o **BE continuou esfomeado (~19 Mbps)**. *(Este mecanismo de expulsão foi por isso revertido.)* **Fixar isto exige binding vinculativo** (ex.: `BlockQueues` no delegate para bloquear a fila de cada (STA,TID) nos links não-escolhidos), que precisa de uma **razão de bloqueio nova no core do ns-3** — trabalho adiado.

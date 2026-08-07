@@ -23,7 +23,13 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 # Mesma paleta dos gráficos individuais por STA, para a legenda coincidir.
-STA_COLORS = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12']  # Red, Blue, Green, Orange
+# Alargada até 12 STAs (mantém as 4 primeiras cores originais).
+STA_COLORS = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12',
+              '#9B59B6', '#1ABC9C', '#E67E22', '#34495E',
+              '#16A085', '#C0392B', '#2980B9', '#8E44AD']
+
+# Estilo de linha por AC — distingue as apps quando um STA muda de AC a meio (switch).
+AC_LINESTYLE = {"VO": "-", "VI": "--", "BE": ":", "BK": "-."}
 
 FREQ_PAIRS = ["2+5", "2+6", "5+6"]
 FREQ_PAIR_LABELS = {"2+5": "2.4+5 GHz", "2+6": "2.4+6 GHz", "5+6": "5+6 GHz"}
@@ -59,10 +65,34 @@ def load(csv_path: Path) -> pd.DataFrame:
     return df
 
 
-def sta_label(sta_id: int, df: pd.DataFrame) -> str:
-    acs = df.loc[df["sta_id"] == sta_id, "ac"].dropna().unique()
-    ac = str(acs[0]).strip() if len(acs) else "?"
+def flow_label(sta_id: int, ac: str) -> str:
     return f"STA{sta_id} ({ac})"
+
+
+def detect_switch_times(df: pd.DataFrame):
+    """Instante real do switch de AC (≈ simTime/2). Detetado como o 1º instante em que
+    o AC "depois" fica ativo (throughput>1), menos meio intervalo de amostragem — porque
+    a amostra que contém o switch já apanha a app nova a meio dessa janela.
+    (Ex.: BE aparece em t=9 → switch = 9 − 0.5 = 8.5.)"""
+    times = set()
+    ts = sorted(df["time_s"].dropna().unique())
+    dt = 1.0
+    if len(ts) >= 2:
+        diffs = sorted(ts[i + 1] - ts[i] for i in range(len(ts) - 1))
+        dt = float(diffs[len(diffs) // 2])  # mediana dos intervalos
+    for sta_id, sdf in df.groupby("sta_id"):
+        if sdf["ac"].nunique() < 2:
+            continue
+        first_active = {}
+        for ac, g in sdf.groupby("ac"):
+            act = g[g["throughput_mbps"] > 1.0]["time_s"]
+            if not act.empty:
+                first_active[ac] = float(act.min())
+        if len(first_active) < 2:
+            continue
+        after_t = sorted(first_active.values())[1]  # o AC que fica ativo mais tarde
+        times.add(after_t - dt / 2.0)
+    return sorted(times)
 
 
 def make_figure(df: pd.DataFrame, column: str, metric_title: str, ylabel: str,
@@ -75,6 +105,8 @@ def make_figure(df: pd.DataFrame, column: str, metric_title: str, ylabel: str,
         return
 
     sta_ids = sorted(df["sta_id"].unique())
+    sta_color = {sid: STA_COLORS[i % len(STA_COLORS)] for i, sid in enumerate(sta_ids)}
+    switch_times = detect_switch_times(df)
 
     fig, axes = plt.subplots(len(pairs), 1, figsize=(12, 3.2 * len(pairs)),
                              sharex=True, sharey=False)
@@ -87,17 +119,25 @@ def make_figure(df: pd.DataFrame, column: str, metric_title: str, ylabel: str,
         if pair_df.empty:
             ax.text(0.5, 0.5, "no data", ha="center", va="center",
                     transform=ax.transAxes, color="gray")
-        for idx, sta_id in enumerate(sta_ids):
-            sta_df = pair_df[pair_df["sta_id"] == sta_id].sort_values("time_s")
-            if sta_df.empty:
+        # Uma linha por (STA, AC): cor por STA, estilo por AC → distingue o switch.
+        for (sta_id, ac), g in pair_df.groupby(["sta_id", "ac"]):
+            g = g.sort_values("time_s")
+            if g.empty:
                 continue
-            line, = ax.plot(sta_df["time_s"], sta_df[column],
-                            color=STA_COLORS[idx % len(STA_COLORS)],
-                            linewidth=1.6, marker="o", markersize=2.5,
-                            label=sta_label(sta_id, df))
+            ls = AC_LINESTYLE.get(str(ac).strip().upper(), "-")
+            line, = ax.plot(g["time_s"], g[column],
+                            color=sta_color.get(sta_id, "#555555"),
+                            linestyle=ls, linewidth=1.6, marker="o", markersize=2.5,
+                            label=flow_label(sta_id, ac))
             if line.get_label() not in labels:
                 handles.append(line)
                 labels.append(line.get_label())
+
+        # Marcar o(s) instante(s) de switch de AC.
+        for st in switch_times:
+            ax.axvline(st, color="black", linestyle=(0, (4, 3)), linewidth=1.2, alpha=0.7)
+            ax.text(st, ax.get_ylim()[1], " switch", color="black", fontsize=8,
+                    va="top", ha="left", alpha=0.8)
 
         ax.set_title(FREQ_PAIR_LABELS.get(pair, pair), fontsize=11, fontweight="bold",
                      loc="left")
@@ -108,12 +148,12 @@ def make_figure(df: pd.DataFrame, column: str, metric_title: str, ylabel: str,
     axes[-1].set_xlabel("Simulation time (s)", fontsize=10)
 
     if handles:
-        fig.legend(handles, labels, loc="upper right", ncol=len(labels),
-                   fontsize=9, frameon=True, bbox_to_anchor=(0.99, 0.985))
+        fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 6),
+                   fontsize=8, frameon=True, bbox_to_anchor=(0.5, 0.0))
 
     fig.suptitle(f"Per-STA {metric_title} over Time — {protocol} {scenario_tag}",
                  fontsize=13, fontweight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.tight_layout(rect=[0, 0.07, 1, 0.95])
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"[timeseries] Generated: {out_path}")

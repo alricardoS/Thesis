@@ -11,10 +11,21 @@ PYTHON_BIN="python3"
 NUM_STAS_LIST="${NUM_STAS_LIST:-4}"
 STA_TRAFFIC_TYPES="${STA_TRAFFIC_TYPES:-voice,video,besteffort,background}"
 QUEUE_OCCUPANCY_LABEL="${QUEUE_OCCUPANCY_LABEL:-}"
+# Novo modelo de apps por-fluxo (opcional): se APPS_SPEC estiver definido, usa-se em vez
+# de STA_TRAFFIC_TYPES; numStas é derivado do spec e o data-rate é repartido do orçamento.
+APPS_SPEC="${APPS_SPEC:-}"
+TOTAL_RATE_MBPS="${TOTAL_RATE_MBPS:-600}"
+# Banda: 'dual' (corre os 3 pares), um par específico (ex.: '2+5'), ou 'tri' (Fase B).
+BAND="${BAND:-dual}"
 
 QUEUE_LABEL_ARG=""
 if [ -n "$QUEUE_OCCUPANCY_LABEL" ]; then
     QUEUE_LABEL_ARG=" --queueOccupancyLabel=$QUEUE_OCCUPANCY_LABEL"
+fi
+
+APPS_SPEC_ARG=""
+if [ -n "$APPS_SPEC" ]; then
+    APPS_SPEC_ARG=" --appsSpec=$APPS_SPEC --totalRateMbps=$TOTAL_RATE_MBPS"
 fi
 
 # Python post-processing (plots/tables) enabled by default
@@ -119,16 +130,23 @@ for DATA_RATE in "${DATA_RATES[@]}"; do
     # Apenas UDP (TCP comentado para uso futuro)
     declare -a PROTOS=("UDP")
 
-    # Pares de frequências MLO
-    declare -a PAIRS=("2 5 2.4+5" "2 6 2.4+6" "5 6 5+6")
-    
+    # Frequências MLO — cada entrada: "F1 F2 F3 NAME" (F3=0 → 2-link/dualband).
+    # Seleção de banda: 'dual' = 3 pares; um par ('2+5'/'5+6') = só esse; 'tri' = 3 links.
+    case "$BAND" in
+        2+5) declare -a PAIRS=("2 5 0 2.4+5") ;;
+        2+6) declare -a PAIRS=("2 6 0 2.4+6") ;;
+        5+6) declare -a PAIRS=("5 6 0 5+6") ;;
+        tri) declare -a PAIRS=("2 5 6 2.4+5+6") ;;  # triband (3 links)
+        *)   declare -a PAIRS=("2 5 0 2.4+5" "2 6 0 2.4+6" "5 6 0 5+6") ;;  # dual
+    esac
+
     for pair in "${PAIRS[@]}"; do
-        read -r F1 F2 NAME <<< "$pair"
+        read -r F1 F2 F3 NAME <<< "$pair"
         for proto in "${PROTOS[@]}"; do
             echo "Running MLO Multi-STA: $NAME ($proto) @ $DATA_RATE per STA $OFDMA_LABEL..."
             OUTFILE="$OUTPUTS_DIR/mlo_multi_sta_${F1}_${F2}_${proto}_${TIMESTAMP}.txt"
             CSV_MLO_DECISIONS="$OUTPUTS_DIR/scheduler_decisions_${F1}_${F2}_${proto}_${TIMESTAMP}.csv"
-            ./ns3 run "scratch/wifi7-mlo-multi-sta-priority-sch --freq1=$F1 --freq2=$F2 --protocol=$proto --dataRate=$DATA_RATE --simTime=$SIM_TIME --staticSetup=true --enablePcaps=false --numStas=$NSTAS --staTrafficTypes=$STA_TRAFFIC_TYPES --queueOccupancyCsv=$CSV_MLO_QUEUE_OCC --linkTrafficCsv=$CSV_MLO_LINK_TRAFFIC$QUEUE_LABEL_ARG --queueSampleInterval=0.1 --linkTrafficSampleInterval=0.1 --useCustomMloScheduler=true --schedulerDecisionCsv=$CSV_MLO_DECISIONS --perStaMetricsCsv=$CSV_MLO_PER_STA_TS --metricComparisonCsv=$CSV_MLO_METRIC_COMP" 2>&1 | tee "$OUTFILE"
+            ./ns3 run "scratch/wifi7-mlo-multi-sta-priority-sch --freq1=$F1 --freq2=$F2 --freq3=${F3:-0} --protocol=$proto --dataRate=$DATA_RATE --simTime=$SIM_TIME --staticSetup=true --enablePcaps=false --numStas=$NSTAS --staTrafficTypes=$STA_TRAFFIC_TYPES --queueOccupancyCsv=$CSV_MLO_QUEUE_OCC --linkTrafficCsv=$CSV_MLO_LINK_TRAFFIC$QUEUE_LABEL_ARG --queueSampleInterval=0.1 --linkTrafficSampleInterval=0.1 --useCustomMloScheduler=true --schedulerDecisionCsv=$CSV_MLO_DECISIONS --perStaMetricsCsv=$CSV_MLO_PER_STA_TS --metricComparisonCsv=$CSV_MLO_METRIC_COMP$APPS_SPEC_ARG" 2>&1 | tee "$OUTFILE"
 
             if [ ! -s "$OUTFILE" ]; then
                 echo "[WARN] Missing or empty output file, skipping post-processing: $OUTFILE"

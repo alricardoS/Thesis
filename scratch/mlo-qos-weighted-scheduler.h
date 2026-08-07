@@ -193,6 +193,7 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     ~QosWeightedMloScheduler() override;
 
     void ConfigureForPair(int freq1, int freq2);
+    void ConfigureForLinks(const std::vector<int>& freqs); // N links (triband, etc.)
     void SetWifiMac(Ptr<WifiMac> mac) override;
 
     // ---- External feed APIs (called from simulation script) ----
@@ -425,11 +426,23 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     // single raw metric like loss alone.
     double m_harmThreshold{0.70};
 
-    // ---- Link identity ----
-    uint8_t m_slowLinkId{0};
-    uint8_t m_fastLinkId{1};
+    // ---- Link identity (N links) ----
+    // m_linksByRank: ordenado por capacidade/frequência, MELHOR primeiro, PIOR último.
+    // m_fastLinkId/m_slowLinkId são aliases (melhor/pior) — mantêm o comportamento 2-link
+    // idêntico, e o balanceador/vetos iteram m_linksByRank para suportar N links.
+    std::vector<uint8_t> m_linksByRank;   // [0]=melhor ... [N-1]=pior
+    std::vector<int>     m_freqs;         // frequência de cada linkId (por índice = linkId)
+    uint8_t m_slowLinkId{0};              // = pior link (alias)
+    uint8_t m_fastLinkId{1};              // = melhor link (alias)
     int m_freq1{5};
     int m_freq2{6};
+
+    // Posição no ranking (0 = melhor; maior = pior). Devolve grande se desconhecido.
+    int LinkRankPos(uint8_t l) const {
+        for (size_t i = 0; i < m_linksByRank.size(); ++i)
+            if (m_linksByRank[i] == l) return static_cast<int>(i);
+        return 999;
+    }
 
     // ---- Legacy targets alias (for SetTargets backward compat) ----
     // Maps 1:1 with m_goals
@@ -518,14 +531,30 @@ QosWeightedMloScheduler::~QosWeightedMloScheduler()
 inline void
 QosWeightedMloScheduler::ConfigureForPair(int freq1, int freq2)
 {
-    m_freq1 = freq1;
-    m_freq2 = freq2;
-    const int rank1 = GetFrequencyRank(freq1);
-    const int rank2 = GetFrequencyRank(freq2);
-    m_fastLinkId = (rank1 >= rank2) ? 0 : 1;
-    m_slowLinkId = (rank1 >= rank2) ? 1 : 0;
+    ConfigureForLinks({freq1, freq2}); // wrapper de compatibilidade (2 links)
+}
 
-    for (uint8_t linkId : {m_slowLinkId, m_fastLinkId}) {
+inline void
+QosWeightedMloScheduler::ConfigureForLinks(const std::vector<int>& freqs)
+{
+    m_freqs = freqs;
+    const size_t n = freqs.size();
+
+    // Ranking: linkIds 0..n-1 ordenados por rank de frequência (MELHOR primeiro).
+    m_linksByRank.clear();
+    for (uint8_t l = 0; l < n; ++l) m_linksByRank.push_back(l);
+    std::sort(m_linksByRank.begin(), m_linksByRank.end(),
+              [&](uint8_t a, uint8_t b) {
+                  int ra = GetFrequencyRank(freqs[a]), rb = GetFrequencyRank(freqs[b]);
+                  if (ra != rb) return ra > rb;   // rank maior = melhor = primeiro
+                  return a < b;                    // desempate estável
+              });
+    m_fastLinkId = m_linksByRank.front();          // melhor
+    m_slowLinkId = m_linksByRank.back();           // pior
+    m_freq1 = freqs.size() > 0 ? freqs[0] : 5;
+    m_freq2 = freqs.size() > 1 ? freqs[1] : 6;
+
+    for (uint8_t linkId : m_linksByRank) {
         for (AcIndex ac : {AC_BE, AC_BK, AC_VI, AC_VO}) {
             m_metrics[linkId][static_cast<uint8_t>(ac)] = LinkState{};
         }
@@ -802,7 +831,9 @@ QosWeightedMloScheduler::UpdateLinkCapability(uint8_t linkId, double dt)
     } else if (phy.valid) {
         cap.estimatedCapacityMbps = phy.ewmaDataRateMbps * (1.0 - phy.ewmaPer); // fallback PHY
     } else {
-        cap.estimatedCapacityMbps = (linkId == m_fastLinkId) ? 400.0 : 150.0;   // cold-start
+        // Cold-start por frequência (N links): 2.4→150, 5→400, 6→500 (aprox.).
+        int f = (linkId < m_freqs.size()) ? m_freqs[linkId] : 5;
+        cap.estimatedCapacityMbps = (f <= 2) ? 150.0 : (f >= 6 ? 500.0 : 400.0);
     }
 
     cap.availableCapacityMbps = std::max(0.0, cap.estimatedCapacityMbps - occupied);
@@ -1184,14 +1215,20 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
 
     // ---- Priority bootstrap, held until first measured satisfaction ----
     // Até existir uma amostra de satisfação MEDIDA para este (STA,AC),
-    // mantém a alocação por prioridade EDCA (VO/VI -> fast, BE/BK -> slow).
+    // mantém a alocação por prioridade EDCA (VO/VI -> melhor link).
     // Isto impede que o transiente de cold-start (effCap=capacidade total nos
     // links vazios) puxe ACs de baixa prioridade para o fast e contamine a
     // primeira medição dos residentes de alta prioridade.
+    //
+    // BE/BK (baixa prioridade): em TRIBAND (>=3 links) arrancam no 2º melhor
+    // link (ex.: 5 GHz = m_linksByRank[1]) em vez do pior (2.4 GHz), deixando o
+    // 2.4 GHz livre; em DUALBAND (2 links) mantêm-se no pior (m_slowLinkId).
     bool useBootstrap = false;
     if (m_hasMeasuredSat.count(staAcKey) == 0) {
+        uint8_t lowPrioBoot = (m_linksByRank.size() >= 3)
+                              ? m_linksByRank[1] : m_slowLinkId;
         uint8_t bootLink = (acIdx >= static_cast<uint8_t>(AC_VI))
-                           ? m_fastLinkId : m_slowLinkId;
+                           ? m_fastLinkId : lowPrioBoot;
         if (std::find(eligibleLinks.begin(), eligibleLinks.end(), bootLink)
                 != eligibleLinks.end()) {
             selectedLink = bootLink;
@@ -1236,7 +1273,8 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
         // EXCEÇÃO: se o VO/VI estiver genuinamente a não cumprir os objetivos
         // no fast (esfomeado), cede e pode descer — tem prioridade sobre o BE.
         bool isHighPrio = (acIdx >= static_cast<uint8_t>(AC_VI));
-        if (isHighPrio && bestLink == m_slowLinkId && currentLink == m_fastLinkId) {
+        // Downgrade = mover para um link de PIOR rank que o atual (N links).
+        if (isHighPrio && LinkRankPos(bestLink) > LinkRankPos(currentLink)) {
             // Sinal de fome = satisfação MEDIDA no fast (currentSat), fiável após
             // o warmup de 2 janelas. NÃO usar a projecção: é instável e chegou a
             // dar quase empate entre links (0.963223 vs 0.963183), abrindo a
@@ -1244,7 +1282,7 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
             constexpr double kStarvationFloor = 0.60; // tunável
             bool starvingOnFast = (currentSat < kStarvationFloor);
 
-            bool soleOccupant = CountCoResidents(ac, sta, m_fastLinkId) == 0;
+            bool soleOccupant = CountCoResidents(ac, sta, currentLink) == 0;
             bool wouldStarveLowPrio = false;
             for (const auto& [key, resLink] : m_lastSelectedLink) {
                 if (!IsRoutableSta(key.first)) continue; // ignora beacons/broadcast
@@ -1480,12 +1518,15 @@ QosWeightedMloScheduler::RebalanceIdleLinks()
         return static_cast<int>(a);
     };
 
-    for (uint8_t T : {m_slowLinkId, m_fastLinkId}) {
+    // Alvos: do PIOR para o melhor (encher primeiro os links ociosos/lentos).
+    // Fontes: do MELHOR para o pior (drenar dos mais capazes). N links.
+    std::vector<uint8_t> balTargets(m_linksByRank.rbegin(), m_linksByRank.rend());
+    for (uint8_t T : balTargets) {
         int cls = targetAcClass(T);
         if (cls == -2) continue;  // alvo misto → nunca mistura ACs
         bool targetEmpty = flowsByLink[T].empty();
         double spare = m_linkCapability[T].estimatedCapacityMbps - linkLoad(T);
-        for (uint8_t S : {m_fastLinkId, m_slowLinkId}) {
+        for (uint8_t S : m_linksByRank) {
             if (S == T) continue;
             if (flowsByLink[S].size() < 2) continue;  // não esvaziar a fonte
             // Balanceamento: só mover se reduz o desequilíbrio (mantém S >= T).
@@ -1747,6 +1788,18 @@ InstallQosWeightedScheduler(Ptr<WifiMac> mac, int freq1, int freq2)
     if (!mac) return nullptr;
     auto sched = CreateObject<QosWeightedMloScheduler>();
     sched->ConfigureForPair(freq1, freq2);
+    mac->SetMacQueueScheduler(sched);
+    return sched;
+}
+
+// Overload N-link: recebe a lista de frequências (uma por link, mesma ordem
+// que as PHYs foram adicionadas). Usado no modo triband (Fase B).
+inline Ptr<QosWeightedMloScheduler>
+InstallQosWeightedScheduler(Ptr<WifiMac> mac, const std::vector<int>& freqs)
+{
+    if (!mac) return nullptr;
+    auto sched = CreateObject<QosWeightedMloScheduler>();
+    sched->ConfigureForLinks(freqs);
     mac->SetMacQueueScheduler(sched);
     return sched;
 }

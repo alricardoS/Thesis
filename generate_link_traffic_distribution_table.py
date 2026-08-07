@@ -29,6 +29,61 @@ def _parse_sta_traffic_types(sta_traffic_types_csv):
         return []
     return [_normalize_traffic_type(token) for token in str(sta_traffic_types_csv).split(",") if token.strip()]
 
+
+def _detect_switch_bucket(run_df):
+    """Instante (time_bucket_s) em que algum STA muda de AC (switch a meio). None se
+    não houver switch. Detetado como o 1º bucket em que o AC dominante de um STA muda."""
+    best = None
+    for sta_id, sdf in run_df.groupby("sta_id"):
+        if sdf["ac"].nunique() < 2:
+            continue
+        piv = sdf.pivot_table(index="time_bucket_s", columns="ac",
+                              values="frame_count", aggfunc="sum").fillna(0.0).sort_index()
+        if piv.empty:
+            continue
+        dom = piv.idxmax(axis=1)
+        first = dom.iloc[0]
+        for t, a in dom.items():
+            if a != first:
+                best = float(t) if best is None else min(best, float(t))
+                break
+    return best
+
+
+def _write_dist_table(handle, sub_df, title):
+    """Escreve uma tabela de distribuição (STA×AC×Link) para o sub-dataframe dado."""
+    if title:
+        handle.write(f"[{title}]\n")
+    if sub_df.empty:
+        handle.write("(no data)\n\n")
+        return
+    rows = []
+    run_total_packets = sub_df["frame_count"].sum()
+    for (sta_id, ac, link_name), group in sub_df.groupby(["sta_id", "ac", "link_name"]):
+        packets = int(group["frame_count"].sum())
+        bytes_count = int(group["bytes"].sum())
+        ac_total_packets = int(sub_df[sub_df["ac"] == ac]["frame_count"].sum())
+        sta_total_packets = int(sub_df[sub_df["sta_id"] == sta_id]["frame_count"].sum())
+        pct_sta_ac = (100.0 * packets / ac_total_packets) if ac_total_packets > 0 else 0.0
+        pct_sta_total = (100.0 * packets / sta_total_packets) if sta_total_packets > 0 else 0.0
+        pct_run = (100.0 * packets / run_total_packets) if run_total_packets > 0 else 0.0
+        rows.append({
+            "STA": int(sta_id), "AC": ac, "Link": link_name,
+            "FrameType": ",".join(sorted(group["frame_type"].astype(str).unique())),
+            "Packets": packets, "Bytes": bytes_count,
+            "Pct_Sta_AC": f"{pct_sta_ac:.1f}%",
+            "Pct_Sta_Total": f"{pct_sta_total:.1f}%",
+            "Pct_Run": f"{pct_run:.1f}%",
+            "Avg_Bytes_Per_Pkt": f"{(bytes_count / packets) if packets > 0 else 0.0:.0f}",
+        })
+    if rows:
+        out_df = pd.DataFrame(rows).sort_values(["STA", "AC", "Link"])
+        handle.write(out_df.to_string(index=False))
+        handle.write("\n\n")
+    else:
+        handle.write("(no data)\n\n")
+
+
 def generate_link_traffic_distribution_table(outputs_dir, scenario_name, table_output_file, sta_traffic_types_csv=""):
     """Generate an AP-to-STA traffic table per link and access category.
 
@@ -66,6 +121,11 @@ def generate_link_traffic_distribution_table(outputs_dir, scenario_name, table_o
             handle.write(f"Scenario: {scenario_name}\n")
             handle.write("Metric: AP-transmitted data frames grouped by STA, AC and link\n\n")
 
+            has_bucket = "time_bucket_s" in traffic_df.columns
+            if has_bucket:
+                traffic_df["time_bucket_s"] = pd.to_numeric(
+                    traffic_df["time_bucket_s"], errors="coerce").fillna(0.0)
+
             for run_label in sorted(traffic_df["run_label"].unique()):
                 run_df = traffic_df[traffic_df["run_label"] == run_label].copy()
                 if run_df.empty:
@@ -74,37 +134,15 @@ def generate_link_traffic_distribution_table(outputs_dir, scenario_name, table_o
                 handle.write(f"Run: {run_label}\n")
                 handle.write("-" * 120 + "\n")
 
-                rows = []
-                run_total_packets = run_df["frame_count"].sum()
-                for (sta_id, ac, link_name), group in run_df.groupby(["sta_id", "ac", "link_name"]):
-                    packets = int(group["frame_count"].sum())
-                    bytes_count = int(group["bytes"].sum())
-                    ac_total_packets = int(run_df[run_df["ac"] == ac]["frame_count"].sum())
-                    sta_total_packets = int(run_df[run_df["sta_id"] == sta_id]["frame_count"].sum())
-                    pct_sta_ac = (100.0 * packets / ac_total_packets) if ac_total_packets > 0 else 0.0
-                    pct_sta_total = (100.0 * packets / sta_total_packets) if sta_total_packets > 0 else 0.0
-                    pct_run = (100.0 * packets / run_total_packets) if run_total_packets > 0 else 0.0
-                    rows.append(
-                        {
-                            "STA": int(sta_id),
-                            "AC": ac,
-                            "Link": link_name,
-                            "FrameType": ",".join(sorted(group["frame_type"].astype(str).unique())),
-                            "Packets": packets,
-                            "Bytes": bytes_count,
-                            "Pct_Sta_AC": f"{pct_sta_ac:.1f}%",
-                            "Pct_Sta_Total": f"{pct_sta_total:.1f}%",
-                            "Pct_Run": f"{pct_run:.1f}%",
-                            "Avg_Bytes_Per_Pkt": f"{(bytes_count / packets) if packets > 0 else 0.0:.0f}",
-                        }
-                    )
-
-                if rows:
-                    out_df = pd.DataFrame(rows).sort_values(["STA", "AC", "Link"])
-                    handle.write(out_df.to_string(index=False))
-                    handle.write("\n\n")
+                # Cenários de switch: dividir em fases (antes/depois da mudança de AC).
+                switch_t = _detect_switch_bucket(run_df) if has_bucket else None
+                if switch_t is not None:
+                    _write_dist_table(handle, run_df[run_df["time_bucket_s"] < switch_t],
+                                      f"FASE 1 (antes do switch, t < {switch_t:g}s)")
+                    _write_dist_table(handle, run_df[run_df["time_bucket_s"] >= switch_t],
+                                      f"FASE 2 (após o switch, t >= {switch_t:g}s)")
                 else:
-                    handle.write("(no data)\n\n")
+                    _write_dist_table(handle, run_df, None)
 
             handle.write("Legend:\n")
             handle.write("- STA: destination station index\n")

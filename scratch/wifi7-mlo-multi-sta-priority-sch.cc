@@ -853,7 +853,24 @@ uint32_t g_numStas = 2;
 // Distância dos STAs ao AP (em metros)
 const double STA_DISTANCE = 5.0;
 
-/* global variable for easier access (cumulative delay/jitter) - per STA */
+// Modelo de FLUXOS: cada fluxo = uma (STA, app). Preenchido em main a partir de
+// --appsSpec (ou do legacy staTrafficTypes). As métricas sink abaixo são indexadas
+// por FLUXO (não por STA), para suportar múltiplas apps por STA.
+struct FlowSpec
+{
+    uint32_t staIdx;
+    uint32_t prio;      // 0..3
+    AcIndex  ac;
+    double   rateMbps;
+    double   startSec;
+    double   stopSec;
+    uint16_t port;
+};
+std::vector<FlowSpec> g_flows;
+uint32_t g_numFlows = 0;
+std::map<uint16_t, uint32_t> g_portToFlow;  // porta destino -> índice de fluxo
+
+/* métricas cumulativas delay/jitter — POR FLUXO */
 std::vector<double> g_delaySumMs;
 std::vector<uint64_t> g_delaySamples;
 std::vector<double> g_jitterSumMs;
@@ -861,7 +878,7 @@ std::vector<uint64_t> g_jitterSamples;
 std::vector<double> g_lastDelayMs;
 std::vector<bool> g_firstPacket;
 
-// Per-STA throughput tracking
+// throughput por FLUXO
 std::vector<uint64_t> g_lastTotalRx;
 
 // Per-second per-STA QoS metrics time series (CSV opcional, puramente observacional)
@@ -879,14 +896,15 @@ std::vector<uint64_t> g_lastStaTxC;   // baseline dedicado à comparação (loss
 std::vector<uint64_t> g_lastStaRxC;
 
 // Per-STA identity/goal, for feeding real per-STA QoS to the AP scheduler
-std::vector<AcIndex> g_staAc;                             // AC de cada STA
 // FlowMonitor para loss REAL acumulada por-STA (alimentada ao scheduler)
 Ptr<FlowMonitor> g_flowMonitor;
 Ptr<Ipv4FlowClassifier> g_flowClassifier;
 std::map<Ipv4Address, uint32_t> g_staIpToIndex;          // IP destino -> índice STA
+AcIndex TosToAc(uint8_t tos); // fwd (definição perto dos helpers de prioridade)
 
 // Enqueue no traffic-control do AP (topo da pilha) — pacote OFERECIDO. Timestamp por UID
-// (o delay TC→ACK capta a espera TC + MAC). Atribui por-STA via IP destino.
+// (o delay TC→ACK capta a espera TC + MAC). Atribui por (STA, AC): STA via IP destino,
+// AC via ToS do pacote (suporta múltiplas apps/ACs no mesmo STA).
 void ApTcEnqueue(Ptr<const QueueDiscItem> item)
 {
     auto ip = DynamicCast<const Ipv4QueueDiscItem>(item);
@@ -894,12 +912,13 @@ void ApTcEnqueue(Ptr<const QueueDiscItem> item)
     auto it = g_staIpToIndex.find(ip->GetHeader().GetDestination());
     if (it == g_staIpToIndex.end() || it->second >= g_numStas) return;
     uint32_t s = it->second;
-    g_apOffered[ApKey{s, static_cast<uint8_t>(g_staAc[s])}]++;
+    AcIndex ac = TosToAc(ip->GetHeader().GetTos());
+    g_apOffered[ApKey{s, static_cast<uint8_t>(ac)}]++;
     g_apEnqTimeMs[item->GetPacket()->GetUid()] = Simulator::Now().GetMilliSeconds();
 }
 
 // Drop no traffic-control do AP (downlink) ANTES do enqueue — a fonte de perda dominante
-// no all-BE (overlimit). Atribui por-STA via IP destino. (Aqui porque usa g_staIpToIndex/g_staAc.)
+// no all-BE (overlimit). Atribui por (STA via IP, AC via ToS).
 void ApTcDrop(Ptr<const QueueDiscItem> item, const char* /*reason*/)
 {
     auto ip = DynamicCast<const Ipv4QueueDiscItem>(item);
@@ -907,7 +926,8 @@ void ApTcDrop(Ptr<const QueueDiscItem> item, const char* /*reason*/)
     auto it = g_staIpToIndex.find(ip->GetHeader().GetDestination());
     if (it == g_staIpToIndex.end() || it->second >= g_numStas) return;
     uint32_t s = it->second;
-    g_apDropped[ApKey{s, static_cast<uint8_t>(g_staAc[s])}]++;
+    AcIndex ac = TosToAc(ip->GetHeader().GetTos());
+    g_apDropped[ApKey{s, static_cast<uint8_t>(ac)}]++;
 }
 
 // Baselines por janela (para converter somas cumulativas em médias por janela)
@@ -990,21 +1010,21 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
     double totalJitter = 0.0;
     uint32_t validStas = 0;
 
-    // Loss REAL acumulada por-STA (FlowMonitor, downlink) — mesma fonte do relatório final.
-    std::vector<uint64_t> staTx(g_numStas, 0), staRx(g_numStas, 0);
+    // Loss REAL acumulada por-FLUXO (FlowMonitor, downlink) — via porta destino.
+    std::vector<uint64_t> staTx(g_numFlows, 0), staRx(g_numFlows, 0);
     if (g_flowMonitor && g_flowClassifier) {
         auto fstats = g_flowMonitor->GetFlowStats();
         for (const auto& kv : fstats) {
             Ipv4FlowClassifier::FiveTuple tup = g_flowClassifier->FindFlow(kv.first);
-            auto it = g_staIpToIndex.find(tup.destinationAddress);
-            if (it != g_staIpToIndex.end() && it->second < g_numStas) {
-                staTx[it->second] += kv.second.txPackets;
-                staRx[it->second] += kv.second.rxPackets;
+            auto pit = g_portToFlow.find(tup.destinationPort);
+            if (pit != g_portToFlow.end() && pit->second < g_numFlows) {
+                staTx[pit->second] += kv.second.txPackets;
+                staRx[pit->second] += kv.second.rxPackets;
             }
         }
     }
 
-    for (uint32_t i = 0; i < g_numStas; ++i) {
+    for (uint32_t i = 0; i < g_numFlows; ++i) {
         uint64_t currentTotalRx = sinks[i]->GetTotalRx();
         double throughput = ((currentTotalRx - g_lastTotalRx[i]) * 8.0) / (1.0 * 1e6);
         g_lastTotalRx[i] = currentTotalRx;
@@ -1027,7 +1047,7 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
                              : 0.0;
 
         // ---- Estimativa SÓ-AP desta janela (camada TC do AP; sem feedback dos STAs) ----
-        ApKey k{i, static_cast<uint8_t>(g_staAc[i])};
+        ApKey k{g_flows[i].staIdx, static_cast<uint8_t>(g_flows[i].ac)};
         uint64_t enq = g_apOffered.count(k)   ? g_apOffered[k]   : 0;
         uint64_t del = g_apDelivered.count(k) ? g_apDelivered[k] : 0;
         uint64_t drp = g_apDropped.count(k)   ? g_apDropped[k]   : 0;
@@ -1046,19 +1066,19 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
 
         // Alimentar a DECISÃO: por defeito com a estimativa do AP (remove a dependência dos
         // sinks); com --decisionMetrics=sink usa o feedback dos STAs (para comparação).
-        if (g_apScheduler && i < g_staIndexToMacs.size()) {
+        if (g_apScheduler && g_flows[i].staIdx < g_staIndexToMacs.size()) {
             bool useAp = (g_decisionMetrics == "ap");
             double fTp = useAp ? apTp : throughput;
             double fDe = useAp ? apDe : winDelay;
             double fJi = useAp ? apJi : winJitter;
             double fLo = useAp ? apLo : winLoss;
-            for (const auto& mac : g_staIndexToMacs[i]) {
-                g_apScheduler->FeedStaQos(mac, g_staAc[i], fTp, fDe, fJi, fLo);
+            for (const auto& mac : g_staIndexToMacs[g_flows[i].staIdx]) {
+                g_apScheduler->FeedStaQos(mac, g_flows[i].ac, fTp, fDe, fJi, fLo);
             }
         }
 
         // ---- Comparação (observacional): SINK (verdade) vs estimativa SÓ-AP ----
-        if (g_metricCompStream.is_open() && i < g_staAc.size()) {
+        if (g_metricCompStream.is_open() && i < g_numFlows) {
             // loss_sink POR-JANELA (delta de tx/rx), para comparar com o apLo por-janela
             // (o winLoss é cumulativo). Baseline dedicado, atualizado aqui.
             double dTxC = double(staTx[i]) - double(g_lastStaTxC[i]);
@@ -1070,8 +1090,8 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
                                    : 0.0;
 
             g_metricCompStream << '"' << g_metricCompRunLabel << "\","
-                               << currentTime << ',' << i << ','
-                               << AcIndexToShortName(g_staAc[i]) << ','
+                               << currentTime << ',' << g_flows[i].staIdx << ','
+                               << AcIndexToShortName(g_flows[i].ac) << ','
                                << throughput << ',' << apTp << ','
                                << winDelay   << ',' << apDe << ','
                                << winJitter  << ',' << apJi << ','
@@ -1085,7 +1105,7 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
         g_apJitterSumMs.erase(k); g_apJitterN.erase(k);
 
         // ---- Série temporal por-STA (opcional; não afecta nenhum cálculo acima) ----
-        if (g_perStaMetricsStream.is_open() && i < g_staAc.size()) {
+        if (g_perStaMetricsStream.is_open() && i < g_numFlows) {
             // Subtracção em double (com sinal): evita o underflow de uint64_t quando
             // uma janela "sobre-entrega" (dRx > dTx, pacotes in-flight da janela
             // anterior chegam agora), que gerava 100% de loss falso.
@@ -1099,8 +1119,8 @@ void CalculateStats(std::vector<Ptr<PacketSink>> sinks)
                                   : 0.0;
 
             g_perStaMetricsStream << '"' << g_perStaMetricsRunLabel << "\","
-                                  << currentTime << ',' << i << ','
-                                  << AcIndexToShortName(g_staAc[i]) << ','
+                                  << currentTime << ',' << g_flows[i].staIdx << ','
+                                  << AcIndexToShortName(g_flows[i].ac) << ','
                                   << throughput << ',' << winDelay << ','
                                   << winJitter << ',' << winLossPct << '\n';
         }
@@ -1236,6 +1256,86 @@ PriorityClassToAc(uint32_t priorityClass)
     }
 }
 
+// Token de AC ("vo/vi/be/bk"/nomes) -> classe de prioridade (0=BK..3=VO).
+uint32_t
+AcTokenToPrio(std::string t)
+{
+    std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c){ return std::tolower(c); });
+    if (t == "vo" || t == "voice")      return 3;
+    if (t == "vi" || t == "video")      return 2;
+    if (t == "be" || t == "besteffort" || t == "best-effort") return 1;
+    if (t == "bk" || t == "background") return 0;
+    return 1; // default BE
+}
+
+// ToS do cabeçalho IP -> AcIndex (inverso de PriorityClassToTos). Para atribuir o AC
+// de um pacote no traffic-control quando um STA tem múltiplas apps (ACs diferentes).
+AcIndex
+TosToAc(uint8_t tos)
+{
+    switch (tos)
+    {
+    case 0x20: return AC_BK;
+    case 0xA0: return AC_VI;
+    case 0xC0: return AC_VO;
+    default:   return AC_BE; // 0x00
+    }
+}
+
+// Parser do --appsSpec: STAs separados por ';'; apps por '+' (concorrentes) e '>'
+// (switch a meio). Ex.: "vo;vo>be;vi+bk". numStas = nº de entradas ';'. O rate de cada
+// STA = totalRateMbps/numStas, dividido pelas apps (segmentos '+') do STA.
+std::vector<FlowSpec>
+ParseAppsSpec(const std::string& spec, double totalRateMbps, double simTime,
+              uint16_t basePort, uint32_t& numStasOut)
+{
+    std::vector<FlowSpec> flows;
+    std::vector<std::string> staEntries;
+    std::stringstream ss(spec);
+    std::string ent;
+    while (std::getline(ss, ent, ';'))
+    {
+        auto b = ent.find_first_not_of(" \t\n\r");
+        auto e = ent.find_last_not_of(" \t\n\r");
+        if (b == std::string::npos) continue;
+        staEntries.push_back(ent.substr(b, e - b + 1));
+    }
+    numStasOut = static_cast<uint32_t>(staEntries.size());
+    if (numStasOut == 0) return flows;
+
+    const double perSta = totalRateMbps / double(numStasOut);
+    const double mid = simTime / 2.0;
+    uint16_t port = basePort;
+
+    for (uint32_t s = 0; s < numStasOut; ++s)
+    {
+        std::vector<std::string> segs;
+        std::stringstream es(staEntries[s]);
+        std::string seg;
+        while (std::getline(es, seg, '+')) segs.push_back(seg);
+        if (segs.empty()) segs.push_back("be");
+        const double perApp = perSta / double(segs.size());
+
+        for (auto& sg : segs)
+        {
+            auto gt = sg.find('>');
+            if (gt != std::string::npos) // switch a meio: ac1>ac2
+            {
+                uint32_t p1 = AcTokenToPrio(sg.substr(0, gt));
+                uint32_t p2 = AcTokenToPrio(sg.substr(gt + 1));
+                flows.push_back({s, p1, PriorityClassToAc(p1), perApp, 1.5 + 0.01 * s, mid, port++});
+                flows.push_back({s, p2, PriorityClassToAc(p2), perApp, mid, simTime - 0.5, port++});
+            }
+            else // app única toda a simulação
+            {
+                uint32_t p = AcTokenToPrio(sg);
+                flows.push_back({s, p, PriorityClassToAc(p), perApp, 1.5 + 0.01 * s, simTime - 0.5, port++});
+            }
+        }
+    }
+    return flows;
+}
+
 std::vector<uint32_t>
 ParseStaTrafficTypes(const std::string& csv, uint32_t numStas)
 {
@@ -1317,6 +1417,7 @@ int main(int argc, char* argv[])
     // Default params
     int freq1 = 5;
     int freq2 = 6;
+    int freq3 = 0;  // 0 = modo 2-link (dualband). >0 (2,5,6) ativa a 3ª PHY (triband).
     std::string dataRateStr = "150Mbps"; // Per-STA (reduzido para evitar saturação com 4 STAs)
     double simTime = 12.0;
     bool enablePcaps = false;
@@ -1328,30 +1429,35 @@ int main(int argc, char* argv[])
     uint32_t beMaxAmpduBytes = 65535;
     uint32_t viMaxAmpduBytes = 65535;
     uint32_t voMaxAmpduBytes = 65535;
-    uint32_t bkMaxAmpduBytes = 0;
+    uint32_t bkMaxAmpduBytes = 65535; // A-MPDU ativo (antes 0/desligado, que limitava o BK a ~50 Mbps mesmo sozinho num link)
     std::string queueOccupancyCsvPath;
     std::string queueOccupancyLabel;
     std::string linkTrafficCsvPath;
     std::string frameDistributionCsvPath;
     std::string staTrafficTypesCsv = "best-effort,voice,voice,video";
+    std::string appsSpecStr = "";        // se vazio → modelo legacy (staTrafficTypes)
+    double totalRateMbps = 600.0;        // orçamento total (600 = 4×150 original)
 
     uint32_t numStas = 4; // Number of STAs (configurable)
 
     CommandLine cmd;
     cmd.AddValue("freq1", "First link frequency (2,5,6)", freq1);
     cmd.AddValue("freq2", "Second link frequency (2,5,6)", freq2);
+    cmd.AddValue("freq3", "Third link frequency (2,5,6; 0=disabled/2-link)", freq3);
     cmd.AddValue("dataRate", "Per-STA application data rate", dataRateStr);
     cmd.AddValue("simTime", "Simulation time (s)", simTime);
     cmd.AddValue("enablePcaps", "Enable PCAP captures", enablePcaps);
     cmd.AddValue("protocol", "Application protocol: TCP or UDP", protocol);
     cmd.AddValue("distance", "Distance from STAs to AP (m)", staDistance);
     cmd.AddValue("staticSetup", "Use WifiStaticSetupHelper", useStaticSetup);
-    cmd.AddValue("numStas", "Number of STAs (2, 4, 8, 16, etc.)", numStas);
+    cmd.AddValue("numStas", "Number of STAs (2, 4, 8, 16, etc.) — ignorado se --appsSpec for dado", numStas);
     cmd.AddValue("staTrafficTypes", "CSV por STA (voice,video,besteffort,background) ou classes 0..3", staTrafficTypesCsv);
+    cmd.AddValue("appsSpec", "Spec de apps por STA: STAs por ';', apps por '+' (concorrente) e '>' (switch a meio). Ex.: 'vo;vo>be;vi+bk'. numStas derivado.", appsSpecStr);
+    cmd.AddValue("totalRateMbps", "Orçamento total de data-rate (Mbps), repartido por STA e apps", totalRateMbps);
     cmd.AddValue("beMaxAmpdu", "BE A-MPDU max bytes (0=disabled)", beMaxAmpduBytes);
     cmd.AddValue("viMaxAmpdu", "VI A-MPDU max bytes (0=disabled)", viMaxAmpduBytes);
     cmd.AddValue("voMaxAmpdu", "VO A-MPDU max bytes (0=disabled, default)", voMaxAmpduBytes);
-    cmd.AddValue("bkMaxAmpdu", "BK A-MPDU max bytes (0=disabled)", bkMaxAmpduBytes);
+    cmd.AddValue("bkMaxAmpdu", "BK A-MPDU max bytes (default 65535; 0=disabled)", bkMaxAmpduBytes);
     cmd.AddValue("queueSampleInterval", "Queue occupancy sampling interval (s)", queueSampleInterval);
     cmd.AddValue("linkTrafficSampleInterval", "Per-link per-STA traffic sampling interval (s)", linkTrafficSampleInterval);
     cmd.AddValue("queueOccupancyCsv", "CSV file for MAC queue occupancy samples", queueOccupancyCsvPath);
@@ -1395,32 +1501,53 @@ int main(int argc, char* argv[])
         linkTrafficSampleInterval = 0.1;
     }
 
-    // Set global numStas and initialize vectors
+    // ---- Construir os FLUXOS (modelo unificado) ----
+    const uint16_t basePort = 5001;
+    if (!appsSpecStr.empty()) {
+        // Modelo novo: --appsSpec (deriva numStas + rates pelo orçamento).
+        g_flows = ParseAppsSpec(appsSpecStr, totalRateMbps, simTime, basePort, numStas);
+    } else {
+        // Legacy: 1 fluxo por STA, AC de staTrafficTypes, rate = --dataRate.
+        std::vector<uint32_t> pri = ParseStaTrafficTypes(staTrafficTypesCsv, numStas);
+        double legacyMbps = DataRate(dataRateStr).GetBitRate() / 1e6;
+        uint16_t p = basePort;
+        for (uint32_t s = 0; s < numStas; ++s)
+            g_flows.push_back({s, pri[s], PriorityClassToAc(pri[s]), legacyMbps,
+                               1.5 + 0.01 * s, simTime - 0.5, p++});
+    }
     g_numStas = numStas;
-    g_delaySumMs.resize(g_numStas, 0.0);
-    g_delaySamples.resize(g_numStas, 0);
-    g_jitterSumMs.resize(g_numStas, 0.0);
-    g_jitterSamples.resize(g_numStas, 0);
-    g_lastDelayMs.resize(g_numStas, 0.0);
-    g_firstPacket.resize(g_numStas, true);
-    g_lastTotalRx.resize(g_numStas, 0);
-    g_lastDelaySumMs.resize(g_numStas, 0.0);
-    g_lastDelaySamples.resize(g_numStas, 0);
-    g_lastJitterSumMs.resize(g_numStas, 0.0);
-    g_lastJitterSamples.resize(g_numStas, 0);
-    g_lastStaTx.resize(g_numStas, 0);
-    g_lastStaRx.resize(g_numStas, 0);
-    g_lastStaTxC.resize(g_numStas, 0);
-    g_lastStaRxC.resize(g_numStas, 0);
+    g_numFlows = static_cast<uint32_t>(g_flows.size());
+    for (uint32_t f = 0; f < g_numFlows; ++f) g_portToFlow[g_flows[f].port] = f;
+
+    // Vetores de métricas SINK indexados por FLUXO.
+    g_delaySumMs.resize(g_numFlows, 0.0);
+    g_delaySamples.resize(g_numFlows, 0);
+    g_jitterSumMs.resize(g_numFlows, 0.0);
+    g_jitterSamples.resize(g_numFlows, 0);
+    g_lastDelayMs.resize(g_numFlows, 0.0);
+    g_firstPacket.resize(g_numFlows, true);
+    g_lastTotalRx.resize(g_numFlows, 0);
+    g_lastDelaySumMs.resize(g_numFlows, 0.0);
+    g_lastDelaySamples.resize(g_numFlows, 0);
+    g_lastJitterSumMs.resize(g_numFlows, 0.0);
+    g_lastJitterSamples.resize(g_numFlows, 0);
+    g_lastStaTx.resize(g_numFlows, 0);
+    g_lastStaRx.resize(g_numFlows, 0);
+    g_lastStaTxC.resize(g_numFlows, 0);
+    g_lastStaRxC.resize(g_numFlows, 0);
     g_queueOccupancyCsvPath = queueOccupancyCsvPath;
     g_queueSampleInterval = queueSampleInterval;
     g_linkTrafficCsvPath = linkTrafficCsvPath;
     g_linkTrafficSampleInterval = linkTrafficSampleInterval;
     g_frameDistributionCsvPath = frameDistributionCsvPath;
-    g_frameDistributionRunLabel = std::to_string(freq1) + "+" + std::to_string(freq2) + "|" + protocol;
+    // pair inclui a 3ª frequência em modo triband → GetLinkName nomeia o link 2.
+    const std::string pairStr = (freq3 > 0)
+        ? std::to_string(freq1) + "+" + std::to_string(freq2) + "+" + std::to_string(freq3)
+        : std::to_string(freq1) + "+" + std::to_string(freq2);
+    g_frameDistributionRunLabel = pairStr + "|" + protocol;
     g_linkTrafficRunLabel = g_frameDistributionRunLabel;
     g_protocol = protocol;
-    g_linkTrafficPairLabel = std::to_string(freq1) + "+" + std::to_string(freq2);
+    g_linkTrafficPairLabel = pairStr;
     g_linkFrequencyPair = g_linkTrafficPairLabel;
     g_linkTrafficEndTime = Seconds(simTime);
     g_frameDistributionEndTime = Seconds(simTime);
@@ -1428,6 +1555,10 @@ int main(int argc, char* argv[])
 
     if (freq1 == freq2) {
         NS_FATAL_ERROR("freq1 and freq2 must be different");
+    }
+    const bool triband = (freq3 > 0);
+    if (triband && (freq3 == freq1 || freq3 == freq2)) {
+        NS_FATAL_ERROR("freq3 must differ from freq1 and freq2");
     }
 
     std::string appSocketType;
@@ -1483,8 +1614,9 @@ int main(int argc, char* argv[])
     wifi.ConfigHeOptions("GuardInterval", TimeValue(NanoSeconds(800)));
     wifi.ConfigEhtOptions("EmlsrActivated", BooleanValue(false));
 
-    // PHY (2 links para MLO)
-    SpectrumWifiPhyHelper phy(2);
+    // PHY (2 ou 3 links para MLO)
+    const uint8_t nPhys = triband ? 3 : 2;
+    SpectrumWifiPhyHelper phy(nPhys);
     phy.Set("Antennas", UintegerValue(2));
     phy.Set("MaxSupportedTxSpatialStreams", UintegerValue(2));
     phy.Set("MaxSupportedRxSpatialStreams", UintegerValue(2));
@@ -1508,6 +1640,17 @@ int main(int argc, char* argv[])
     phy.AddChannel(ch2, c2.freqRange);
     phy.Set(1, "ChannelSettings", StringValue("{" + std::to_string(c2.channel) + ", " + std::to_string(c2.width) + ", " + c2.band + ", 0}"));
     phy.AddPhyToFreqRangeMapping(1, c2.freqRange);
+
+    if (triband) {
+        Ptr<MultiModelSpectrumChannel> ch3 = CreateObject<MultiModelSpectrumChannel>();
+        ch3->AddPropagationLossModel(CreateObject<LogDistancePropagationLossModel>());
+        ch3->SetPropagationDelayModel(CreateObject<ConstantSpeedPropagationDelayModel>());
+        ChannelConfig c3 = GetChannelConfig(freq3);
+        phy.AddChannel(ch3, c3.freqRange);
+        phy.Set(2, "ChannelSettings", StringValue("{" + std::to_string(c3.channel) + ", " + std::to_string(c3.width) + ", " + c3.band + ", 0}"));
+        phy.AddPhyToFreqRangeMapping(2, c3.freqRange);
+    }
+
     phy.Set("NotifyMacHdrRxEnd", BooleanValue(true));
 
     // Rate manager para cada link
@@ -1515,6 +1658,9 @@ int main(int argc, char* argv[])
     // wifi.SetRemoteStationManager(1, std::string("ns3::IdealWifiManager"));
     wifi.SetRemoteStationManager(0, std::string("ns3::IdealWifiManager"));
     wifi.SetRemoteStationManager(1, std::string("ns3::IdealWifiManager"));
+    if (triband) {
+        wifi.SetRemoteStationManager(2, std::string("ns3::IdealWifiManager"));
+    }
 
     // MAC
     Ssid ssid = Ssid("wifi7-mlo-multi-sta");
@@ -1700,8 +1846,8 @@ int main(int argc, char* argv[])
             g_queueOccupancyStream << "run_label,time_s,role,node_id,ac,packets,bytes\n";
         }
         g_queueOccupancyRunLabel = queueOccupancyLabel.empty()
-                                       ? std::to_string(freq1) + "+" + std::to_string(freq2) + "|" + protocol
-                                       : queueOccupancyLabel + "|" + std::to_string(freq1) + "+" + std::to_string(freq2) + "|" + protocol;
+                                       ? pairStr + "|" + protocol
+                                       : queueOccupancyLabel + "|" + pairStr + "|" + protocol;
         g_queueOccupancyEndTime = Seconds(simTime);
     }
 
@@ -1719,9 +1865,8 @@ int main(int argc, char* argv[])
         }
         g_perStaMetricsRunLabel =
             queueOccupancyLabel.empty()
-                ? std::to_string(freq1) + "+" + std::to_string(freq2) + "|" + protocol
-                : queueOccupancyLabel + "|" + std::to_string(freq1) + "+" + std::to_string(freq2) +
-                      "|" + protocol;
+                ? pairStr + "|" + protocol
+                : queueOccupancyLabel + "|" + pairStr + "|" + protocol;
     }
 
     if (!g_metricCompCsvPath.empty())
@@ -1740,9 +1885,8 @@ int main(int argc, char* argv[])
         }
         g_metricCompRunLabel =
             queueOccupancyLabel.empty()
-                ? std::to_string(freq1) + "+" + std::to_string(freq2) + "|" + protocol
-                : queueOccupancyLabel + "|" + std::to_string(freq1) + "+" + std::to_string(freq2) +
-                      "|" + protocol;
+                ? pairStr + "|" + protocol
+                : queueOccupancyLabel + "|" + pairStr + "|" + protocol;
     }
 
     // ===== CONFIGURAÇÃO ESTÁTICA (WifiStaticSetupHelper) =====
@@ -1775,7 +1919,9 @@ int main(int argc, char* argv[])
         NS_LOG_UNCOND("         BK(delay=0.05, jitter=0.05, loss=0.10, tp=0.80)");
 
         Ptr<WifiNetDevice> apWifiDev = DynamicCast<WifiNetDevice>(apDev.Get(0));
-        g_apScheduler = InstallQosWeightedScheduler(apWifiDev->GetMac(), freq1, freq2);
+        g_apScheduler = triband
+            ? InstallQosWeightedScheduler(apWifiDev->GetMac(), std::vector<int>{freq1, freq2, freq3})
+            : InstallQosWeightedScheduler(apWifiDev->GetMac(), freq1, freq2);
         if (g_apScheduler) {
             // Set decision thresholds
             g_apScheduler->SetAttribute("StayThreshold",
@@ -1839,7 +1985,6 @@ int main(int argc, char* argv[])
 
     g_staAddressToIndex.clear();
     g_staIndexToMacs.assign(staDev.GetN(), {});
-    g_staAc.assign(staDev.GetN(), AC_BE);
     for (uint32_t i = 0; i < staDev.GetN(); ++i)
     {
         Ptr<WifiNetDevice> staWifiNetDev = DynamicCast<WifiNetDevice>(staDev.Get(i));
@@ -1856,9 +2001,7 @@ int main(int argc, char* argv[])
                     staWifiNetDev->GetMac()->GetFrameExchangeManager(linkId)->GetAddress())] = i;
                 g_staIndexToMacs[i].push_back(linkMac);
             }
-            if (i < staPriorities.size())
-                g_staAc[i] = PriorityClassToAc(staPriorities[i]);
-            g_staIpToIndex[ifSta.GetAddress(i)] = i; // para loss real do FlowMonitor
+            g_staIpToIndex[ifSta.GetAddress(i)] = i; // para loss real do FlowMonitor (STA por IP)
         }
     }
 
@@ -1898,46 +2041,44 @@ int main(int argc, char* argv[])
         NS_LOG_UNCOND("Static ARP cache populated");
     }
 
-    // ===== APLICAÇÕES =====
-    // Tráfego downlink: AP envia para cada STA
-    uint16_t basePort = 5001;
-    std::vector<Ptr<PacketSink>> sinks(g_numStas);
+    // ===== APLICAÇÕES (por FLUXO) =====
+    // Tráfego downlink: um OnOff+sink por fluxo (STA,app). Múltiplas apps/STA e
+    // switch a meio (dois fluxos sequenciais na mesma STA) suportados via g_flows.
+    std::vector<Ptr<PacketSink>> sinks(g_numFlows);
     uint32_t payloadSize = 1440;
     g_payloadBytes = payloadSize; // p/ goodput exato na estimativa SÓ-AP
-    
-    for (uint32_t i = 0; i < g_numStas; ++i) {
-        uint16_t port = basePort + i;
-        
-        // Sink na STA
-        Address sinkAddress(InetSocketAddress(ifSta.GetAddress(i), port));
+
+    for (uint32_t f = 0; f < g_numFlows; ++f) {
+        const FlowSpec& fl = g_flows[f];
+        Address sinkAddress(InetSocketAddress(ifSta.GetAddress(fl.staIdx), fl.port));
+
+        // Sink na STA (sempre ligado toda a simulação, mesmo que a app seja parcial)
         PacketSinkHelper sinkHelper(appSocketType, sinkAddress);
-        ApplicationContainer sinkApp = sinkHelper.Install(staNodes.Get(i));
+        ApplicationContainer sinkApp = sinkHelper.Install(staNodes.Get(fl.staIdx));
         sinkApp.Start(Seconds(1.0));
         sinkApp.Stop(Seconds(simTime + 0.5));
-        sinks[i] = DynamicCast<PacketSink>(sinkApp.Get(0));
-        
-        // Conectar callback de RX
-        uint32_t staIdx = i;
-        sinks[i]->TraceConnectWithoutContext("Rx", 
-            MakeBoundCallback(&MonitorPacketSinkRx, staIdx));
-        
-        // OnOff sender no AP
+        sinks[f] = DynamicCast<PacketSink>(sinkApp.Get(0));
+
+        uint32_t flowIdx = f;
+        sinks[f]->TraceConnectWithoutContext("Rx",
+            MakeBoundCallback(&MonitorPacketSinkRx, flowIdx));
+
+        // OnOff sender no AP (rate do fluxo; janela temporal do fluxo)
         OnOffHelper onoff(appSocketType, sinkAddress);
         onoff.SetAttribute("PacketSize", UintegerValue(payloadSize));
-        onoff.SetAttribute("DataRate", DataRateValue(DataRate(dataRateStr)));
+        onoff.SetAttribute("DataRate", DataRateValue(DataRate(static_cast<uint64_t>(fl.rateMbps * 1e6))));
         onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
         onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
         onoff.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
-        onoff.SetAttribute("Tos", UintegerValue(PriorityClassToTos(staPriorities[i])));
+        onoff.SetAttribute("Tos", UintegerValue(PriorityClassToTos(fl.prio)));
 
         ApplicationContainer app = onoff.Install(apNode.Get(0));
-        //Início ligeiramente diferente para cada STA
-        app.Start(Seconds(1.5) + MilliSeconds(i * 10));
-        app.Stop(Seconds(simTime - 0.5));
-        
-        NS_LOG_UNCOND("App configured: AP -> STA" << i << " (port " << port << ")"
-              << " AC=" << PriorityClassToAcName(staPriorities[i])
-              << " TOS=" << static_cast<uint32_t>(PriorityClassToTos(staPriorities[i])));
+        app.Start(Seconds(fl.startSec));
+        app.Stop(Seconds(fl.stopSec));
+
+        NS_LOG_UNCOND("Flow " << f << ": AP -> STA" << fl.staIdx << " port " << fl.port
+              << " AC=" << PriorityClassToAcName(fl.prio)
+              << " rate=" << fl.rateMbps << "Mbps  t=[" << fl.startSec << "," << fl.stopSec << "]");
     }
 
     // PCAP (opcional)

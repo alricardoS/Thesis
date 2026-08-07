@@ -36,9 +36,12 @@ def list_output_dirs():
     return sorted(glob.glob(os.path.join(RESULTS_DIR, "outputs_*")))
 
 
-# Colors for STAs
-STA_COLORS = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12']  # Red, Blue, Green, Orange
-STA_HATCHES = ['//', 'xx', '..', '\\\\']
+# Colors/hatches for flow entities (STA,AC) — alargado para muitos fluxos.
+STA_COLORS = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12',
+              '#9B59B6', '#1ABC9C', '#E67E22', '#34495E',
+              '#16A085', '#C0392B', '#2980B9', '#8E44AD',
+              '#D35400', '#27AE60', '#2C3E50', '#7F8C8D']
+STA_HATCHES = ['//', 'xx', '..', '\\\\', '++', 'oo', '--', '||']
 
 
 def extract_priority_map(output_file):
@@ -148,41 +151,50 @@ def load_all_single_link_data():
 
 
 def load_all_mlo_data():
-    """Load all MLO per-STA data"""
-    all_data = []
+    """Carrega dados MLO por-(STA,AC) do CSV per_sta_timeseries (suporta N STAs e
+    múltiplas apps/STA). Cada 'entity' é um fluxo (STA,AC); num switch, o mesmo STA
+    tem dois fluxos (ex.: VO e BE), permitindo comparar o AC antes/depois. A média é
+    calculada sobre a janela ATIVA do fluxo (throughput>1), para não diluir com os
+    zeros da metade em que a app não estava ativa."""
+    all_rows = []
+
+    def _pair_of(lbl):
+        parts = str(lbl).split("|")
+        return parts[-2] if len(parts) >= 2 else "?"
+
+    def _proto_of(lbl):
+        parts = str(lbl).split("|")
+        return parts[-1] if parts else "UDP"
 
     for outputs_dir in list_output_dirs():
         scenario = os.path.basename(outputs_dir).replace("outputs_", "")
+        for csv_path in glob.glob(os.path.join(outputs_dir, "mlo_multi_sta_per_sta_timeseries_*.csv")):
+            try:
+                df = pd.read_csv(csv_path)
+            except Exception:
+                continue
+            if df.empty or "ac" not in df.columns:
+                continue
+            df["freq_pair"] = df["run_label"].map(_pair_of)
+            df["protocol"] = df["run_label"].map(_proto_of)
+            df["sta_id"] = pd.to_numeric(df["sta_id"], errors="coerce").fillna(-1).astype(int)
+            for c in ["throughput_mbps", "delay_ms", "jitter_ms", "loss_pct"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
-        for f1, f2 in FREQ_PAIRS:
-            pattern = f"mlo_multi_sta_{f1}_{f2}_*_*.txt"
-            for output_file in glob.glob(os.path.join(outputs_dir, pattern)):
-                match = re.search(rf"mlo_multi_sta_{f1}_{f2}_([A-Za-z0-9]+)_", os.path.basename(output_file))
-                if not match:
-                    continue
-                proto = match.group(1)
+            for (pair, proto, sid, ac), g in df.groupby(["freq_pair", "protocol", "sta_id", "ac"]):
+                active = g[g["throughput_mbps"] > 1.0]
+                use = active if not active.empty else g
+                all_rows.append({
+                    "scenario": scenario, "freq_pair": pair, "protocol": proto,
+                    "sta_id": int(sid), "ac": str(ac), "entity": f"{int(sid)}|{ac}",
+                    "priority_label": str(ac),
+                    "throughput_mbps": use["throughput_mbps"].mean(),
+                    "delay_ms": use["delay_ms"].mean(),
+                    "jitter_ms": use["jitter_ms"].mean(),
+                    "loss_rate_pct": use["loss_pct"].mean(),
+                })
 
-                sta_data = extract_sta_data(output_file)
-                pair_label = FREQ_PAIR_LABELS[(f1, f2)]
-
-                for sta in sta_data:
-                    all_data.append({
-                        'scenario': scenario,
-                        'freq_pair': pair_label,
-                        'protocol': proto,
-                        'sta_id': sta['sta_id'],
-                        'sta_label': f"STA{sta['sta_id']}",
-                        'priority_class': sta['priority_class'],
-                        'priority_label': sta['priority_label'],
-                        'ac': sta['ac'],
-                        'tos': sta['tos'],
-                        'throughput_mbps': sta['throughput_mbps'],
-                        'delay_ms': sta['delay_ms'],
-                        'jitter_ms': sta['jitter_ms'],
-                        'loss_rate_pct': sta['loss_rate_pct']
-                    })
-
-    return pd.DataFrame(all_data) if all_data else None
+    return pd.DataFrame(all_rows) if all_rows else None
 
 
 def create_individual_sta_plot(df, metric, ylabel, title_prefix, filename_prefix,
@@ -198,8 +210,10 @@ def create_individual_sta_plot(df, metric, ylabel, title_prefix, filename_prefix
             continue
 
         groups = df_proto[group_col].unique()
-        sta_ids = sorted(df_proto['sta_id'].unique())
-        num_stas = len(sta_ids)
+        # Entity = (STA, AC): num switch, o mesmo STA aparece com 2 ACs → barras separadas.
+        entities = sorted(df_proto['entity'].unique(),
+                          key=lambda e: (int(e.split('|')[0]), e.split('|')[1]))
+        num_stas = len(entities)
 
         for scenario in scenarios:
             df_scenario = df_proto[df_proto['scenario'] == scenario]
@@ -209,22 +223,20 @@ def create_individual_sta_plot(df, metric, ylabel, title_prefix, filename_prefix
             fig, ax = plt.subplots(figsize=(12, 7))
 
             x = np.arange(len(groups))
-            width = 0.35 / num_stas
+            width = 0.7 / max(num_stas, 1)
 
             legend_labels = []
-            for i, sta_id in enumerate(sta_ids):
+            for i, entity in enumerate(entities):
+                sid, ac = entity.split('|')
                 vals = []
                 for g in groups:
-                    row = df_scenario[(df_scenario[group_col] == g) & (df_scenario['sta_id'] == sta_id)]
+                    row = df_scenario[(df_scenario[group_col] == g) & (df_scenario['entity'] == entity)]
                     if not row.empty:
                         vals.append(float(row[metric].values[0]))
                     else:
                         vals.append(0.0)
 
-                sta_row = df_scenario[df_scenario['sta_id'] == sta_id].head(1)
-                priority_label = sta_row['priority_label'].values[0] if not sta_row.empty else 'UNK'
-                ac = sta_row['ac'].values[0] if not sta_row.empty else 'UNK'
-                legend_label = f'STA{sta_id} ({priority_label})'
+                legend_label = f'STA{sid} ({ac})'
                 legend_labels.append(legend_label)
 
                 offset = (i - (num_stas - 1) / 2) * width
