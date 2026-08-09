@@ -157,6 +157,7 @@ Ptr<QosWeightedMloScheduler> g_apScheduler;
 // STAs use the default FcfsWifiQueueScheduler (AP-only scope for goal-oriented scheduler)
 // std::vector<Ptr<QosWeightedMloScheduler>> g_staSchedulers; // removed — STAs use FCFS
 std::string g_schedulerDecisionCsvPath = "";
+std::string g_schedulerStateCsvPath = ""; // CSV de estado por-fluxo (score+link por STA,AC)
 
 // Default QoS Weights (Delay, Jitter, Loss, Throughput)
 double g_voDelayWeight = 0.40; double g_voJitterWeight = 0.30; double g_voLossWeight = 0.25; double g_voTpWeight = 0.05;
@@ -1468,6 +1469,7 @@ int main(int argc, char* argv[])
     cmd.AddValue("decisionMetrics", "Fonte das métricas da decisão: 'ap' (estimativa do AP, sem sinks) | 'sink'", g_decisionMetrics);
     cmd.AddValue("useCustomMloScheduler", "Enable custom MLO scheduler (VO/VI prefer fast link, BE/BK prefer slow link)", g_useCustomMloScheduler);
     cmd.AddValue("schedulerDecisionCsv", "CSV file for scheduler decisions", g_schedulerDecisionCsvPath);
+    cmd.AddValue("schedulerStateCsv", "CSV file for per-flow scheduler state (score+link over time)", g_schedulerStateCsvPath);
     cmd.AddValue("stayThreshold", "Satisfaction index above which the AP scheduler keeps the current link (0..1)", g_stayThreshold);
     cmd.AddValue("migrationThreshold", "Minimum satisfaction gain required to trigger link migration (0..1)", g_migrationThreshold);
     cmd.AddValue("voDelayWeight", "VO Delay Weight", g_voDelayWeight);
@@ -2003,6 +2005,19 @@ int main(int argc, char* argv[])
             }
             g_staIpToIndex[ifSta.GetAddress(i)] = i; // para loss real do FlowMonitor (STA por IP)
         }
+    }
+
+    // Estado por-fluxo do scheduler (score+link por STA,AC): dá-lhe o mapa
+    // endereço→índice (MLD e link addrs) e abre o CSV com o mesmo run_label do per-STA.
+    if (g_apScheduler && !g_schedulerStateCsvPath.empty()) {
+        std::map<Mac48Address, uint32_t> addrToIdx;
+        for (uint32_t i = 0; i < g_staIndexToMacs.size(); ++i) {
+            for (const auto& mac : g_staIndexToMacs[i]) {
+                addrToIdx[mac] = i;
+            }
+        }
+        g_apScheduler->SetStaIndexMap(addrToIdx);
+        g_apScheduler->EnableStateCsv(g_schedulerStateCsvPath, g_perStaMetricsRunLabel);
     }
 
     // ===== TRAFFIC CONTROL LAYER DROP TRACES =====

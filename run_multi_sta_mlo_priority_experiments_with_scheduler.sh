@@ -123,6 +123,10 @@ for DATA_RATE in "${DATA_RATES[@]}"; do
     CSV_MLO_PER_STA_TS="$OUTPUTS_DIR/mlo_multi_sta_per_sta_timeseries_${TIMESTAMP}.csv"
     rm -f "$CSV_MLO_PER_STA_TS"
 
+    # Per-flow scheduler state (score + link em uso por STA,AC) — para os gráficos score/link
+    CSV_MLO_SCHED_STATE="$OUTPUTS_DIR/mlo_multi_sta_sched_state_${TIMESTAMP}.csv"
+    rm -f "$CSV_MLO_SCHED_STATE"
+
     # Comparação sink (verdade) vs estimativa SÓ-AP das métricas de QoS (validação)
     CSV_MLO_METRIC_COMP="$OUTPUTS_DIR/mlo_multi_sta_metric_comparison_${TIMESTAMP}.csv"
     rm -f "$CSV_MLO_METRIC_COMP"
@@ -146,7 +150,7 @@ for DATA_RATE in "${DATA_RATES[@]}"; do
             echo "Running MLO Multi-STA: $NAME ($proto) @ $DATA_RATE per STA $OFDMA_LABEL..."
             OUTFILE="$OUTPUTS_DIR/mlo_multi_sta_${F1}_${F2}_${proto}_${TIMESTAMP}.txt"
             CSV_MLO_DECISIONS="$OUTPUTS_DIR/scheduler_decisions_${F1}_${F2}_${proto}_${TIMESTAMP}.csv"
-            ./ns3 run "scratch/wifi7-mlo-multi-sta-priority-sch --freq1=$F1 --freq2=$F2 --freq3=${F3:-0} --protocol=$proto --dataRate=$DATA_RATE --simTime=$SIM_TIME --staticSetup=true --enablePcaps=false --numStas=$NSTAS --staTrafficTypes=$STA_TRAFFIC_TYPES --queueOccupancyCsv=$CSV_MLO_QUEUE_OCC --linkTrafficCsv=$CSV_MLO_LINK_TRAFFIC$QUEUE_LABEL_ARG --queueSampleInterval=0.1 --linkTrafficSampleInterval=0.1 --useCustomMloScheduler=true --schedulerDecisionCsv=$CSV_MLO_DECISIONS --perStaMetricsCsv=$CSV_MLO_PER_STA_TS --metricComparisonCsv=$CSV_MLO_METRIC_COMP$APPS_SPEC_ARG" 2>&1 | tee "$OUTFILE"
+            ./ns3 run "scratch/wifi7-mlo-multi-sta-priority-sch --freq1=$F1 --freq2=$F2 --freq3=${F3:-0} --protocol=$proto --dataRate=$DATA_RATE --simTime=$SIM_TIME --staticSetup=true --enablePcaps=false --numStas=$NSTAS --staTrafficTypes=$STA_TRAFFIC_TYPES --queueOccupancyCsv=$CSV_MLO_QUEUE_OCC --linkTrafficCsv=$CSV_MLO_LINK_TRAFFIC$QUEUE_LABEL_ARG --queueSampleInterval=0.1 --linkTrafficSampleInterval=0.1 --useCustomMloScheduler=true --schedulerDecisionCsv=$CSV_MLO_DECISIONS --schedulerStateCsv=$CSV_MLO_SCHED_STATE --perStaMetricsCsv=$CSV_MLO_PER_STA_TS --metricComparisonCsv=$CSV_MLO_METRIC_COMP$APPS_SPEC_ARG" 2>&1 | tee "$OUTFILE"
 
             if [ ! -s "$OUTFILE" ]; then
                 echo "[WARN] Missing or empty output file, skipping post-processing: $OUTFILE"
@@ -536,6 +540,9 @@ PY
         fi
         if [ -f "$CSV_MLO_PER_STA_TS" ]; then
             "$PYTHON_BIN" "$BASE_DIR/generate_multi_sta_timeseries_plots.py" "$CSV_MLO_PER_STA_TS" "$PLOTS_DIR/Individual_plots_by_time" "$SCENARIO_TAG" "$OUTPUTS_DIR"
+        fi
+        if [ -f "$CSV_MLO_SCHED_STATE" ]; then
+            "$PYTHON_BIN" "$BASE_DIR/generate_multi_sta_score_link_timeseries_plots.py" "$CSV_MLO_SCHED_STATE" "$PLOTS_DIR/Individual_plots_by_time" "$SCENARIO_TAG" "$CSV_MLO_PER_STA_TS"
         fi
         
         echo "Plots/tables generated in: $PLOTS_DIR"

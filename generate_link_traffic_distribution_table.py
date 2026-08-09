@@ -30,24 +30,53 @@ def _parse_sta_traffic_types(sta_traffic_types_csv):
     return [_normalize_traffic_type(token) for token in str(sta_traffic_types_csv).split(",") if token.strip()]
 
 
-def _detect_switch_bucket(run_df):
-    """Instante (time_bucket_s) em que algum STA muda de AC (switch a meio). None se
-    não houver switch. Detetado como o 1º bucket em que o AC dominante de um STA muda."""
-    best = None
+def _detect_switch_info(run_df):
+    """Deteta switches de AC a meio da simulação, distinguindo-os de apps concorrentes.
+
+    Para cada STA, calcula a janela ativa [first, last] (buckets com frame_count>0) de cada
+    AC. Há **switch** sse dois ACs tiverem janelas ~disjuntas no tempo (um sai quando o outro
+    entra); se as janelas se sobrepõem (ex.: 'vo+be' concorrente), NÃO é switch — evita o
+    falso split causado pelo cruzamento do AC dominante durante o ramp-up.
+
+    Devolve dict: sta_id -> {"switch_t", "before_ac", "after_ac"}."""
+    ts = sorted(run_df["time_bucket_s"].dropna().unique())
+    dt = 1.0
+    if len(ts) >= 2:
+        diffs = sorted(ts[i + 1] - ts[i] for i in range(len(ts) - 1))
+        dt = float(diffs[len(diffs) // 2])
+    info = {}
     for sta_id, sdf in run_df.groupby("sta_id"):
         if sdf["ac"].nunique() < 2:
             continue
-        piv = sdf.pivot_table(index="time_bucket_s", columns="ac",
-                              values="frame_count", aggfunc="sum").fillna(0.0).sort_index()
-        if piv.empty:
+        windows = {}  # ac -> (first, last) dos buckets ativos
+        for ac, g in sdf.groupby("ac"):
+            act = g[g["frame_count"] > 0]["time_bucket_s"]
+            if not act.empty:
+                windows[str(ac)] = (float(act.min()), float(act.max()))
+        if len(windows) < 2:
             continue
-        dom = piv.idxmax(axis=1)
-        first = dom.iloc[0]
-        for t, a in dom.items():
-            if a != first:
-                best = float(t) if best is None else min(best, float(t))
+        ordered = sorted(windows.items(), key=lambda kv: kv[1][0])
+        found = None
+        for i in range(len(ordered)):
+            for j in range(len(ordered)):
+                if i == j:
+                    continue
+                a_ac, (a_first, a_last) = ordered[i]
+                b_ac, (b_first, b_last) = ordered[j]
+                if a_first < b_first and a_last <= b_first + dt:  # janelas ~disjuntas
+                    found = (a_ac, b_ac, b_first)
+                    break
+            if found:
                 break
-    return best
+        if not found:
+            continue  # janelas sobrepostas → apps concorrentes, não switch
+        before_ac, after_ac, after_first = found
+        info[sta_id] = {
+            "switch_t": after_first - dt / 2.0,
+            "before_ac": before_ac,
+            "after_ac": after_ac,
+        }
+    return info
 
 
 def _write_dist_table(handle, sub_df, title):
@@ -135,11 +164,22 @@ def generate_link_traffic_distribution_table(outputs_dir, scenario_name, table_o
                 handle.write("-" * 120 + "\n")
 
                 # Cenários de switch: dividir em fases (antes/depois da mudança de AC).
-                switch_t = _detect_switch_bucket(run_df) if has_bucket else None
-                if switch_t is not None:
-                    _write_dist_table(handle, run_df[run_df["time_bucket_s"] < switch_t],
+                switch_info = _detect_switch_info(run_df) if has_bucket else {}
+                if switch_info:
+                    switch_t = min(v["switch_t"] for v in switch_info.values())
+                    # Em cada fase, esconder o AC que não pertence a essa fase (para os
+                    # STAs que trocam): FASE 2 sem o AC "antes" (ex.: VO residual), FASE 1
+                    # sem o AC "depois". STAs sem switch não são filtrados.
+                    def _phase(df, drop_key):  # drop_key: "before_ac" ou "after_ac"
+                        mask = pd.Series(True, index=df.index)
+                        for sid, si in switch_info.items():
+                            mask &= ~((df["sta_id"] == sid) & (df["ac"].astype(str) == si[drop_key]))
+                        return df[mask]
+                    f1 = _phase(run_df[run_df["time_bucket_s"] < switch_t], "after_ac")
+                    f2 = _phase(run_df[run_df["time_bucket_s"] >= switch_t], "before_ac")
+                    _write_dist_table(handle, f1,
                                       f"FASE 1 (antes do switch, t < {switch_t:g}s)")
-                    _write_dist_table(handle, run_df[run_df["time_bucket_s"] >= switch_t],
+                    _write_dist_table(handle, f2,
                                       f"FASE 2 (após o switch, t >= {switch_t:g}s)")
                 else:
                     _write_dist_table(handle, run_df, None)

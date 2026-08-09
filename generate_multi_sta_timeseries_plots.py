@@ -69,30 +69,64 @@ def flow_label(sta_id: int, ac: str) -> str:
     return f"STA{sta_id} ({ac})"
 
 
-def detect_switch_times(df: pd.DataFrame):
-    """Instante real do switch de AC (≈ simTime/2). Detetado como o 1º instante em que
-    o AC "depois" fica ativo (throughput>1), menos meio intervalo de amostragem — porque
-    a amostra que contém o switch já apanha a app nova a meio dessa janela.
-    (Ex.: BE aparece em t=9 → switch = 9 − 0.5 = 8.5.)"""
-    times = set()
+def _median_dt(df: pd.DataFrame) -> float:
     ts = sorted(df["time_s"].dropna().unique())
-    dt = 1.0
     if len(ts) >= 2:
         diffs = sorted(ts[i + 1] - ts[i] for i in range(len(ts) - 1))
-        dt = float(diffs[len(diffs) // 2])  # mediana dos intervalos
+        return float(diffs[len(diffs) // 2])  # mediana dos intervalos
+    return 1.0
+
+
+def detect_switch_info(df: pd.DataFrame):
+    """Deteta switches de AC a meio da simulação, distinguindo-os de apps concorrentes.
+
+    Para cada STA, calcula a janela ativa [first_active, last_active] (throughput>1) de
+    cada AC. Há **switch** sse dois ACs tiverem janelas ~disjuntas no tempo (um sai quando
+    o outro entra); se as janelas se sobrepõem (ex.: 'vo+be' concorrente), NÃO é switch.
+
+    Devolve dict: sta_id -> {"switch_t": float, "before_ac": str, "after_ac": str}.
+    switch_t ≈ (1º instante do AC "depois") − dt/2  (ex.: BE aparece em t=9 → 8.5)."""
+    dt = _median_dt(df)
+    info = {}
     for sta_id, sdf in df.groupby("sta_id"):
         if sdf["ac"].nunique() < 2:
             continue
-        first_active = {}
+        windows = {}  # ac -> (first_active, last_active)
         for ac, g in sdf.groupby("ac"):
             act = g[g["throughput_mbps"] > 1.0]["time_s"]
             if not act.empty:
-                first_active[ac] = float(act.min())
-        if len(first_active) < 2:
+                windows[str(ac)] = (float(act.min()), float(act.max()))
+        if len(windows) < 2:
             continue
-        after_t = sorted(first_active.values())[1]  # o AC que fica ativo mais tarde
-        times.add(after_t - dt / 2.0)
-    return sorted(times)
+        # Ordena por início; procura o 1º par (a, b) com janelas ~disjuntas (a acaba antes de b começar).
+        ordered = sorted(windows.items(), key=lambda kv: kv[1][0])
+        found = None
+        for i in range(len(ordered)):
+            for j in range(len(ordered)):
+                if i == j:
+                    continue
+                a_ac, (a_first, a_last) = ordered[i]
+                b_ac, (b_first, b_last) = ordered[j]
+                # a sai (before) e b entra (after): a_last < b_first (com tolerância de 1 dt)
+                if a_first < b_first and a_last <= b_first + dt:
+                    found = (a_ac, b_ac, b_first)
+                    break
+            if found:
+                break
+        if not found:
+            continue  # janelas sobrepostas → apps concorrentes, não switch
+        before_ac, after_ac, after_first = found
+        info[sta_id] = {
+            "switch_t": after_first - dt / 2.0,
+            "before_ac": before_ac,
+            "after_ac": after_ac,
+        }
+    return info
+
+
+def detect_switch_times(info: dict):
+    """Instantes de switch (para os marcadores axvline), derivados de detect_switch_info."""
+    return sorted({v["switch_t"] for v in info.values()})
 
 
 def make_figure(df: pd.DataFrame, column: str, metric_title: str, ylabel: str,
@@ -106,7 +140,10 @@ def make_figure(df: pd.DataFrame, column: str, metric_title: str, ylabel: str,
 
     sta_ids = sorted(df["sta_id"].unique())
     sta_color = {sid: STA_COLORS[i % len(STA_COLORS)] for i, sid in enumerate(sta_ids)}
-    switch_times = detect_switch_times(df)
+    switch_info = detect_switch_info(df)
+    switch_times = detect_switch_times(switch_info)
+    dt = _median_dt(df)
+    trail = 1.5 * dt  # o AC "antes" prolonga-se ~1.5 amostras além do switch (mostra a saída)
 
     fig, axes = plt.subplots(len(pairs), 1, figsize=(12, 3.2 * len(pairs)),
                              sharex=True, sharey=False)
@@ -124,6 +161,17 @@ def make_figure(df: pd.DataFrame, column: str, metric_title: str, ylabel: str,
             g = g.sort_values("time_s")
             if g.empty:
                 continue
+            # Trim para STAs com switch: o AC "antes" acaba pouco após o switch,
+            # o AC "depois" só começa no switch — evita linhas planas a ~0.
+            sinfo = switch_info.get(sta_id)
+            if sinfo is not None:
+                ac_s = str(ac)
+                if ac_s == sinfo["before_ac"]:
+                    g = g[g["time_s"] <= sinfo["switch_t"] + trail]
+                elif ac_s == sinfo["after_ac"]:
+                    g = g[g["time_s"] >= sinfo["switch_t"]]
+                if g.empty:
+                    continue
             ls = AC_LINESTYLE.get(str(ac).strip().upper(), "-")
             line, = ax.plot(g["time_s"], g[column],
                             color=sta_color.get(sta_id, "#555555"),

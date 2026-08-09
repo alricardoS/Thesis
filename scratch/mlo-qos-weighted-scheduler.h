@@ -32,6 +32,7 @@
 #include "ns3/wifi-mac.h"
 #include "ns3/qos-txop.h"
 #include "ns3/wifi-mac-queue.h"
+#include "ns3/wifi-mac-queue-container.h"
 #include "ns3/wifi-tx-vector.h"
 #include "ns3/wifi-mode.h"
 
@@ -219,6 +220,11 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
 
     // ---- Configuration ----
     void EnableDecisionCsv(const std::string& filename, const std::string& nodeContext);
+    /// CSV de estado por-fluxo (score + link utilizado por (STA,AC)), amostrado ao
+    /// ritmo de UpdatePeriodicMetrics. Para os gráficos temporais score/link.
+    void EnableStateCsv(const std::string& filename, const std::string& runLabel);
+    /// Mapa endereço→índice de STA (MLD e link addrs), para logar o índice do STA.
+    void SetStaIndexMap(const std::map<Mac48Address, uint32_t>& m) { m_staIndex = m; }
     void SetWeights(AcIndex ac, double delay, double jitter, double loss, double tp);
     void SetTargets(AcIndex ac, double delayMs, double jitterMs, double lossRate, double tpMbps);
     /// Alias for SetTargets using AcGoals semantics
@@ -271,6 +277,24 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     // ---- Internal helpers ----
     static int GetFrequencyRank(int frequency);
     void EnsureDelegate();
+
+    /// Amarra fisicamente o fluxo (STA,AC) ao link decidido: bloqueia a fila
+    /// desse (STA,AC) em todos os links exceto chosenLink, via o reason
+    /// WIFI_SCHEDULER_ROUTING. Transforma a decisão de "sugestão" (o dequeue Fcfs
+    /// do delegate espalhava por todos os links) em "ordem". Ver README, secção
+    /// "Espalhamento STR e binding".
+    void EnforceRouting(AcIndex ac, const Mac48Address& dest, uint8_t chosenLink);
+
+    /// TIDs 802.11e associados a cada AC (BlockQueues de QoS data exige TIDs).
+    static std::set<uint8_t> AcToTids(AcIndex ac) {
+        switch (ac) {
+        case AC_VO: return {6, 7};
+        case AC_VI: return {4, 5};
+        case AC_BE: return {0, 3};
+        case AC_BK: return {1, 2};
+        default:    return {};
+        }
+    }
 
     /// Chaves broadcast/multicast (ex.: beacons) não são fluxos encaminhados
     /// por-STA e não devem contar como "residentes" de um link.
@@ -357,6 +381,7 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     /// Per-(destination STA MAC, AC) routing key for per-flow link assignment
     using StaAcKey = std::pair<Mac48Address, uint8_t>;
     std::map<StaAcKey, uint8_t> m_lastSelectedLink;
+    std::map<StaAcKey, uint8_t> m_boundLink; // link atualmente amarrado (via queue-blocking) — evita re-bloquear a cada frame
 
     // ---- Phase 1 state ----
     std::map<uint8_t, AcGoals>        m_goals;         // per AC (indexed by AcIndex cast to uint8)
@@ -452,6 +477,21 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     std::ofstream m_decisionCsv;
     std::string   m_nodeContext;
     bool          m_csvEnabled{false};
+
+    std::ofstream m_stateCsv;
+    std::string   m_stateRunLabel;
+    bool          m_stateCsvEnabled{false};
+    std::map<Mac48Address, uint32_t> m_staIndex; // endereço → índice de STA
+
+    static const char* AcShortName(uint8_t acIdx) {
+        switch (acIdx) {
+        case AC_VO: return "VO";
+        case AC_VI: return "VI";
+        case AC_BE: return "BE";
+        case AC_BK: return "BK";
+        default:    return "??";
+        }
+    }
 };
 
 // ===========================================================================
@@ -523,6 +563,7 @@ inline
 QosWeightedMloScheduler::~QosWeightedMloScheduler()
 {
     if (m_decisionCsv.is_open()) m_decisionCsv.close();
+    if (m_stateCsv.is_open()) m_stateCsv.close();
 }
 
 // ===========================================================================
@@ -628,6 +669,18 @@ QosWeightedMloScheduler::EnableDecisionCsv(const std::string& filename,
                          "EffectiveCapMbps,CapabilityScore,"
                          "AvgDelayMs,AvgJitterMs,PER,ChannelUtil,Throughput,"
                          "ProjCurrentLink\n";
+    }
+}
+
+inline void
+QosWeightedMloScheduler::EnableStateCsv(const std::string& filename,
+                                        const std::string& runLabel)
+{
+    m_stateCsvEnabled = true;
+    m_stateRunLabel   = runLabel;
+    m_stateCsv.open(filename, std::ios::out | std::ios::app);
+    if (m_stateCsv.is_open() && m_stateCsv.tellp() == std::streampos(0)) {
+        m_stateCsv << "run_label,time_s,sta_id,ac,link_id,link_freq,score\n";
     }
 }
 
@@ -1466,6 +1519,22 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
     // Balanceamento de recursos: espalhar carga para links vazios/homogéneos.
     RebalanceIdleLinks();
 
+    // ---- CSV de estado por-fluxo: score + link utilizado por (STA,AC) ----
+    if (m_stateCsvEnabled && m_stateCsv.is_open()) {
+        for (const auto& [key, link] : m_lastSelectedLink) {
+            if (!IsRoutableSta(key.first)) continue; // ignora beacons/broadcast
+            auto sit = m_staIndex.find(key.first);
+            if (sit == m_staIndex.end()) continue;   // sem índice conhecido → salta
+            double score = m_currentSatisfaction.count(key)
+                               ? m_currentSatisfaction.at(key).index : 0.0;
+            int freq = (link < m_freqs.size()) ? m_freqs[link] : 0;
+            m_stateCsv << m_stateRunLabel << ',' << now << ',' << sit->second << ','
+                       << AcShortName(key.second) << ',' << +link << ','
+                       << freq << ',' << score << '\n';
+        }
+        m_stateCsv.flush();
+    }
+
     m_lastPeriodicUpdateTime = now;
     m_updateEvent = Simulator::Schedule(
         Seconds(m_metricsIntervalSec),
@@ -1587,12 +1656,51 @@ QosWeightedMloScheduler::GetLinkIds(AcIndex ac, Ptr<const WifiMpdu> mpdu,
                                      const std::list<WifiQueueBlockedReason>& ignoredReasons)
 {
     EnsureDelegate();
-    const auto eligible = m_delegate->GetLinkIds(ac, mpdu, ignoredReasons);
+    // Ignora o NOSSO próprio reason de routing ao apurar os links elegíveis: a
+    // decisão tem de "ver" todos os links fisicamente utilizáveis, senão, uma vez
+    // amarrado o fluxo, os outros links ficariam ocultos e a migração congelava.
+    // O binding (EnforceRouting) só restringe o DEQUEUE físico, não a decisão.
+    std::list<WifiQueueBlockedReason> ir(ignoredReasons);
+    ir.push_back(WifiQueueBlockedReason::WIFI_SCHEDULER_ROUTING);
+    const auto eligible = m_delegate->GetLinkIds(ac, mpdu, ir);
     if (eligible.empty()) return {};
     Mac48Address dest = (mpdu && !mpdu->GetHeader().GetAddr1().IsBroadcast())
                           ? mpdu->GetHeader().GetAddr1()
                           : Mac48Address("ff:ff:ff:ff:ff:ff");
-    return {DecideLinkMigration(ac, dest, eligible)};
+    uint8_t chosen = DecideLinkMigration(ac, dest, eligible);
+    // Torna a decisão vinculativa: amarra o (STA,AC) ao link escolhido.
+    if (IsRoutableSta(dest)) {
+        EnforceRouting(ac, dest, chosen);
+    }
+    return {chosen};
+}
+
+inline void
+QosWeightedMloScheduler::EnforceRouting(AcIndex ac, const Mac48Address& dest, uint8_t chosenLink)
+{
+    StaAcKey key{dest, static_cast<uint8_t>(ac)};
+    auto it = m_boundLink.find(key);
+    if (it != m_boundLink.end() && it->second == chosenLink) {
+        return; // já amarrado a este link — nada a fazer (evita trabalho por-frame)
+    }
+
+    EnsureDelegate();
+    if (!GetMac()) return;
+    const Mac48Address apAddr = GetMac()->GetAddress(); // TA = MLD do AP (obrigatório p/ InitQueueInfo popular a mask)
+    const std::set<uint8_t> tids = AcToTids(ac);
+    const std::list<WifiContainerQueueType> types{WIFI_QOSDATA_QUEUE};
+
+    // Para cada link físico: bloqueia se != chosenLink, desbloqueia o escolhido.
+    for (uint8_t link : m_linksByRank) {
+        if (link == chosenLink) {
+            m_delegate->UnblockQueues(WifiQueueBlockedReason::WIFI_SCHEDULER_ROUTING,
+                                      ac, types, dest, apAddr, tids, {link});
+        } else {
+            m_delegate->BlockQueues(WifiQueueBlockedReason::WIFI_SCHEDULER_ROUTING,
+                                    ac, types, dest, apAddr, tids, {link});
+        }
+    }
+    m_boundLink[key] = chosenLink;
 }
 
 inline void
@@ -1748,6 +1856,7 @@ QosWeightedMloScheduler::DoDispose()
     m_metrics.clear();
     m_delegate = nullptr;
     if (m_decisionCsv.is_open()) m_decisionCsv.close();
+    if (m_stateCsv.is_open()) m_stateCsv.close();
     WifiMacQueueScheduler::DoDispose();
 }
 

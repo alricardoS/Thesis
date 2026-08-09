@@ -493,9 +493,21 @@ O espalhamento só acontece quando fluxos da **mesma AC** estão separados por l
 
 Da mesma forma, o **bootstrap parece "vinculativo"** (link rápido a 0% para os BE) só porque **todos** os fluxos aconselham o **mesmo** link — o outro nunca pede acesso a essa AC. A "regra" vem da ausência de contenção, não de o binding ser aplicado.
 
-### Como se tornaria vinculativo (não implementado)
+### O espalhamento é uma interação natural do MLO em modo STR
 
-Seria preciso pôr **máscaras de bloqueio no delegate** (`m_delegate->BlockQueues`) para bloquear a fila de cada (STA, TID) nos links não-escolhidos — o único mecanismo que o `GetNext` do delegate respeita — o que exigiria **uma razão de bloqueio nova no enum do core** do ns-3 (todas as existentes são geridas pelo MAC). Não foi implementado: o espalhamento **satisfaz todos os STAs** e é, na prática, **agregação de links MLO legítima**. Forçar o binding limpo poria o BE sozinho no 2.4GHz no **limite** da capacidade, com risco de piorar as métricas e introduzir ping-pong.
+Antes de o ver como um "defeito", vale a pena reconhecer que este espalhamento é um **comportamento natural e importante do MLO em modo STR** (Simultaneous Transmit and Receive). Com **filas partilhadas por-AC** e **CSMA independente por link**, qualquer link livre pode servir o frame *head-of-line* dessa AC — distribuindo naturalmente o tráfego de um mesmo fluxo pelos vários links disponíveis. É, na prática, **agregação de links legítima**: satisfaz todos os STAs e aproveita a capacidade agregada. O contraste **VO (100% num link) vs VI (50/50)** explica-se só por isto: o VO aconselha sempre o mesmo link → o outro nunca ativa o loop de acesso à AC VO; os VI ficaram separados por links → **ambos** os `Txop`-VI ativos → o Fcfs alimenta os dois.
+
+### Como se tornou vinculativo (implementado — binding por queue-blocking)
+
+Para os cenários em que **queremos** que a decisão seja uma **ordem** (sem espalhamento), o scheduler amarra fisicamente cada fluxo ao link decidido através de **máscaras de bloqueio no delegate** — o único mecanismo que o `GetNext` do delegate respeita:
+
+- **`EnforceRouting(ac, dest, chosenLink)`** (`mlo-qos-weighted-scheduler.h`), chamado no fim de `GetLinkIds`: para o (STA, AC), faz `m_delegate->BlockQueues(WIFI_SCHEDULER_ROUTING, …)` em **todos os links exceto** o escolhido e `UnblockQueues` no escolhido. A fila desse (STA, AC) fica com um bit de máscara ativo nos links errados → `GetNext(ac, linkId)` **salta-a** aí → o frame só é servido no link decidido. Sem espalhamento.
+- Usa um **reason novo, `WIFI_SCHEDULER_ROUTING`**, adicionado ao enum `WifiQueueBlockedReason` do **core** do ns-3 (todas as razões existentes são geridas pela MAC e seriam limpas por ela). Ver a secção [Alterações ao core do ns-3](#alterações-ao-core-do-ns-3).
+- Detalhes que fazem isto funcionar: o container de QoS data unicast é chaveado por `(WIFI_QOSDATA_QUEUE, UNICAST, RA=endereço-MLD-do-STA, tid)` — coincide com o `dest` que o scheduler já usa; o `BlockQueues` é chamado com `txAddress = GetMac()->GetAddress()` (endereço MLD do AP), **condição para o `InitQueueInfo` popular a máscara por-link**; e bloqueiam-se os 2 TIDs da AC.
+- Para não congelar a migração, o `GetLinkIds` apura os links elegíveis **ignorando o próprio `WIFI_SCHEDULER_ROUTING`** — a decisão continua a "ver" todos os links; o binding só restringe o **dequeue físico**, não a decisão.
+- `m_boundLink[(STA,AC)]` guarda o link amarrado; só se re-bloqueia quando a decisão **muda** (evita trabalho por-frame). Numa migração, reamarra no mesmo passo (bloqueia o antigo, desbloqueia o novo).
+
+> **Trabalho futuro — reexplorar o espalhamento.** O binding elimina o espalhamento por defeito, mas o espalhamento STR é um mecanismo **desejável** a explorar (aproveitamento de capacidade agregada por-fluxo). Fica como trabalho futuro poder **reativá-lo seletivamente** (ex.: por AC, ou quando o link-alvo está saturado) — existe um plano próprio para essa interação.
 
 ---
 
@@ -633,6 +645,24 @@ Análise honesta do estado atual. Nada aqui impede os cenários testados de conv
 
 13. **Cobertura de teste.** Validado em cenários de **4 STAs** (2VO+1VI+1BE, 2VO+2VI, 1VO+1VI+1BE+1BK, all-BE) × **3 pares de frequências** (2.4+5, 2.4+6, 5+6), com tráfego UDP saturante de 150 Mbps por STA e STAs estáticos. Fora deste envelope — mais links, mais STAs, mobilidade, tráfego variável, TCP — não há garantias. Vários mecanismos (bootstrap, vetos, balanceamento) assumem implicitamente **exatamente 2 links**.
 
-14. **O binding é consultivo, não vinculativo.** A decisão por (STA, AC) só enviesa o **pedido de acesso ao canal** no enqueue; o **dequeue** é feito pelo delegate Fcfs, que serve qualquer STA em qualquer link com acesso. Por isso a distribuição física observada por-fluxo **pode usar ambos os links** em simultâneo (medido no all-BE). Ver [Conselho vs. execução](#conselho-enqueue-vs-execução-dequeue-porque-o-all-be-usa-os-dois-links).
+14. **~~O binding é consultivo, não vinculativo.~~ RESOLVIDO — binding vinculativo via queue-blocking.** Historicamente, a decisão por (STA, AC) só enviesava o **pedido de acesso ao canal** no enqueue e o **dequeue** (delegate Fcfs) servia qualquer STA em qualquer link com acesso → a distribuição física por-fluxo **usava ambos os links** (o espalhamento STR, medido no all-BE e nos VI do S5). **Agora** o `EnforceRouting` amarra cada (STA, AC) ao link decidido, bloqueando a sua fila nos outros links (reason `WIFI_SCHEDULER_ROUTING`) → as decisões são **ordens** e não há espalhamento. Ver [Conselho vs. execução → Como se tornou vinculativo](#como-se-tornou-vinculativo-implementado--binding-por-queue-blocking) e [Alterações ao core do ns-3](#alterações-ao-core-do-ns-3).
 
-    > **Consequência importante (mudar a decisão NÃO muda o físico).** Como o dequeue é Fcfs, **alterar** o `m_lastSelectedLink` de um fluxo (via migração, balanceador, etc.) **não** altera a distribuição física se o outro link estiver ativo para essa AC. Caso concreto medido (cenário de *switch* 2VO+2VI→2BE+2VI, fase 2): tentou-se uma **"expulsão considerada"** — mover o VI que partilhava o 2.4GHz com os BEs para o 5GHz. A **decisão** ficou perfeita (VI 100% no 5GHz no log de decisões), mas o **físico manteve o VI ~40% no 2.4GHz** (constante, não transiente) porque o 2.4GHz — ocupado a servir os BEs — continua a puxar frames de VI da fila partilhada. Resultado: o **BE continuou esfomeado (~19 Mbps)**. *(Este mecanismo de expulsão foi por isso revertido.)* **Fixar isto exige binding vinculativo** (ex.: `BlockQueues` no delegate para bloquear a fila de cada (STA,TID) nos links não-escolhidos), que precisa de uma **razão de bloqueio nova no core do ns-3** — trabalho adiado.
+    > **Nota histórica (mudar a decisão NÃO mudava o físico).** Antes do binding, **alterar** o `m_lastSelectedLink` (via migração, balanceador, etc.) **não** alterava a distribuição física se o outro link estivesse ativo para essa AC. Caso concreto: no *switch* 2VO+2VI→2BE+2VI (fase 2), a "expulsão considerada" (mover o VI que partilhava o 2.4GHz com os BEs para o 5GHz) deu **decisão** perfeita mas **físico com VI ~40% no 2.4GHz** (BE esfomeado a ~19 Mbps), porque o 2.4GHz continuava a puxar VI da fila partilhada. Com o binding atual este problema deixa de existir — a fila de VI fica bloqueada no 2.4GHz e o dequeue só ocorre no 5GHz.
+    >
+    > **O espalhamento STR continua a ser desejável** enquanto mecanismo de agregação por-fluxo; fica como trabalho futuro poder reativá-lo seletivamente (ver a nota "Trabalho futuro" na secção de binding).
+
+---
+
+## Alterações ao core do ns-3
+
+Este projeto vive quase inteiramente em `scratch/`, mas o **binding vinculativo** (limitação #14, resolvida) obrigou a **uma** alteração ao core do ns-3. Todas as linhas alteradas estão marcadas com o comentário **`// I CHANGED HERE`** para fácil rastreio.
+
+| Ficheiro | O quê | Porquê |
+|---|---|---|
+| `src/wifi/model/wifi-mac-queue-scheduler.h` | Novo valor `WIFI_SCHEDULER_ROUTING` no `enum class WifiQueueBlockedReason` (antes de `REASONS_COUNT`) + o `case` correspondente no `operator<<`. | O `EnforceRouting` precisa de uma **razão de bloqueio própria** para amarrar cada (STA, AC) a um link. Todas as razões existentes (`WAITING_ADDBA_RESP`, `POWER_SAVE_MODE`, `USING_OTHER_EMLSR_LINK`, `WAITING_EMLSR_TRANSITION_DELAY`, `TID_NOT_MAPPED`) são **geridas pela MAC**, que as poria/limparia por conta própria, entrando em conflito com o nosso uso. A razão nova é gerida **exclusivamente** pelo scheduler. |
+
+**Impacto**: acrescentar um valor ao enum aumenta em 1 bit a `Mask = std::bitset<REASONS_COUNT>` de cada container-queue — obriga a **recompilar o módulo wifi** (`./ns3 build`), sem alterar comportamento de nenhum mecanismo existente.
+
+**Como reverter**: remover as 3 linhas marcadas com `// I CHANGED HERE` em `src/wifi/model/wifi-mac-queue-scheduler.h` e o `EnforceRouting`/`WIFI_SCHEDULER_ROUTING` no `scratch/mlo-qos-weighted-scheduler.h`. Sem a razão nova, o scheduler volta ao modo consultivo (com espalhamento STR).
+
+**Localizar as alterações**: `grep -rn "I CHANGED HERE" src/`.
