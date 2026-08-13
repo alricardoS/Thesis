@@ -285,11 +285,19 @@ if (m_hasMeasuredSat.count(staAcKey) == 0) {
 }
 ```
 
-### Passo 2 — `STAY_SATISFIED`
+### Passo 2 — `STAY_SATISFIED` (+ expulsão considerada)
 
 ```
-se currentSat >= StayThreshold E há âncora:  fica, sem avaliar nada.
+se currentSat >= StayThreshold E há âncora:
+    se (VO/VI) E há BE/BK no link atual E existe link LIMPO com capacidade:
+        MIGRATE_CONSIDERATE_EVICT  → migra p/ esse link (deixa o atual aos BE/BK)
+    senão:
+        STAY_SATISFIED             → fica, sem avaliar mais nada.
 ```
+
+**Expulsão considerada.** Um VO/VI **satisfeito** que partilha o link atual com **BE/BK** está a esfomeá-los por EDCA (regra: BE/BK nunca coexistem bem com VO/VI). Se existir um link **limpo** (sem BE/BK residente) com **capacidade** para toda a procura de alta-prioridade que lá ficaria, o VO/VI **migra para lá** — mesmo sem melhorar a sua própria satisfação — libertando o link atual para os BE/BK. Implementado por `FindConsiderateEvictTarget`, que usa `estimatedCapacity ≥ Σ(procura VO/VI)` (**capacidade medida**, *não* a projeção `MeetsOwnGoals`, que é pessimista por causa da penalidade de co-ocupação e classificaria mal o link-alvo). Migração **imediata** (sem dwell): a condição é estável e o `EnforceRouting` (binding) torna a decisão **efetiva** no físico — só por isso este mecanismo funciona agora (ver limitação #14).
+
+- **Sem ping-pong / seguro**: só dispara para VO/VI com BE/BK no link atual E um alvo limpo com espaço. Depois de mover, o novo link não tem BE/BK → não volta a disparar. Se nenhum alvo limpo couber, fica em `STAY_SATISFIED` (preserva o caso legítimo em que o VO/VI **tem** de partilhar com o BE — `CAT2_PRIORITY_OVERRIDE`).
 
 ### Passo 3 — Cascata explícita de três categorias
 
@@ -596,6 +604,7 @@ Valores possíveis de `Decision`:
 |---|---|
 | `BOOTSTRAP_PRIORITY` | Alocação forçada por prioridade (ainda em warmup) |
 | `STAY_SATISFIED` | `currentSat >= StayThreshold` — nem avaliou alternativas |
+| `MIGRATE_CONSIDERATE_EVICT` | VO/VI satisfeito saiu de um link partilhado com BE/BK para um link limpo com capacidade (ver [Passo 2](#passo-2--stay_satisfied--expulsão-considerada)) |
 | `STAY_HYSTERESIS` | Avaliou, mas o ganho não compensa (ou o melhor link é o atual) |
 | `STAY_BEST` | Ficou no melhor link, sem âncora prévia |
 | `MIGRATE_PENDING` | **Quer** migrar; a aguardar confirmação do dwell (1 s) |
@@ -647,7 +656,7 @@ Análise honesta do estado atual. Nada aqui impede os cenários testados de conv
 
 14. **~~O binding é consultivo, não vinculativo.~~ RESOLVIDO — binding vinculativo via queue-blocking.** Historicamente, a decisão por (STA, AC) só enviesava o **pedido de acesso ao canal** no enqueue e o **dequeue** (delegate Fcfs) servia qualquer STA em qualquer link com acesso → a distribuição física por-fluxo **usava ambos os links** (o espalhamento STR, medido no all-BE e nos VI do S5). **Agora** o `EnforceRouting` amarra cada (STA, AC) ao link decidido, bloqueando a sua fila nos outros links (reason `WIFI_SCHEDULER_ROUTING`) → as decisões são **ordens** e não há espalhamento. Ver [Conselho vs. execução → Como se tornou vinculativo](#como-se-tornou-vinculativo-implementado--binding-por-queue-blocking) e [Alterações ao core do ns-3](#alterações-ao-core-do-ns-3).
 
-    > **Nota histórica (mudar a decisão NÃO mudava o físico).** Antes do binding, **alterar** o `m_lastSelectedLink` (via migração, balanceador, etc.) **não** alterava a distribuição física se o outro link estivesse ativo para essa AC. Caso concreto: no *switch* 2VO+2VI→2BE+2VI (fase 2), a "expulsão considerada" (mover o VI que partilhava o 2.4GHz com os BEs para o 5GHz) deu **decisão** perfeita mas **físico com VI ~40% no 2.4GHz** (BE esfomeado a ~19 Mbps), porque o 2.4GHz continuava a puxar VI da fila partilhada. Com o binding atual este problema deixa de existir — a fila de VI fica bloqueada no 2.4GHz e o dequeue só ocorre no 5GHz.
+    > **Nota histórica (mudar a decisão NÃO mudava o físico).** Antes do binding, **alterar** o `m_lastSelectedLink` (via migração, balanceador, etc.) **não** alterava a distribuição física se o outro link estivesse ativo para essa AC. Caso concreto: no *switch* 2VO+2VI→2BE+2VI (fase 2), a "expulsão considerada" (mover o VI que partilhava o 2.4GHz com os BEs para o 5GHz) deu **decisão** perfeita mas **físico com VI ~40% no 2.4GHz** (BE esfomeado a ~19 Mbps), porque o 2.4GHz continuava a puxar VI da fila partilhada. Com o binding atual este problema deixa de existir — a fila de VI fica bloqueada no 2.4GHz e o dequeue só ocorre no 5GHz. **A expulsão considerada foi por isso reintroduzida** (ver [Passo 2](#passo-2--stay_satisfied--expulsão-considerada)) e **agora converge fisicamente**: o VI que partilha o 2.4GHz com os BEs migra para o 5GHz (onde cabe com o outro VI) e o 2.4GHz fica livre para os 2 BEs.
     >
     > **O espalhamento STR continua a ser desejável** enquanto mecanismo de agregação por-fluxo; fica como trabalho futuro poder reativá-lo seletivamente (ver a nota "Trabalho futuro" na secção de binding).
 

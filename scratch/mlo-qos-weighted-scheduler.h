@@ -324,6 +324,14 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     // ---- Phase 5+6: Migration Decision Engine ----
     /// Number of OTHER STAs of the same AC already assigned to linkId
     uint32_t CountCoResidents(AcIndex ac, const Mac48Address& sta, uint8_t linkId) const;
+    /// Expulsão considerada: um VO/VI satisfeito que partilha o link atual com
+    /// BE/BK deve migrar para um link LIMPO (sem BE/BK) que tenha CAPACIDADE para
+    /// toda a procura de alta-prioridade que lá ficaria. Devolve esse link (o de
+    /// melhor rank) ou 255 se nenhum servir. Usa capacidade medida (não a
+    /// projeção pessimista de MeetsOwnGoals).
+    uint8_t FindConsiderateEvictTarget(AcIndex ac, const Mac48Address& sta,
+                                       uint8_t currentLink,
+                                       const std::list<uint8_t>& eligibleLinks) const;
     /// Expected QoS satisfaction if (STA, AC) were placed on linkId
     double ComputeExpectedQosSatisfaction(AcIndex ac, const Mac48Address& sta, uint8_t linkId) const;
     /// Returns true if any link can meet goals for (STA, AC)
@@ -1177,6 +1185,46 @@ QosWeightedMloScheduler::CountCoResidents(AcIndex ac, const Mac48Address& sta,
     return count;
 }
 
+inline uint8_t
+QosWeightedMloScheduler::FindConsiderateEvictTarget(
+    AcIndex ac, const Mac48Address& sta, uint8_t currentLink,
+    const std::list<uint8_t>& eligibleLinks) const
+{
+    const uint8_t acIdx = static_cast<uint8_t>(ac);
+    // Procura real deste fluxo (throughput medido; fallback ao objetivo do AC).
+    auto demandOf = [this](const StaAcKey& k) -> double {
+        auto qit = m_staQos.find(k);
+        if (qit != m_staQos.end() && qit->second.valid && qit->second.tpMbps > 0.0)
+            return qit->second.tpMbps;
+        auto git = m_goals.find(k.second);
+        return (git != m_goals.end()) ? git->second.targetThroughputMbps : 0.0;
+    };
+    const double demandSelf = demandOf({sta, acIdx});
+
+    uint8_t best = 255;
+    int bestRank = 1000;
+    for (uint8_t T : eligibleLinks) {
+        if (T == currentLink) continue;
+        bool clean = true;
+        double hpDemand = demandSelf; // procura de alta-prioridade que ficaria em T (inclui este fluxo)
+        for (const auto& [key, resLink] : m_lastSelectedLink) {
+            if (!IsRoutableSta(key.first)) continue; // ignora beacons/broadcast
+            if (resLink != T) continue;
+            if (key.second < static_cast<uint8_t>(AC_VI)) { clean = false; break; } // BE/BK em T
+            hpDemand += demandOf(key); // residente VO/VI em T
+        }
+        if (!clean) continue;
+        // Capacidade TOTAL medida do link vs procura total de alta-prioridade.
+        double capT = 0.0;
+        auto cit = m_linkCapability.find(T);
+        if (cit != m_linkCapability.end()) capT = cit->second.estimatedCapacityMbps;
+        if (capT + 1e-9 < hpDemand) continue; // não cabe
+        int r = LinkRankPos(T);
+        if (r < bestRank) { bestRank = r; best = T; } // preferir o melhor rank
+    }
+    return best;
+}
+
 inline bool
 QosWeightedMloScheduler::AnyLinkMeetsGoals(AcIndex ac, const Mac48Address& sta,
                                              const std::list<uint8_t>& links) const
@@ -1292,7 +1340,31 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
 
     if (!useBootstrap) {
     if (currentSat >= m_stayThreshold && hasAnchor) {
-        decision = "STAY_SATISFIED";
+        // Expulsão considerada: um VO/VI satisfeito que partilha o link atual com
+        // BE/BK esfomeia-os por EDCA. Se existir um link LIMPO (sem BE/BK) com
+        // capacidade para toda a procura de alta-prioridade, migra para lá — mesmo
+        // sem melhorar a própria satisfação — deixando o link atual aos BE/BK.
+        // (Só possível porque o binding/EnforceRouting torna a decisão efetiva.)
+        bool isHighPrio = (acIdx >= static_cast<uint8_t>(AC_VI));
+        bool bebkOnCur = false;
+        if (isHighPrio) {
+            for (const auto& [key, resLink] : m_lastSelectedLink) {
+                if (!IsRoutableSta(key.first)) continue; // ignora beacons/broadcast
+                if (resLink == currentLink && key.second < static_cast<uint8_t>(AC_VI)) {
+                    bebkOnCur = true;
+                    break;
+                }
+            }
+        }
+        uint8_t evT = (isHighPrio && bebkOnCur)
+                          ? FindConsiderateEvictTarget(ac, sta, currentLink, eligibleLinks)
+                          : 255;
+        if (evT != 255 && evT != currentLink) {
+            selectedLink = evT;
+            decision = "MIGRATE_CONSIDERATE_EVICT"; // migração imediata (condição estável)
+        } else {
+            decision = "STAY_SATISFIED";
+        }
     } else {
         uint8_t bestCat1Link = 0; double bestCat1Score = -1.0; bool hasCat1 = false;
         uint8_t bestCat2Link = 0; double bestCat2Score = -1.0; bool hasCat2 = false;

@@ -31,17 +31,17 @@ APPEND_TIMESTAMP="${APPEND_TIMESTAMP:-false}"
 # ============================================================================
 SCENARIOS=(
   # --- Dualband (Fase A) ---
-  #"S1_base_1vo1vi1be1bk|dual|vo;vi;be;bk"
+  "S1_base_1vo1vi1be1bk|dual|vo;vi;be;bk"
   #"S2_scale8_2each|dual|vo;vo;vi;vi;be;be;bk;bk X"
-  #"S4_concurrent_mixed|dual|vo+be;vo+be;vi+bk;vi+vo"
+  "S4_concurrent_mixed|dual|vo+be;vo+be;vi+bk;vi+vo"
   "S5_switch_2vo2vi_vo2be|dual|vo>be;vo>be;vi;vi"
-  #"S3_scale8_4VO_2VI_2BE|dual|vo;vo;vo;vo;vi;vi;be;be"
+  "S3_scale8_4VO_2VI_2BE|dual|vo;vo;vo;vo;vi;vi;be;be"
 
   # --- Triband (Fase B — scheduler N-link ativo; 3 links 2.4+5+6) ---
-  #"S6_tri_base_4ac_2VO_1VI_1BE|tri|vo;vo;vi;be"
-  #"S7_tri_base_4ac_1VO_1VI_2BE|tri|vo;vi;be;be"
+  "S6_tri_base_4ac_2VO_1VI_1BE|tri|vo;vo;vi;be"
+  "S7_tri_base_4ac_1VO_1VI_2BE|tri|vo;vi;be;be"
   "S8_tri_switch_allBE2_2VO_2VI|tri|be>vo;be>vo;be>vi;be>vi"
-  #"S9_tri_concurrent8|tri|vo+be+vi;vi+bk;vo;vi;be;bk;vo+bk;vi+be"
+  "S9_tri_concurrent8|tri|vo+be+vi;vi+bk;vo;vi;be;bk;vo+bk;vi+be"
   
   #"S7_tri_scale8|tri|vo;vo;vi;vi;be;be;bk;bk X"
   #"S8_tri_concurrent8|tri|vo+be;vi+bk;vo;vi;be;bk;vo+bk;vi+be X"
