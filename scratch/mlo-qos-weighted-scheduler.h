@@ -1720,6 +1720,13 @@ QosWeightedMloScheduler::RebalanceIdleLinks()
         double capT = targetEmpty ? NominalCapByFreq(freqT)
                                   : m_linkCapability[T].estimatedCapacityMbps;
         double spare = capT - linkLoad(T);
+        // Escolhe o fluxo de MENOR prioridade EDCA GLOBALMENTE — varre todas as
+        // fontes válidas antes de decidir. Assim o VO (rank 3) só é movido quando
+        // nenhum AC de menor prioridade (VI/BE/BK) pode preencher o link ocioso;
+        // não está "preso" ao melhor link, é apenas o último recurso.
+        StaAcKey best{};
+        int bestRank = 99;
+        bool found = false;
         for (uint8_t S : m_linksByRank) {
             if (S == T) continue;
             if (flowsByLink[S].size() < 2) continue;  // não esvaziar a fonte
@@ -1727,12 +1734,8 @@ QosWeightedMloScheduler::RebalanceIdleLinks()
             // Evita sobre-migração para um link vazio capaz (ex.: all-BE @ 5+6).
             if (flowsByLink[S].size() <= flowsByLink[T].size() + 1) continue;
 
-            StaAcKey best{};
-            int bestRank = 99;
-            bool found = false;
             for (const auto& key : flowsByLink[S]) {
                 uint8_t acIdx = key.second;
-                if (acIdx == static_cast<uint8_t>(AC_VO)) continue;  // voz pinada no melhor link
                 if (cls != -1 && acIdx != static_cast<uint8_t>(cls)) continue; // alvo homogéneo
                 double lastBal = m_lastFlowBalanceSec.count(key)
                                      ? m_lastFlowBalanceSec.at(key) : -1e9;
@@ -1747,12 +1750,12 @@ QosWeightedMloScheduler::RebalanceIdleLinks()
                 int r = edcaRank(acIdx);
                 if (r < bestRank) { bestRank = r; best = key; found = true; }
             }
-            if (found) {
-                m_lastSelectedLink[best] = T;
-                m_lastFlowBalanceSec[best] = now;
-                m_lastRebalanceSec = now;
-                return;  // um movimento por janela
-            }
+        }
+        if (found) {
+            m_lastSelectedLink[best] = T;
+            m_lastFlowBalanceSec[best] = now;
+            m_lastRebalanceSec = now;
+            return;  // um movimento por janela
         }
     }
 }

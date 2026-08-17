@@ -449,7 +449,7 @@ This is the subtlest mechanism, and worth understanding in detail.
 - **Mechanism** (in `UpdatePeriodicMetrics`, one move per window):
   1. **Gate**: **all** routable flows satisfied (`curSat ≥ StayThreshold`). If any is not, the cascade is rescuing it → do not balance.
   2. **Homogeneous target**: a flow is only moved to a link that is **empty** or that **contains only flows of the same AC** as the candidate.
-  3. It moves the **lowest EDCA-priority** flow (non-VO — voice is pinned) from a link with ≥2 flows, **and only if it reduces the imbalance** (`flows(source) > flows(target)+1`).
+  3. It moves the **globally lowest EDCA-priority** flow — scanning **all** valid source links before deciding — from a link with ≥2 flows, **and only if it reduces the imbalance** (`flows(source) > flows(target)+1`). VO is no longer pinned: it is simply the **last resort**, moved only when no lower-priority AC (VI/BE/BK) can fill the idle link. *(Selecting globally, rather than returning on the first source that yields a candidate, is what keeps a VO on the fast link while a VI fills the idle 2.4 GHz — e.g. tri-band 2VO+2VI → 2VO@6, 1VI@5, 1VI@2.4.)*
   4. **Target order: best → worst.** The **highest-quality link is preferred first** (e.g. 5 GHz before 2.4 GHz); only when it fills up is the next one considered. (It used to be worst → best.)
   5. **Headroom test (fill up to real capacity):** `headroom ≥ targetThroughput` is required for **any** candidate, using a **reliable capacity** per link — the **measured** one when the target already carries traffic, and the **per-band nominal** (`NominalCapByFreq`: 2.4→150, 5→400, 6→500 Mbps) when it is **idle** (an empty link's capacity is not measurable). Since the nominal ≥ demand in every band, the **1st flow always enters**; only the **excess** is limited — 2.4 GHz holds 1 VI, 5 GHz holds 2, etc.
 
@@ -656,7 +656,7 @@ An honest analysis of the current state. Nothing here prevents the tested scenar
 
 10. **The 1 s dwell is coupled to the measurement interval.** It was chosen to guarantee an intent survives ≥ 1 new window. If `MetricsInterval` or the `FeedStaQos` cadence (1 s) changes, the dwell must be re-evaluated.
 
-11. **Balancing — voice pinned.** `RebalanceIdleLinks` **never moves VO** (voice stays on the best link, being the most delay-sensitive). Consequence: in an all-VO scenario the VOs do not spread to an empty link. A conservative choice; relaxing it is trivial (remove the `acIdx == AC_VO` guard).
+11. **~~Balancing — voice pinned.~~ RESOLVED — VO is moved last, not never.** `RebalanceIdleLinks` used to **never move VO** (voice pinned to the best link). It now selects the **globally lowest EDCA-priority** flow across all sources, so VO participates in balancing but is only moved when no lower-priority AC (VI/BE/BK) can fill the idle link — including the all-VO case, where the VOs now spread to empty links by capacity. In mixed scenarios the practical effect is small (VO is naturally the last to move).
 
 12. **Balancing — an empty link receives the 1st flow unconditionally.** An idle link's capacity **is not measurable** (`estimatedCapacity = goodput/airtime` needs traffic → it is 0 if never used, or stale if used early). Hence the 1st flow enters with no capacity test — it takes the whole link — and reliance is placed on the **next window's measurement** (to decide on a 2nd) and on the **cascade's self-correction** (which pulls it back if the link really is weak). Without this, the `headroom ≥ target` test would always block the 1st migration.
 
