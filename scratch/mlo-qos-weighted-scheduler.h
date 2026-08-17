@@ -285,6 +285,12 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     /// "Espalhamento STR e binding".
     void EnforceRouting(AcIndex ac, const Mac48Address& dest, uint8_t chosenLink);
 
+    /// Capacidade NOMINAL por banda (Mbps) — fiável para links OCIOSOS, cuja
+    /// capacidade medida não existe. Mesma escala do cold-start (UpdateLinkCapability).
+    static double NominalCapByFreq(int freq) {
+        return (freq <= 2) ? 150.0 : (freq >= 6 ? 500.0 : 400.0);
+    }
+
     /// TIDs 802.11e associados a cada AC (BlockQueues de QoS data exige TIDs).
     static std::set<uint8_t> AcToTids(AcIndex ac) {
         switch (ac) {
@@ -390,6 +396,7 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     using StaAcKey = std::pair<Mac48Address, uint8_t>;
     std::map<StaAcKey, uint8_t> m_lastSelectedLink;
     std::map<StaAcKey, uint8_t> m_boundLink; // link atualmente amarrado (via queue-blocking) — evita re-bloquear a cada frame
+    std::map<StaAcKey, double>  m_lastActivitySec; // último instante em que o fluxo enfileirou (p/ podar fluxos parados)
 
     // ---- Phase 1 state ----
     std::map<uint8_t, AcGoals>        m_goals;         // per AC (indexed by AcIndex cast to uint8)
@@ -1299,6 +1306,11 @@ QosWeightedMloScheduler::DecideLinkMigration(AcIndex ac, const Mac48Address& sta
     uint8_t acIdx = static_cast<uint8_t>(ac);
     StaAcKey staAcKey = {sta, acIdx};
 
+    // Sinal de atividade: chamado a cada enqueue (via GetLinkIds). Uma app parada
+    // deixa de enfileirar → o fluxo é podado em UpdatePeriodicMetrics (não fica a
+    // envenenar o gate do balanceador nem a "residir" como fantasma na cascata).
+    if (IsRoutableSta(sta)) m_lastActivitySec[staAcKey] = Simulator::Now().GetSeconds();
+
     // Determine current link (anchor)
     auto lastIt = m_lastSelectedLink.find(staAcKey);
     bool hasAnchor = (lastIt != m_lastSelectedLink.end())
@@ -1575,6 +1587,42 @@ QosWeightedMloScheduler::UpdatePeriodicMetrics()
         UpdateEdcaCompetition(linkId);
     }
 
+    // ---- Podar fluxos INATIVOS (apps que pararam, ex.: BE antes de um switch) ----
+    // Sem isto, as entradas obsoletas ficam em m_lastSelectedLink com satisfação
+    // congelada (< StayThreshold) e (a) envenenam o gate "todos satisfeitos" do
+    // balanceador e (b) "residem" como fantasmas na cascata (WouldHarmResident /
+    // co-ocupação), impedindo os fluxos ativos de migrar para links ociosos.
+    {
+        constexpr double kInactivityTimeoutSec = 1.0; // ~2 janelas de métrica
+        std::vector<StaAcKey> dead;
+        for (const auto& [key, linkId] : m_lastSelectedLink) {
+            if (!IsRoutableSta(key.first)) continue;
+            auto ait = m_lastActivitySec.find(key);
+            double last = (ait != m_lastActivitySec.end()) ? ait->second : now;
+            if (now - last > kInactivityTimeoutSec) dead.push_back(key);
+        }
+        for (const auto& key : dead) {
+            // limpa as máscaras de binding do fluxo em TODOS os links
+            if (GetMac()) {
+                const Mac48Address apAddr = GetMac()->GetAddress();
+                const std::set<uint8_t> tids = AcToTids(static_cast<AcIndex>(key.second));
+                for (uint8_t link : m_linksByRank) {
+                    m_delegate->UnblockQueues(WifiQueueBlockedReason::WIFI_SCHEDULER_ROUTING,
+                                              static_cast<AcIndex>(key.second),
+                                              {WIFI_QOSDATA_QUEUE}, key.first, apAddr, tids, {link});
+                }
+            }
+            m_lastSelectedLink.erase(key);
+            m_currentSatisfaction.erase(key);
+            m_boundLink.erase(key);
+            m_hasMeasuredSat.erase(key);
+            m_pendingMigration.erase(key);
+            m_lastFlowBalanceSec.erase(key);
+            m_lastActivitySec.erase(key);
+            m_staQos.erase(key);
+        }
+    }
+
     // Phase 1 — update current satisfaction for each (STA, AC) on its current link
     for (const auto& [key, linkId] : m_lastSelectedLink) {
         AcIndex ac = static_cast<AcIndex>(key.second);
@@ -1659,14 +1707,19 @@ QosWeightedMloScheduler::RebalanceIdleLinks()
         return static_cast<int>(a);
     };
 
-    // Alvos: do PIOR para o melhor (encher primeiro os links ociosos/lentos).
-    // Fontes: do MELHOR para o pior (drenar dos mais capazes). N links.
-    std::vector<uint8_t> balTargets(m_linksByRank.rbegin(), m_linksByRank.rend());
+    // Alvos: do MELHOR para o pior (preferir primeiro o link de melhor qualidade;
+    // quando ele encher, passa-se ao seguinte). Fontes: do MELHOR para o pior. N links.
+    std::vector<uint8_t> balTargets(m_linksByRank.begin(), m_linksByRank.end());
     for (uint8_t T : balTargets) {
         int cls = targetAcClass(T);
         if (cls == -2) continue;  // alvo misto → nunca mistura ACs
         bool targetEmpty = flowsByLink[T].empty();
-        double spare = m_linkCapability[T].estimatedCapacityMbps - linkLoad(T);
+        // Capacidade FIÁVEL: medida quando o alvo já tem tráfego; NOMINAL por banda
+        // quando ocioso (a capacidade de um link vazio não é medível).
+        int freqT = (T < m_freqs.size()) ? m_freqs[T] : 5;
+        double capT = targetEmpty ? NominalCapByFreq(freqT)
+                                  : m_linkCapability[T].estimatedCapacityMbps;
+        double spare = capT - linkLoad(T);
         for (uint8_t S : m_linksByRank) {
             if (S == T) continue;
             if (flowsByLink[S].size() < 2) continue;  // não esvaziar a fonte
@@ -1686,10 +1739,11 @@ QosWeightedMloScheduler::RebalanceIdleLinks()
                 if (now - lastBal < kFlowBalanceCooldownSec) continue;  // anti-ping-pong
                 double tgt = m_goals.count(acIdx)
                                  ? m_goals.at(acIdx).targetThroughputMbps : 150.0;
-                // Link vazio recebe sempre o 1º fluxo (fica com o link todo — a
-                // capacidade de um link ocioso não é medível). Só se exige folga
-                // quando o alvo JÁ tem tráfego (capacidade medida, fiável).
-                if (!targetEmpty && spare < tgt) continue;
+                // Enche cada link só até à sua capacidade (fiável): a 1ª migração
+                // entra sempre (nominal ≥ demanda em todas as bandas), mas o
+                // excedente é limitado — 2.4 GHz aguenta 1 VI (150), 5 GHz aguenta
+                // 2 (400), etc. Aplica-se a QUALQUER AC (inclui alvo vazio).
+                if (spare < tgt) continue;
                 int r = edcaRank(acIdx);
                 if (r < bestRank) { bestRank = r; best = key; found = true; }
             }

@@ -450,16 +450,24 @@ Este é o mecanismo mais subtil, e vale a pena perceber em detalhe.
   1. **Gate**: **todos** os fluxos routáveis satisfeitos (`curSat ≥ StayThreshold`). Se algum não está, o cascade está a resgatá-lo → não se balanceia.
   2. **Alvo homogéneo**: só se move para um link **vazio** ou que **só contenha fluxos da mesma AC** do candidato.
   3. Move o fluxo de **menor prioridade EDCA** (não-VO — voz pinada) de um link com ≥2 fluxos, **e apenas se reduzir o desequilíbrio** (`flows(source) > flows(target)+1`).
-  4. **Teste de folga**: se o alvo estiver **vazio**, o 1º fluxo entra sempre (fica com o link todo — um link ocioso não tem capacidade medível). Se já tiver fluxos, exige `folga medida ≥ targetThroughput`.
+  4. **Ordem dos alvos: melhor→pior.** Prefere-se **primeiro o link de melhor qualidade** (ex.: 5 GHz antes do 2.4 GHz); só quando esse enche é que se passa ao seguinte. (Antes era pior→melhor.)
+  5. **Teste de folga (encher até à capacidade real):** exige-se `folga ≥ targetThroughput` para **qualquer** candidato, com uma **capacidade fiável** por link — a **medida** quando o alvo já tem tráfego, e a **nominal por banda** (`NominalCapByFreq`: 2.4→150, 5→400, 6→500 Mbps) quando está **ocioso** (a capacidade de um link vazio não é medível). Como a nominal ≥ demanda em todas as bandas, o **1º fluxo entra sempre**; só o **excedente** é limitado — 2.4 GHz aguenta 1 VI, 5 GHz aguenta 2, etc.
 
   **A regra do alvo homogéneo é o núcleo de segurança** — substitui um "veto bidirecional" por algo mais forte: **o balanceador nunca mistura ACs**. Consequências:
   - Nunca cria BE/BK com VO/VI (em nenhum sentido). *(Foi o bug de uma versão anterior: um VI era movido para cima de um BE. Aqui não acontece — o link do BE não é vazio nem "só-VI".)*
-  - Um grupo novo **só arranca num link vazio**; depois enche-se com a mesma AC enquanto houver folga → **iterativo**, o "quantos migram" emerge da capacidade medida (ex.: 2VO+2VI → 2 VIs no 5GHz, mas só 1 no 2.4GHz).
+  - Um grupo novo **só arranca num link vazio**; depois enche-se com a mesma AC enquanto houver folga → **iterativo**, o "quantos migram" emerge da capacidade (ex.: triband 2VO+2VI → os 2 VIs vão primeiro para o 5 GHz; com o 2.4 GHz ainda ocioso, um deles migra depois para lá — 5 GHz aguenta 2, 2.4 GHz aguenta 1).
   - Impede a **consolidação inversa** (mover um VI de volta para o link dos VOs) → sem ping-pong.
 
   **Anti-oscilação**: cooldown global (`kRebalanceCooldownSec = 2 s`) + por-fluxo (`kFlowBalanceCooldownSec = 10 s`). Se um movimento degradar um fluxo, o cascade puxa-o de volta e o cooldown impede o re-empurrão.
 
   > **Importante — a decisão do balanceador é *consultiva*, não *vinculativa*.** Como o `RebalanceIdleLinks` só altera o `m_lastSelectedLink` (que enviesa o pedido de acesso ao canal no enqueue), o resultado observado no tráfego físico pode diferir da atribuição decidida. Ver [Conselho vs. execução](#conselho-enqueue-vs-execução-dequeue-porque-o-all-be-usa-os-dois-links).
+
+
+### 6. Poda de fluxos inativos (apps que param, ex.: antes de um *switch* de AC)
+
+- **Sintoma**: num cenário com *switch* (ex.: `be>vo`), as apps BB param a meio. As suas entradas ficavam eternamente em `m_lastSelectedLink` com **satisfação congelada** da fase 1 (`ComputeQosSatisfaction` usa `m_staQos`, que deixa de ser alimentado). Como esse valor costuma ser `< StayThreshold`, envenenava o **gate do balanceador** (nunca mais espalhava) e os fluxos obsoletos "residiam" como **fantasmas** na cascata (`WouldHarmResident`/co-ocupação), impedindo os fluxos ativos de migrar para links ociosos.
+- **Mecanismo** (início de `UpdatePeriodicMetrics`): cada `(STA,AC)` regista o instante do último enqueue (`m_lastActivitySec`, atualizado em `DecideLinkMigration`). Um fluxo sem enqueues há `> kInactivityTimeoutSec` (1 s ≈ 2 janelas) é **podado**: limpam-se as máscaras de binding (`UnblockQueues` em todos os links) e apaga-se de `m_lastSelectedLink`, `m_currentSatisfaction`, `m_boundLink`, `m_hasMeasuredSat`, `m_pendingMigration`, `m_lastFlowBalanceSec`, `m_staQos`.
+- **Fiável**: uma app *esfomeada mas ativa* continua a enfileirar → não é podada; só apps genuinamente paradas o são.
 
 ---
 
