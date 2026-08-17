@@ -1,91 +1,91 @@
-# QosWeightedMloScheduler — Documentação Técnica
+# QosWeightedMloScheduler — Technical Documentation
 
-## Visão geral
+## Overview
 
-O `QosWeightedMloScheduler` é um scheduler de seleção de link para Multi-Link Operation (MLO) em Wi-Fi 7, implementado como uma extensão do `WifiMacQueueScheduler` do ns-3. Opera **apenas no AP** (tráfego downlink); as STAs continuam a usar o `FcfsWifiQueueScheduler` por defeito do ns-3.
+`QosWeightedMloScheduler` is a link-selection scheduler for Multi-Link Operation (MLO) in Wi-Fi 7, implemented as an extension of the ns-3 `WifiMacQueueScheduler`. It operates **at the AP only** (downlink traffic); the STAs continue to use the default ns-3 `FcfsWifiQueueScheduler`.
 
-A cada pacote (MPDU) que o AP precisa de enviar, o scheduler decide **a que link físico** (ex: 2.4 GHz, 5 GHz ou 6 GHz) esse pacote deve ser encaminhado, com o objetivo de que cada fluxo cumpra os seus próprios objetivos de qualidade de serviço (QoS), respeitando ao mesmo tempo a hierarquia de prioridades real do EDCA (802.11e): **VO > VI > BE > BK**.
+For every packet (MPDU) the AP needs to transmit, the scheduler decides **which physical link** (e.g. 2.4 GHz, 5 GHz, or 6 GHz) that packet should be routed to, with the goal that each flow meets its own Quality-of-Service (QoS) objectives while respecting the real EDCA (802.11e) priority hierarchy: **VO > VI > BE > BK**.
 
-O scheduler não decide *quando* transmitir (isso continua a ser gerido pelo EDCA/CSMA-CA real do ns-3) — decide apenas **em qual link** colocar cada pacote, na fila MAC apropriada.
+The scheduler does not decide *when* to transmit (that remains managed by the real ns-3 EDCA/CSMA-CA) — it only decides **which link** each packet is placed on, in the appropriate MAC queue.
 
-### Suporte N-link (dualband e triband) — Fase B
+### N-link support (dual-band and tri-band) — Phase B
 
-O scheduler é **agnóstico ao número de links**. Internamente mantém `m_linksByRank` — a lista dos linkIds ordenada por qualidade da banda (**melhor primeiro**, pior último), construída em `ConfigureForLinks(freqs)` a partir de `GetFrequencyRank` (6 GHz > 5 GHz > 2.4 GHz). Os aliases `m_fastLinkId` (=`m_linksByRank.front()`, o melhor) e `m_slowLinkId` (=`m_linksByRank.back()`, o pior) são derivados daí. `ConfigureForPair(f1, f2)` é apenas um wrapper de `ConfigureForLinks({f1, f2})`, pelo que o comportamento a 2 links é **idêntico** ao anterior.
+The scheduler is **agnostic to the number of links**. Internally it maintains `m_linksByRank` — the list of link IDs ordered by band quality (**best first**, worst last), built in `ConfigureForLinks(freqs)` from `GetFrequencyRank` (6 GHz > 5 GHz > 2.4 GHz). The aliases `m_fastLinkId` (=`m_linksByRank.front()`, the best) and `m_slowLinkId` (=`m_linksByRank.back()`, the worst) are derived from it. `ConfigureForPair(f1, f2)` is merely a wrapper around `ConfigureForLinks({f1, f2})`, so the two-link behaviour is **identical** to before.
 
-Todos os mecanismos que iteravam explicitamente "fast/slow" passaram a iterar `m_linksByRank` (bootstrap, balanceador, cascata, cold-start por frequência) e os vetos de downgrade passaram a ser **baseados em rank** via `LinkRankPos(linkId)` (0 = melhor). Assim, adicionar um 3º link (triband) não requer alterações à lógica de decisão.
+Every mechanism that used to iterate explicitly over "fast/slow" now iterates over `m_linksByRank` (bootstrap, balancer, cascade, per-frequency cold-start), and the downgrade vetoes are now **rank-based** via `LinkRankPos(linkId)` (0 = best). Adding a 3rd link (tri-band) therefore requires no changes to the decision logic.
 
-- **2 links (dualband)**: correr com `--freq1`/`--freq2` (ex.: `5`+`6`). `--freq3=0` (default) mantém o modo 2-link.
-- **3 links (triband)**: passar `--freq3` (ex.: `--freq1=2 --freq2=5 --freq3=6`). O `.cc` cria a 3ª PHY/canal e chama o overload `InstallQosWeightedScheduler(mac, {f1,f2,f3})`. No runner/suite, a banda `tri` ativa este modo.
+- **2 links (dual-band)**: run with `--freq1`/`--freq2` (e.g. `5`+`6`). `--freq3=0` (default) keeps two-link mode.
+- **3 links (tri-band)**: pass `--freq3` (e.g. `--freq1=2 --freq2=5 --freq3=6`). The `.cc` creates the 3rd PHY/channel and calls the overload `InstallQosWeightedScheduler(mac, {f1,f2,f3})`. In the runner/suite, the `tri` band enables this mode.
 
-> **Cold-start por frequência** (antes de haver medições): a capacidade inicial de cada link é estimada pela sua banda — 2.4 GHz→150, 5 GHz→400, 6 GHz→500 Mbps — em vez do antigo binário fast/slow.
+> **Per-frequency cold-start** (before any measurements exist): each link's initial capacity is estimated from its band — 2.4 GHz→150, 5 GHz→400, 6 GHz→500 Mbps — instead of the old fast/slow binary.
 
-### Granularidade: por (STA, AC), não por AC
+### Granularity: per (STA, AC), not per AC
 
-A chave de decisão é `StaAcKey = std::pair<Mac48Address, uint8_t>` — o **MAC de destino** + o índice do AC.
+The decision key is `StaAcKey = std::pair<Mac48Address, uint8_t>` — the **destination MAC** plus the AC index.
 
-> **Porquê**: a versão anterior encaminhava por AC apenas. Isso significava que duas STAs com o mesmo AC (ex: 2 STAs de voz) recebiam **sempre a mesma decisão de link** — era impossível distribuí-las por links diferentes. Com a chave por (STA, AC), cada fluxo é encaminhado independentemente.
+> **Why**: the previous version routed per AC only. That meant two STAs with the same AC (e.g. 2 voice STAs) always received **the same link decision** — it was impossible to distribute them across different links. With a per-(STA, AC) key, each flow is routed independently.
 
-Todo o estado de decisão é chaveado assim:
+All decision state is keyed this way:
 
-| Membro | Tipo | Papel |
+| Member | Type | Role |
 |---|---|---|
-| `m_lastSelectedLink` | `map<StaAcKey, uint8_t>` | Link atual (âncora) de cada fluxo |
-| `m_currentSatisfaction` | `map<StaAcKey, QosSatisfaction>` | Satisfação **medida** no link atual |
-| `m_staQos` | `map<StaAcKey, StaQos>` | Métricas de QoS (throughput, delay, jitter, loss) — por defeito **estimadas pelo próprio AP** (camada TC); opcionalmente dos sinks (`--decisionMetrics=sink`) |
-| `m_hasMeasuredSat` | `set<StaAcKey>` | Fluxos que já passaram o warmup |
-| `m_pendingMigration` | `map<StaAcKey, pair<uint8_t,double>>` | Intenção de migração pendente (link alvo, instante) — debounce |
+| `m_lastSelectedLink` | `map<StaAcKey, uint8_t>` | Current link (anchor) of each flow |
+| `m_currentSatisfaction` | `map<StaAcKey, QosSatisfaction>` | **Measured** satisfaction on the current link |
+| `m_staQos` | `map<StaAcKey, StaQos>` | QoS metrics (throughput, delay, jitter, loss) — by default **estimated by the AP itself** (TC layer); optionally from the sinks (`--decisionMetrics=sink`) |
+| `m_hasMeasuredSat` | `set<StaAcKey>` | Flows that have already passed warmup |
+| `m_pendingMigration` | `map<StaAcKey, pair<uint8_t,double>>` | Pending migration intent (target link, timestamp) — debounce |
 
 ---
 
-## Arquitetura: seis motores + uma camada de estabilidade
+## Architecture: six engines plus a stability layer
 
-| # | Motor | Responsabilidade | Função/estrutura principal |
+| # | Engine | Responsibility | Main function/structure |
 |---|-------|-------------------|------------------------------|
-| 1 | **Goal-Awareness Engine** | Calcula o quão satisfeito está cada (STA, AC), a partir das **métricas reais** | `ComputeQosSatisfaction`, `QosSatisfaction`, `StaQos` |
-| 2 | **Link Capability Engine** | Estima a capacidade real de cada link (PHY) e quanto dela está disponível, por AC, respeitando prioridade | `UpdateLinkCapability`, `LinkCapability` |
-| 3 | **Traffic Composition Engine** | Mede o tráfego real (throughput, airtime, nº de fluxos) que cada AC já gera em cada link | `UpdateTrafficComposition`, `LinkTrafficComposition` |
-| 4 | **EDCA Competition Engine** | Modela a pressão de contenção entre ACs no mesmo link | `UpdateEdcaCompetition`, `EdcaCompetition` |
-| 5 | **Projection Engine** | Combina 2–4 numa pontuação "quão bom seria este link para mim" | `ComputeExpectedQosSatisfaction` |
-| 6 | **Migration Decision Engine** | Decide, com cascata de prioridades, vetos e histerese, se migra ou fica | `DecideLinkMigration`, `MeetsOwnGoals`, `WouldHarmResident` |
+| 1 | **Goal-Awareness Engine** | Computes how satisfied each (STA, AC) is, from the **real metrics** | `ComputeQosSatisfaction`, `QosSatisfaction`, `StaQos` |
+| 2 | **Link Capability Engine** | Estimates each link's real (PHY) capacity and how much of it is available, per AC, respecting priority | `UpdateLinkCapability`, `LinkCapability` |
+| 3 | **Traffic Composition Engine** | Measures the real traffic (throughput, airtime, number of flows) each AC already generates on each link | `UpdateTrafficComposition`, `LinkTrafficComposition` |
+| 4 | **EDCA Competition Engine** | Models contention pressure between ACs on the same link | `UpdateEdcaCompetition`, `EdcaCompetition` |
+| 5 | **Projection Engine** | Combines 2–4 into a "how good would this link be for me" score | `ComputeExpectedQosSatisfaction` |
+| 6 | **Migration Decision Engine** | Decides, via a priority cascade, vetoes, and hysteresis, whether to migrate or stay | `DecideLinkMigration`, `MeetsOwnGoals`, `WouldHarmResident` |
 
-Sobre estes motores existe uma **camada de estabilidade**, construída a partir de bugs reais observados em simulação (cada mecanismo é explicado em detalhe na secção [Mecanismos de prevenção](#mecanismos-de-prevenção)):
+On top of these engines sits a **stability layer**, built from real bugs observed in simulation (each mechanism is explained in detail in the [Prevention mechanisms](#prevention-mechanisms) section):
 
-- **Bootstrap por prioridade + warmup** (2 janelas)
-- **Debounce de migração** (dwell de 1 s)
-- **Veto anti-downgrade VO/VI** (com exceção de fome)
-- **Veto simétrico BE/BK**
-- **Exclusão de frames broadcast/beacons** das verificações de residência
+- **Priority bootstrap + warmup** (2 windows)
+- **Migration debounce** (1 s dwell)
+- **VO/VI anti-downgrade veto** (with a starvation exception)
+- **Symmetric BE/BK veto**
+- **Exclusion of broadcast/beacon frames** from residency checks
 
-Os motores 1–4 são recalculados a cada `MetricsInterval` (0.5 s). Os motores 5–6 correm **por pacote** (em `GetLinkIds`), mas usam os valores já calculados nessa janela — não recalculam PHY/tráfego a cada pacote.
-
----
-
-## Fluxo de uma decisão, passo a passo
-
-Esta é a ordem exata do código em `DecideLinkMigration`:
-
-1. O ns-3 chama `GetLinkIds(ac, mpdu, ...)` quando tem um MPDU pronto a enfileirar.
-2. O scheduler obtém os links elegíveis via `FcfsWifiQueueScheduler` delegado. Se a lista vier vazia, devolve vazio.
-3. Extrai o **MAC de destino** (`mpdu->GetHeader().GetAddr1()`); se for broadcast, usa a chave `ff:ff:ff:ff:ff:ff`. Chama `DecideLinkMigration(ac, dest, eligible)`.
-4. **Atalhos**: se só houver 1 link elegível, grava a âncora e devolve-o (é por aqui que os beacons passam — ver [exclusão de beacons](#4-exclusão-de-beacons-isroutablesta)).
-5. Determina o **link atual** (âncora) e o `currentSat` (satisfação **medida**, de `m_staQos`).
-6. **Bootstrap por prioridade** — se o fluxo ainda não tem 2 amostras medidas (`m_hasMeasuredSat`), força VO/VI → melhor link; BE/BK → em **triband** (≥3 links) o **2º melhor** link (ex.: 5 GHz, deixando o 2.4 GHz livre), em **dualband** o pior link. E **termina aqui**.
-7. **`STAY_SATISFIED`** — se `currentSat >= StayThreshold` e há âncora, fica sem avaliar mais nada.
-8. **Cascata Cat1/Cat2/Cat3** — avalia todos os links elegíveis e escolhe o melhor da melhor categoria.
-9. **Veto anti-downgrade VO/VI** — pode reverter `bestLink` para o link atual.
-10. **Veto simétrico BE/BK** — idem, para ACs de baixa prioridade.
-11. **Histerese + debounce** — se `bestLink != currentLink` e o ganho passar `MigrationThreshold`, a intenção tem de persistir ≥ 1 s (dwell) antes de executar.
-12. Grava a âncora (`m_lastSelectedLink`), regista no CSV e devolve o link.
-
-A cada 0.5 s, `UpdatePeriodicMetrics` recalcula os motores 1–4 e atualiza `m_currentSatisfaction`.
+Engines 1–4 are recomputed every `MetricsInterval` (0.5 s). Engines 5–6 run **per packet** (in `GetLinkIds`), but use the values already computed in that window — they do not recompute PHY/traffic for every packet.
 
 ---
 
-## Motor 1 — Goal-Awareness Engine
+## Decision flow, step by step
 
-### O que faz
+This is the exact order of the code in `DecideLinkMigration`:
 
-Para cada **(STA, AC)**, calcula um **índice de satisfação composto** entre 0 e 1, a partir das **métricas reais end-to-end** guardadas em `m_staQos` (ver [Métricas reais por-STA](#métricas-reais-por-sta)):
+1. ns-3 calls `GetLinkIds(ac, mpdu, ...)` when it has an MPDU ready to enqueue.
+2. The scheduler obtains the eligible links via the delegated `FcfsWifiQueueScheduler`. If the list comes back empty, it returns empty.
+3. It extracts the **destination MAC** (`mpdu->GetHeader().GetAddr1()`); if it is broadcast, it uses the key `ff:ff:ff:ff:ff:ff`. It calls `DecideLinkMigration(ac, dest, eligible)`.
+4. **Shortcuts**: if there is only 1 eligible link, it records the anchor and returns it (this is the path beacons take — see [beacon exclusion](#4-beacon-exclusion-isroutablesta)).
+5. It determines the **current link** (anchor) and `currentSat` (the **measured** satisfaction, from `m_staQos`).
+6. **Priority bootstrap** — if the flow does not yet have 2 measured samples (`m_hasMeasuredSat`), it forces VO/VI → best link; BE/BK → in **tri-band** (≥3 links) the **2nd-best** link (e.g. 5 GHz, leaving 2.4 GHz free), in **dual-band** the worst link. And it **stops here**.
+7. **`STAY_SATISFIED`** — if `currentSat >= StayThreshold` and there is an anchor, it stays without evaluating anything else.
+8. **Cat1/Cat2/Cat3 cascade** — it evaluates all eligible links and picks the best link of the best category.
+9. **VO/VI anti-downgrade veto** — may revert `bestLink` to the current link.
+10. **Symmetric BE/BK veto** — likewise, for low-priority ACs.
+11. **Hysteresis + debounce** — if `bestLink != currentLink` and the gain exceeds `MigrationThreshold`, the intent must persist for ≥ 1 s (dwell) before executing.
+12. It records the anchor (`m_lastSelectedLink`), logs to the CSV, and returns the link.
+
+Every 0.5 s, `UpdatePeriodicMetrics` recomputes engines 1–4 and updates `m_currentSatisfaction`.
+
+---
+
+## Engine 1 — Goal-Awareness Engine
+
+### What it does
+
+For each **(STA, AC)**, it computes a **composite satisfaction index** between 0 and 1, from the **real end-to-end metrics** stored in `m_staQos` (see [Per-STA metrics](#per-sta-metrics--estimated-by-the-ap-itself-no-sta-feedback)):
 
 ```cpp
 sat.throughput = UtilityFunction(q.tpMbps,   g.targetThroughputMbps, /*lowerIsBetter=*/false)
@@ -94,27 +94,27 @@ sat.jitter     = UtilityFunction(q.jitterMs, g.maxJitterMs,          true)
 sat.loss       = UtilityFunction(q.lossRate, g.maxPacketLoss,        true)
 
 sat.index = (throughputWeight·sat.throughput + delayWeight·sat.delay
-           + jitterWeight·sat.jitter + lossWeight·sat.loss) / soma_dos_pesos
+           + jitterWeight·sat.jitter + lossWeight·sat.loss) / sum_of_weights
 ```
 
-Se ainda não houver uma amostra válida em `m_staQos` (arranque), devolve zeros — o bootstrap trata dessa fase.
+If there is not yet a valid sample in `m_staQos` (startup), it returns zeros — the bootstrap handles that phase.
 
-> **Nota importante**: o parâmetro `linkId` existe na assinatura mas **não é usado** — as métricas reais são end-to-end e referem-se ao link onde o fluxo *está*. Isto é deliberado: para o link atual não é preciso projetar, sabe-se o valor real. Para os *outros* links usa-se o Motor 5.
+> **Important note**: the `linkId` parameter exists in the signature but is **not used** — the real metrics are end-to-end and refer to the link where the flow *currently is*. This is deliberate: for the current link there is no need to project, the real value is known. For the *other* links, Engine 5 is used.
 
-### A função sigmoide (`UtilityFunction`)
+### The sigmoid function (`UtilityFunction`)
 
 ```cpp
-ratio = valor / alvo
-lowerIsBetter (máximo tolerável):   utilidade = 1 / (1 + e^(5·(ratio − 1)))    → 0.5 no limite
-higherIsBetter (alvo desejado):     utilidade = 1 / (1 + e^(10·(0.5 − ratio))) → 0.99 ao cumprir
+ratio = value / target
+lowerIsBetter (tolerable maximum):  utility = 1 / (1 + e^(5·(ratio − 1)))    → 0.5 at the limit
+higherIsBetter (desired target):    utility = 1 / (1 + e^(10·(0.5 − ratio))) → 0.99 when met
 ```
 
-- **`lowerIsBetter`** (delay, jitter, loss): o alvo é um *máximo tolerável*, logo estar no limite = **0.5** é semântica correta.
-- **`higherIsBetter`** (throughput): o alvo é *o que se precisa*. A inflexão está a **50% do alvo** → cumprir o alvo ≈ **0.99**, metade do alvo = 0.5. *(Antes a inflexão estava no alvo, o que dava só 0.5 ao cumprir e exigia ~2× o alvo para saturar — ver limitação #4.)*
-- Se `alvo <= 0`, devolve `0.5`.
-- Por ser assintótica, nunca atinge exatamente 0 ou 1.
+- **`lowerIsBetter`** (delay, jitter, loss): the target is a *tolerable maximum*, so being at the limit = **0.5** is the correct semantics.
+- **`higherIsBetter`** (throughput): the target is *what is needed*. The inflection point is at **50% of the target** → meeting the target ≈ **0.99**, half the target = 0.5. *(Previously the inflection was at the target, which gave only 0.5 when met and required ~2× the target to saturate — see limitation #4.)*
+- If `target <= 0`, it returns `0.5`.
+- Being asymptotic, it never reaches exactly 0 or 1.
 
-### `AcGoals` — objetivos por AC (construtor; `SetGoals` **não** é chamado pelo script)
+### `AcGoals` — per-AC objectives (constructor; `SetGoals` is **not** called by the script)
 
 | AC | targetThroughputMbps | maxDelayMs | maxJitterMs | maxPacketLoss |
 |----|----------------------|------------|-------------|----------------|
@@ -123,9 +123,9 @@ higherIsBetter (alvo desejado):     utilidade = 1 / (1 + e^(10·(0.5 − ratio))
 | BE | 150.0 | 200.0 | 1.0 | 0.10 (10%) |
 | BK | 150.0 | 300.0 | 100.0 | 0.10 (10%) |
 
-> `maxJitterMs` de VO/VI foi subido de 0.1 ms (100 µs, fisicamente inatingível numa rede partilhada) para 5/10 ms — antes garantia que o VO nunca pontuava bem em jitter, custando-lhe ~0.22 de satisfação permanentes.
+> The `maxJitterMs` of VO/VI was raised from 0.1 ms (100 µs, physically unattainable on a shared network) to 5/10 ms — previously it guaranteed the VO never scored well on jitter, costing it ~0.22 of permanent satisfaction.
 
-### `AcWeights` — pesos por AC (definidos pelo `.cc` via `SetWeights`)
+### `AcWeights` — per-AC weights (set by the `.cc` via `SetWeights`)
 
 | AC | delayWeight | jitterWeight | lossWeight | throughputWeight |
 |----|-------------|--------------|------------|-------------------|
@@ -134,113 +134,113 @@ higherIsBetter (alvo desejado):     utilidade = 1 / (1 + e^(10·(0.5 − ratio))
 | BE | 0.20 | 0.05 | 0.15 | 0.60 |
 | BK | 0.05 | 0.05 | 0.10 | 0.80 |
 
-Não precisam de somar 1 — o código normaliza pela soma. VO prioriza delay+jitter (voz não tolera atraso, tolera menos throughput). BK quase só quer throughput.
+They need not sum to 1 — the code normalises by the sum. VO prioritises delay+jitter (voice does not tolerate latency, tolerates less throughput). BK almost exclusively wants throughput.
 
 ---
 
-## Motor 2 — Link Capability Engine
+## Engine 2 — Link Capability Engine
 
-### `estimatedCapacityMbps` — rate efetivo à carga atual (medido)
+### `estimatedCapacityMbps` — effective rate at the current load (measured)
 
 ```cpp
-busyFrac = min(1, m_linkBusyTime[link] / dt)          // airtime ocupado real (com overhead)
-occupied = Σ throughput de todos os ACs               // goodput agregado
-se busyFrac > 0.05 e occupied > 0:
-    estimatedCapacityMbps = occupied / busyFrac        // MEDIDO
-senão se houver dados PHY:
+busyFrac = min(1, m_linkBusyTime[link] / dt)          // real occupied airtime (with overhead)
+occupied = Σ throughput of all ACs                    // aggregate goodput
+if busyFrac > 0.05 and occupied > 0:
+    estimatedCapacityMbps = occupied / busyFrac        // MEASURED
+else if PHY data exists:
     estimatedCapacityMbps = dataRate_PHY × (1 − PER)   // fallback
-senão:
-    estimatedCapacityMbps = 400 (rápido) ou 150 (lento) // cold-start
+else:
+    estimatedCapacityMbps = 400 (fast) or 150 (slow)   // cold-start
 ```
 
-> **O que este valor É (e o que NÃO é).** `occupied / busyFrac` mede o **rate efetivo no ponto de operação atual** — quanto goodput o link entrega por unidade de airtime, à carga que está a ver *agora*. **Não** é o máximo saturado do link.
->
-> **Porquê medir em vez de usar a taxa PHY.** `dataRate_PHY × (1−PER)` é a taxa **nominal** (símbolos de payload no ar) e **ignora todo o overhead MAC** (preâmbulo, AIFS, backoff, SIFS, BlockAck). Isso **sobrestimava** a capacidade ~5× (ex.: 3722 Mbps no 6 GHz). A correção substituiu essa **sobrestimação grosseira** por uma **subestimação conservadora** — muito mais seguro, porque o scheduler nunca passa a achar que um link tem mais folga do que tem.
->
-> **Porquê subestima (e sobe com a carga).** A eficiência do WiFi depende da **agregação A-MPDU**, que cresce com a profundidade das filas: mais carga → A-MPDUs maiores → menos overhead por byte → rate efetivo maior. Medido no 6 GHz:
-> | Carga no link | `estimatedCapacity` medida |
+> **What this value IS (and what it is NOT).** `occupied / busyFrac` measures the **effective rate at the current operating point** — how much goodput the link delivers per unit of airtime, at the load it is seeing *now*. It is **not** the link's saturated maximum.
+
+> **Why measure instead of using the PHY rate.** `dataRate_PHY × (1−PER)` is the **nominal** rate (payload symbols on the air) and **ignores all MAC overhead** (preamble, AIFS, backoff, SIFS, BlockAck). That **overestimated** capacity by ~5× (e.g. 3722 Mbps at 6 GHz). The fix replaced that **gross overestimate** with a **conservative underestimate** — much safer, because the scheduler never comes to believe a link has more headroom than it does.
+
+> **Why it underestimates (and rises with load).** Wi-Fi efficiency depends on **A-MPDU aggregation**, which grows with queue depth: more load → larger A-MPDUs → less overhead per byte → higher effective rate. Measured at 6 GHz:
+> | Load on the link | Measured `estimatedCapacity` |
 > |---|---|
 > | ~300 Mbps (1VO+1VI) | ~655 Mbps |
 > | ~450 Mbps (2VO+1VI) | ~982 Mbps |
-> | saturação de link único | ~1600 Mbps (máximo real) |
+> | single-link saturation | ~1600 Mbps (real maximum) |
 >
-> O valor **sobe monotonamente com a carga** e **nunca sobrestima**. É o rate relevante para a carga que o scheduler realmente vê — não o máximo teórico. Consequência (ver limitação #2): a projeção de "quanto caberia aqui" é **pessimista**.
->
-> **Fonte crítica**: `m_linkBusyTime` (de `FeedLinkTxStart/End`, tempo real de PHY ocupado) — os proxies de airtime por-AC não servem, porque são tempo de payload puro (sem overhead) e dariam um cálculo circular de volta à taxa PHY.
+> The value **rises monotonically with load** and **never overestimates**. It is the rate relevant to the load the scheduler actually sees — not the theoretical maximum. Consequence (see limitation #2): the "how much would fit here" projection is **pessimistic**.
 
-> **⚠️ Agregação A-MPDU por AC (config. do `.cc`).** Todos os quatro ACs usam agora `MaxAmpduSize = 65535` — incluindo o **BK** (`bkMaxAmpduBytes = 65535`; anteriormente era `0`/desligado). Com a agregação desligada, o BK enviava frame-a-frame e ficava limitado a **~50 Mbps mesmo estando sozinho num link** (cada frame paga todo o overhead MAC: preâmbulo, AIFS, backoff, SIFS, BlockAck), saturando a fila TC → delay de segundos e loss elevada. Com A-MPDU ativo o BK acompanha os restantes ACs até ao rate oferecido. Ajustável por CLI: `--bkMaxAmpdu=<bytes>` (`0` volta a desligar). Este teto de agregação é uma característica de **MAC**, independente da decisão de link do scheduler.
+> **Critical source**: `m_linkBusyTime` (from `FeedLinkTxStart/End`, real occupied PHY time) — the per-AC airtime proxies do not serve here, because they are pure payload time (no overhead) and would give a circular calculation back to the PHY rate.
 
-`ConfigureForPair` ordena os dois links por `GetFrequencyRank` (6 GHz > 5 GHz > 2.4 GHz) e define `m_fastLinkId` / `m_slowLinkId`.
+> **⚠️ Per-AC A-MPDU aggregation (`.cc` config).** All four ACs now use `MaxAmpduSize = 65535` — including **BK** (`bkMaxAmpduBytes = 65535`; previously `0`/disabled). With aggregation disabled, BK sent frame by frame and was limited to **~50 Mbps even when alone on a link** (each frame pays the full MAC overhead: preamble, AIFS, backoff, SIFS, BlockAck), saturating the TC queue → multi-second delay and high loss. With A-MPDU enabled, BK keeps up with the other ACs up to the offered rate. Tunable via CLI: `--bkMaxAmpdu=<bytes>` (`0` disables it again). This aggregation ceiling is a **MAC** characteristic, independent of the scheduler's link decision.
+
+`ConfigureForPair` orders the two links by `GetFrequencyRank` (6 GHz > 5 GHz > 2.4 GHz) and sets `m_fastLinkId` / `m_slowLinkId`.
 
 ### `availableCapacityPerAcMbps` — priority-aware
 
-Cada AC desconta **apenas** o consumo de ACs com prioridade igual ou superior:
+Each AC discounts **only** the consumption of ACs of equal or higher priority:
 
 ```
-availableCapacityPerAcMbps[VO] = estimatedCapacity − consumo(VO)
-availableCapacityPerAcMbps[VI] = estimatedCapacity − consumo(VO) − consumo(VI)
-availableCapacityPerAcMbps[BE] = estimatedCapacity − consumo(VO) − consumo(VI) − consumo(BE)
-availableCapacityPerAcMbps[BK] = ... − consumo(BK)
+availableCapacityPerAcMbps[VO] = estimatedCapacity − consumption(VO)
+availableCapacityPerAcMbps[VI] = estimatedCapacity − consumption(VO) − consumption(VI)
+availableCapacityPerAcMbps[BE] = estimatedCapacity − consumption(VO) − consumption(VI) − consumption(BE)
+availableCapacityPerAcMbps[BK] = ... − consumption(BK)
 ```
 
-Modela o 802.11 real: o VO, com AIFS/CW mais curtos, ganha sempre o meio primeiro — não "perde" capacidade porque o BE transmite muito. O BE sofre tudo o que está acima dele.
+This models real 802.11: VO, with shorter AIFS/CW, always wins the medium first — it does not "lose" capacity because BE transmits a lot. BE suffers everything above it.
 
-### `freeAirtime` e `capabilityScore`
+### `freeAirtime` and `capabilityScore`
 
 ```
-freeAirtime     = 1 − (tempo ocupado do link / duração da janela)
+freeAirtime     = 1 − (link occupied time / window duration)
 capabilityScore = min(1, availableCapacityMbps / estimatedCapacityMbps)
 ```
 
 ---
 
-## Motor 3 — Traffic Composition Engine
+## Engine 3 — Traffic Composition Engine
 
-Mede, por janela de 0.5 s, o tráfego real de cada AC em cada link:
+Per 0.5 s window, it measures each AC's real traffic on each link:
 
 - `voThroughputMbps`, `viThroughputMbps`, `beThroughputMbps`, `bkThroughputMbps`
-- `voAirtimeFrac`, etc. — **utilização real** do link por AC, em [0,1] (proxy de carga para o Motor 4)
-- `voFlows`, etc. — nº de fluxos distintos (STA+TID) ativos
+- `voAirtimeFrac`, etc. — **real utilisation** of the link per AC, in [0,1] (load proxy for Engine 4)
+- `voFlows`, etc. — number of distinct active flows (STA+TID)
 
-> **`*AirtimeFrac` = utilização real, não mistura.** O airtime de payload por-AC (de `FeedPacketTransmitted`) capta bem o *rácio* entre ACs, mas é tempo de payload puro. É escalado para o `busyFrac` real do PHY (`m_linkBusyTime/dt`) → cada fração fica em [0,1] e todas juntas somam a utilização do link. *(Antes normalizava-se pelo airtime usado, o que fazia as frações somarem sempre 1.0: um AC num link ocioso "pesava" o mesmo que num saturado, e a `pressure` não distinguia os dois — ver limitação #1.)*
+> **`*AirtimeFrac` = real utilisation, not a mixture.** The per-AC payload airtime (from `FeedPacketTransmitted`) captures the *ratio* between ACs well, but it is pure payload time. It is scaled to the real PHY `busyFrac` (`m_linkBusyTime/dt`) → each fraction lands in [0,1] and together they sum to the link's utilisation. *(Previously they were normalised by the used airtime, which made the fractions always sum to 1.0: an AC on an idle link "weighed" the same as on a saturated one, and `pressure` could not tell the two apart — see limitation #1.)*
 
-Alimenta o Motor 2 (consumo absoluto) e o Motor 4 (carga normalizada).
+It feeds Engine 2 (absolute consumption) and Engine 4 (normalised load).
 
 ---
 
-## Motor 4 — EDCA Competition Engine
+## Engine 4 — EDCA Competition Engine
 
-### `m_edcaWeights` — matriz de pressão de contenção
+### `m_edcaWeights` — contention-pressure matrix
 
 ```cpp
-// linhas = AC candidata; colunas = outra AC presente no link
-// ordem: BK, BE, VI, VO
-{0.0,  0.5,  7.0,  9.0}   // candidata BK  — sente MUITO o VO (9.0) e o VI (7.0)
-{0.5,  1.0,  6.0,  8.0}   // candidata BE  — sente MUITO o VO (8.0) e o VI (6.0)
-{0.25, 0.5,  1.0,  2.0}   // candidata VI  — sente moderadamente o VO (2.0)
-{0.0,  0.05, 0.25, 1.0}   // candidata VO  — quase não sente ninguém abaixo
+// rows = candidate AC; columns = other AC present on the link
+// order: BK, BE, VI, VO
+{0.0,  0.5,  7.0,  9.0}   // candidate BK  — feels VO (9.0) and VI (7.0) STRONGLY
+{0.5,  1.0,  6.0,  8.0}   // candidate BE  — feels VO (8.0) and VI (6.0) STRONGLY
+{0.25, 0.5,  1.0,  2.0}   // candidate VI  — feels VO (2.0) moderately
+{0.0,  0.05, 0.25, 1.0}   // candidate VO  — barely feels anything below it
 ```
 
-`m_edcaWeights[X][Y]` = **"o quanto a AC X sente a presença da AC Y"**. Não é simétrica, porque a contenção real do EDCA não é.
+`m_edcaWeights[X][Y]` = **"how much AC X feels the presence of AC Y"**. It is not symmetric, because real EDCA contention is not.
 
-### Cadeia de cálculo
+### Computation chain
 
 ```
 pressure[cand]   = Σ (m_edcaWeights[cand][other] × NormalisedLoad(other, link))
-opportunity      = freeAirtime / (1 + pressure)        (limitado a [0,1])
+opportunity      = freeAirtime / (1 + pressure)        (clamped to [0,1])
 effectiveAvailableCapacityMbps[ac] = availableCapacityPerAcMbps[ac] × opportunity
 ```
 
-`effectiveAvailableCapacityMbps` é a estimativa final de "quantos Mbps eu conseguiria aqui agora".
+`effectiveAvailableCapacityMbps` is the final estimate of "how many Mbps I could get here right now".
 
 ---
 
-## Motor 5 — Projection Engine (`ComputeExpectedQosSatisfaction`)
+## Engine 5 — Projection Engine (`ComputeExpectedQosSatisfaction`)
 
-Usado para avaliar links (incluindo aqueles onde o fluxo **não** está).
+Used to evaluate links (including those where the flow is **not**).
 
 ```
-coRes         = nº de OUTRAS STAs do mesmo AC já neste link
+coRes         = number of OTHER STAs of the same AC already on this link
 effCapShared  = effectiveAvailableCapacityMbps / (coRes + 1)      ← co-occupancy penalty
 
 expTp     = UtilityFunction(effCapShared, targetThroughputMbps, false)
@@ -249,352 +249,352 @@ expJitter = UtilityFunction(jitter_proxy × (1 + pressure×0.2), maxJitterMs, tr
 expLoss   = UtilityFunction(PER_proxy, maxPacketLoss, true)
 
 baseSat = (throughputWeight·expTp + delayWeight·expDelay
-         + jitterWeight·expJitter + lossWeight·expLoss) / soma_dos_pesos
+         + jitterWeight·expJitter + lossWeight·expLoss) / sum_of_weights
 
 expectedScore = baseSat × 0.65 + capabilityScore × 0.25 + (1 − PER_proxy) × 0.10
 ```
 
-> **Atenção**: `delay_proxy` / `jitter_proxy` / `PER_proxy` vêm de `m_metrics[link][ac]` (por-link, **não** as métricas reais por-STA). Esta assimetria é uma limitação conhecida — ver [Limitações](#limitações-conhecidas).
+> **Caution**: `delay_proxy` / `jitter_proxy` / `PER_proxy` come from `m_metrics[link][ac]` (per-link, **not** the real per-STA metrics). This asymmetry is a known limitation — see [Known limitations](#known-limitations).
 
 ### Co-occupancy penalty
 
-Divide a capacidade projetada pelo nº de STAs do mesmo AC que partilhariam o link (`coRes + 1`). Se o fluxo fosse o único do seu AC ali, o denominador é 1 e nada muda.
+It divides the projected capacity by the number of same-AC STAs that would share the link (`coRes + 1`). If the flow were the only one of its AC there, the denominator is 1 and nothing changes.
 
-> **Porquê**: sem isto, num cenário 2VO+2VI todos os fluxos veriam o link rápido como igualmente bom e amontoavam-se lá. A penalidade faz o 2.º VI transbordar quando o link não os comporta aos dois.
+> **Why**: without this, in a 2VO+2VI scenario all flows would see the fast link as equally good and pile up there. The penalty makes the 2nd VI overflow when the link cannot hold both.
 
-### Penalidade altruísta
+### Altruistic penalty
 
-Aplicada depois do `expectedScore`, para proteger ACs já residentes:
+Applied after `expectedScore`, to protect already-resident ACs:
 
-- **(A) Reativa** — se uma AC residente já está esfomeada (`currentSat < 0.45`), soma `(0.6 − currentSat)`.
-- **(B) Preventiva** — mesmo sem estar esfomeada, se o `headroomRatio` (`effectiveAvailableCapacity / targetThroughput`) do residente for < 1.0 **e** `currentSat < 0.75`, aplica penalidade proporcional à carga que o candidato traria (`min(0.5, tightness × candidateLoad × 2)`).
+- **(A) Reactive** — if a resident AC is already starved (`currentSat < 0.45`), it adds `(0.6 − currentSat)`.
+- **(B) Preventive** — even without being starved, if the resident's `headroomRatio` (`effectiveAvailableCapacity / targetThroughput`) is < 1.0 **and** `currentSat < 0.75`, it applies a penalty proportional to the load the candidate would bring (`min(0.5, tightness × candidateLoad × 2)`).
 
-A penalidade final é o `max` entre (A) e (B) por residente (não a soma), subtraída ao score, nunca abaixo de 0.
+The final penalty is the `max` of (A) and (B) per resident (not the sum), subtracted from the score, never below 0.
 
 ---
 
-## Motor 6 — Migration Decision Engine (`DecideLinkMigration`)
+## Engine 6 — Migration Decision Engine (`DecideLinkMigration`)
 
-### Passo 1 — Bootstrap por prioridade (enquanto não há medições)
+### Step 1 — Priority bootstrap (while there are no measurements)
 
 ```cpp
 if (m_hasMeasuredSat.count(staAcKey) == 0) {
-    bootLink = (acIdx >= AC_VI) ? m_fastLinkId : m_slowLinkId;   // VO/VI → rápido; BE/BK → lento
+    bootLink = (acIdx >= AC_VI) ? m_fastLinkId : m_slowLinkId;   // VO/VI → fast; BE/BK → slow
     decision = "BOOTSTRAP_PRIORITY";
-    // termina aqui — não corre a cascata
+    // stops here — the cascade does not run
 }
 ```
 
-### Passo 2 — `STAY_SATISFIED` (+ expulsão considerada)
+### Step 2 — `STAY_SATISFIED` and considerate eviction
 
 ```
-se currentSat >= StayThreshold E há âncora:
-    se (VO/VI) E há BE/BK no link atual E existe link LIMPO com capacidade:
-        MIGRATE_CONSIDERATE_EVICT  → migra p/ esse link (deixa o atual aos BE/BK)
-    senão:
-        STAY_SATISFIED             → fica, sem avaliar mais nada.
+if currentSat >= StayThreshold AND there is an anchor:
+    if (VO/VI) AND there is a BE/BK on the current link AND a CLEAN link with capacity exists:
+        MIGRATE_CONSIDERATE_EVICT  → migrate to that link (leaving the current one to the BE/BK)
+    else:
+        STAY_SATISFIED             → stay, without evaluating anything else.
 ```
 
-**Expulsão considerada.** Um VO/VI **satisfeito** que partilha o link atual com **BE/BK** está a esfomeá-los por EDCA (regra: BE/BK nunca coexistem bem com VO/VI). Se existir um link **limpo** (sem BE/BK residente) com **capacidade** para toda a procura de alta-prioridade que lá ficaria, o VO/VI **migra para lá** — mesmo sem melhorar a sua própria satisfação — libertando o link atual para os BE/BK. Implementado por `FindConsiderateEvictTarget`, que usa `estimatedCapacity ≥ Σ(procura VO/VI)` (**capacidade medida**, *não* a projeção `MeetsOwnGoals`, que é pessimista por causa da penalidade de co-ocupação e classificaria mal o link-alvo). Migração **imediata** (sem dwell): a condição é estável e o `EnforceRouting` (binding) torna a decisão **efetiva** no físico — só por isso este mecanismo funciona agora (ver limitação #14).
+**Considerate eviction.** A **satisfied** VO/VI that shares its current link with **BE/BK** is starving them by EDCA (rule: BE/BK never coexist well with VO/VI). If a **clean** link exists (no resident BE/BK) with **capacity** for all the high-priority demand that would end up there, the VO/VI **migrates to it** — even without improving its own satisfaction — freeing the current link for the BE/BK. Implemented by `FindConsiderateEvictTarget`, which uses `estimatedCapacity ≥ Σ(VO/VI demand)` (**measured capacity**, *not* the `MeetsOwnGoals` projection, which is pessimistic due to the co-occupancy penalty and would misclassify the target link). The migration is **immediate** (no dwell): the condition is stable, and `EnforceRouting` (binding) makes the decision **effective** in the physical distribution — this is the only reason this mechanism works now (see limitation #14).
 
-- **Sem ping-pong / seguro**: só dispara para VO/VI com BE/BK no link atual E um alvo limpo com espaço. Depois de mover, o novo link não tem BE/BK → não volta a disparar. Se nenhum alvo limpo couber, fica em `STAY_SATISFIED` (preserva o caso legítimo em que o VO/VI **tem** de partilhar com o BE — `CAT2_PRIORITY_OVERRIDE`).
+- **No ping-pong / safe**: it only fires for VO/VI with a BE/BK on the current link AND a clean target with room. After moving, the new link has no BE/BK → it does not fire again. If no clean target fits, it stays in `STAY_SATISFIED` (preserving the legitimate case where the VO/VI **must** share with the BE — `CAT2_PRIORITY_OVERRIDE`).
 
-### Passo 3 — Cascata explícita de três categorias
+### Step 3 — Explicit three-category cascade
 
-| Categoria | Condição | Significado |
+| Category | Condition | Meaning |
 |-----------|----------|-------------|
-| **1 — CAT1_CLEAN** | `MeetsOwnGoals` **e** `!WouldHarmResident` | Cumpro os meus objetivos sem prejudicar ninguém |
-| **2 — CAT2_PRIORITY_OVERRIDE** | `MeetsOwnGoals` **mas** `WouldHarmResident` | Cumpro os meus objetivos à custa de outro AC — aceitável porque a prioridade EDCA é legítima |
-| **3 — CAT3_BEST_EFFORT** | Não cumpro em lado nenhum | Último recurso: melhor pontuação possível |
+| **1 — CAT1_CLEAN** | `MeetsOwnGoals` **and** `!WouldHarmResident` | I meet my objectives without harming anyone |
+| **2 — CAT2_PRIORITY_OVERRIDE** | `MeetsOwnGoals` **but** `WouldHarmResident` | I meet my objectives at another AC's expense — acceptable because EDCA priority is legitimate |
+| **3 — CAT3_BEST_EFFORT** | I meet them nowhere | Last resort: best achievable score |
 
-Escolhe sempre a melhor categoria (1 > 2 > 3) e, dentro dela, o link com melhor `ComputeExpectedQosSatisfaction`.
+It always picks the best category (1 > 2 > 3) and, within it, the link with the best `ComputeExpectedQosSatisfaction`.
 
 - **`MeetsOwnGoals(ac, sta, link)`** → `ComputeExpectedQosSatisfaction(...) >= OwnGoalsThreshold` (0.90).
-- **`WouldHarmResident(ac, sta, link)`** → procura, entre os residentes de **outros ACs** (os do mesmo AC são saltados — a co-occupancy trata deles), o de pior `currentSat`; se for `<= HarmThreshold` (0.70), considera que haveria dano.
+- **`WouldHarmResident(ac, sta, link)`** → searches, among residents of **other ACs** (same-AC residents are skipped — co-occupancy handles them), for the one with the worst `currentSat`; if it is `<= HarmThreshold` (0.70), it deems that harm would occur.
 
-### Passo 4 — Vetos de prioridade
+### Step 4 — Priority vetoes
 
-Ver [Mecanismos de prevenção](#2-vetos-de-prioridade-bebk-nunca-partilham-link-com-vovi).
+See [Prevention mechanisms](#2-priority-vetoes-bebk-never-share-a-link-with-vovi).
 
-### Passo 5 — Histerese + debounce
+### Step 5 — Hysteresis + debounce
 
 ```
-se bestLink != currentLink:
+if bestLink != currentLink:
     improvement = bestScore − currentSat
-    se improvement > MigrationThreshold:
-        → debounce (dwell): a intenção tem de persistir ≥ 1 s
-    senão:
-        STAY_HYSTERESIS  (limpa a intenção pendente)
-senão:
-    STAY_HYSTERESIS / STAY_BEST  (limpa a intenção pendente)
+    if improvement > MigrationThreshold:
+        → debounce (dwell): the intent must persist for ≥ 1 s
+    else:
+        STAY_HYSTERESIS  (clears the pending intent)
+else:
+    STAY_HYSTERESIS / STAY_BEST  (clears the pending intent)
 ```
 
 ---
 
-## Métricas por-STA — estimadas pelo próprio AP (sem feedback dos STAs)
+## Per-STA metrics — estimated by the AP itself (no STA feedback)
 
-A satisfação **medida** (`currentSat`) é estimada **só com informação do AP**, na sua própria
-**camada de traffic-control** (queue-disc do AP), e alimentada ao scheduler via `FeedStaQos` a
-cada 1 s (em `CalculateStats`, no `.cc`). **Não precisa de feedback dos STAs.** Isto remove a
-antiga dependência dos sinks (ver o ponto #5 em [Limitações conhecidas](#limitações-conhecidas)).
+The **measured** satisfaction (`currentSat`) is estimated **using AP information only**, at the AP's own
+**traffic-control layer** (the AP's queue-disc), and fed to the scheduler via `FeedStaQos` every
+1 s (in `CalculateStats`, in the `.cc`). **It needs no STA feedback.** This removes the old
+dependency on the sinks (see item #5 in [Known limitations](#known-limitations)).
 
-Cada pacote é seguido do **topo da pilha do AP** (enqueue no traffic-control) até ser **confirmado
-(ACK)** no MAC — captando toda a espera (fila TC **+** fila MAC + acesso ao canal) e os drops.
+Each packet is tracked from the **top of the AP's stack** (traffic-control enqueue) until it is **acknowledged
+(ACK)** at the MAC — capturing all the waiting (TC queue **+** MAC queue + channel access) and the drops.
 
-| Dimensão | Fonte (só-AP, downlink) | Como |
+| Dimension | Source (AP-only, downlink) | How |
 |---|---|---|
-| **Throughput** | `Dequeue` do MAC (entregues) × `payloadSize` | goodput exato = `nEntregues × payload × 8 / dt` (o AP conhece o payload da sua app → sem overhead de cabeçalhos) |
-| **Delay / Jitter** | `Enqueue` do TC → `Dequeue` do MAC (ACK) | por pacote, `t_ACK − t_TCenqueue` (o `uid` do pacote casa entre as duas camadas → 100% match) |
-| **Loss** | `Enqueue`/`DropBeforeEnqueue` do TC + `Dequeue` do MAC | `1 − entregues / oferecidos`, `oferecidos = TC-enfileirados + drops pré-fila` (overlimit do TC + pré-enqueue do MAC) |
+| **Throughput** | MAC `Dequeue` (delivered) × `payloadSize` | exact goodput = `nDelivered × payload × 8 / dt` (the AP knows its application's payload → no header overhead) |
+| **Delay / Jitter** | TC `Enqueue` → MAC `Dequeue` (ACK) | per packet, `t_ACK − t_TCenqueue` (the packet `uid` matches across the two layers → 100% match) |
+| **Loss** | TC `Enqueue`/`DropBeforeEnqueue` + MAC `Dequeue` | `1 − delivered / offered`, `offered = TC-enqueued + pre-queue drops` (TC overlimit + MAC pre-enqueue) |
 
-> **Validação vs sinks (all-BE, N=192).** Comparado com as medições end-to-end dos sinks (verdade):
-> **loss** erro médio 0.0001; **delay** erro 0.19 ms (mesmo com os ~200 ms de espera na saturação
-> do arranque); **throughput** exato após a correção de goodput; **jitter** mesma ordem. A flag
-> `--decisionMetrics=ap|sink` alterna a fonte da decisão (`ap` por defeito); o CSV
-> `metric_comparison` regista sempre ambas (sink vs AP) para auditoria.
+> **Validation vs the sinks (all-BE, N=192).** Compared with the sinks' end-to-end measurements (ground truth):
+> **loss** mean error 0.0001; **delay** error 0.19 ms (even with the ~200 ms of startup-saturation waiting);
+> **throughput** exact after the goodput fix; **jitter** same order of magnitude. The flag
+> `--decisionMetrics=ap|sink` switches the decision source (`ap` by default); the
+> `metric_comparison` CSV always records both (sink vs AP) for auditing.
 
-> ### Nota histórica: porquê medir na camada TC (e não no MAC)?
+> ### Historical note: why measure at the TC layer (and not the MAC)?
 >
-> Medir só na **fila MAC** subestimava delay e loss **sob congestão**: no all-BE, 100% dos drops e
-> ~90% da espera estão **acima** do MAC, na fila do traffic-control (overlimit). Medir no **topo**
-> (TC-enqueue) até ao ACK capta tudo → bate com o sink. As métricas dos sinks foram a **referência**
-> que validou esta estimativa-AP.
+> Measuring at the **MAC queue** only underestimated delay and loss **under congestion**: in the all-BE case, 100% of the drops and
+> ~90% of the waiting occur **above** the MAC, in the traffic-control queue (overlimit). Measuring at the **top**
+> (TC enqueue) through to the ACK captures everything → it matches the sink. The sink metrics were the **reference**
+> that validated this AP-side estimate.
 
-> ### Porquê métricas reais? (bug encontrado)
+> ### Why real metrics? (bug found)
 >
-> Originalmente o scheduler usava métricas do próprio MAC:
-> - O **PER** vinha de `1 − txSuccess/txAttempts`. O `txAttempts` contava **todos** os MPDUs agregados no início da TX, mas o `txSuccess` era alimentado pelo trace `AckedMpdu`, que captava apenas **~5%** dos MPDUs entregues → **PER falso de ~95%** e throughput medido a ~5% do real.
-> - Com os pesos de loss+tp, isto **capava a satisfação do VO em ~0.70** (o teto dado por delay+jitter). Como `StayThreshold` é 0.75, **nada fixava por `STAY_SATISFIED`** — todos os ACs ficavam eternamente à mercê da cascata ruidosa. Foi a raiz de quase todas as instabilidades iniciais.
+> Originally the scheduler used metrics from its own MAC:
+> - The **PER** came from `1 − txSuccess/txAttempts`. `txAttempts` counted **all** the MPDUs aggregated at the start of the TX, but `txSuccess` was fed by the `AckedMpdu` trace, which captured only **~5%** of the delivered MPDUs → a **false PER of ~95%** and throughput measured at ~5% of the real value.
+> - With the loss+tp weights, this **capped VO satisfaction at ~0.70** (the ceiling given by delay+jitter). Since `StayThreshold` is 0.75, **nothing was pinned by `STAY_SATISFIED`** — every AC was permanently at the mercy of the noisy cascade. This was the root of nearly all the initial instabilities.
 >
-> ### Porquê a loss acumulada do FlowMonitor? (segundo bug)
+> ### Why the FlowMonitor cumulative loss? (second bug)
 >
-> A primeira tentativa de corrigir a loss usou `1 − throughput/oferecido`. Isso **não é perda** — é o *défice de throughput*. Uma flutuação normal de 1 janela (o VI receber 144 em vez de 150 Mbps, por variação de enfileiramento) aparecia como "3.7% de loss"; com `maxPacketLoss = 0.01` para o VI, a sigmoide derrubava o `curSat` de 0.665 → 0.465 e disparava uma migração espúria.
+> The first attempt to fix loss used `1 − throughput/offered`. That **is not loss** — it is the *throughput deficit*. A normal 1-window fluctuation (the VI receiving 144 instead of 150 Mbps, from queueing variance) appeared as "3.7% loss"; with `maxPacketLoss = 0.01` for the VI, the sigmoid dragged `curSat` from 0.665 → 0.465 and triggered a spurious migration.
 >
-> A loss **acumulada** do FlowMonitor não tem esse ruído: pacotes em voo na fronteira da janela são insignificantes face a todo o histórico, e o valor converge para a perda real (~0 num link saudável, elevada num congestionado).
+> The FlowMonitor **cumulative** loss has no such noise: packets in flight at the window boundary are insignificant against the whole history, and the value converges to the real loss (~0 on a healthy link, high on a congested one).
 
 ---
 
-## Mecanismos de prevenção
+## Prevention mechanisms
 
-Cada um destes existe por causa de um bug **observado em simulação**. Estão documentados como *sintoma → causa → mecanismo*.
+Each of these exists because of a bug **observed in simulation**. They are documented as *symptom → cause → mechanism*.
 
-### 1. Bootstrap por prioridade + warmup (`kWarmupSamples = 2`)
+### 1. Priority bootstrap + warmup (`kWarmupSamples = 2`)
 
-- **Sintoma**: no cold-start (t≈2.5 s) o BE e o VO **trocavam de link ao mesmo tempo** — o BE fugia para o rápido, o VO para o lento — e ficavam presos na configuração errada.
-- **Causa**: a **1.ª janela de medição está contaminada pelo ramp-up**. O VO media `curSat = 0.469` em vez do seu valor real (~0.87). Com todos a parecerem mal no link atual e o outro link (vazio) a projetar bem, todos migravam ao mesmo tempo.
-- **Mecanismo**: até um fluxo ter **2 amostras** reais (`StaQos::samples >= 2`), a alocação é forçada por prioridade EDCA (VO/VI → melhor link; BE/BK → 2º melhor link em triband, pior link em dualband) e a cascata **nem corre**. Salta-se a janela contaminada; quando a cascata arranca, o `curSat` já reflete a realidade e o `STAY_SATISFIED` trava todos no sítio certo.
-  - **Triband — porquê BE/BK no 2º melhor link (5 GHz), não no pior (2.4 GHz)**: o link de 2.4 GHz é o de menor capacidade; arrancar aí os ACs de baixa prioridade sub-utilizava logo à partida o 5 GHz e sobrecarregava o 2.4 GHz. Com o bootstrap em `m_linksByRank[1]` (=5 GHz), o BE/BK partem de um link com muito mais capacidade e o 2.4 GHz fica disponível para o balanceador/cascata o preencher conforme a carga.
+- **Symptom**: at cold-start (t≈2.5 s) BE and VO **swapped links at the same time** — BE fled to the fast link, VO to the slow one — and got stuck in the wrong configuration.
+- **Cause**: the **1st measurement window is contaminated by the ramp-up**. The VO measured `curSat = 0.469` instead of its real value (~0.87). With everyone looking bad on the current link and the other (empty) link projecting well, they all migrated at once.
+- **Mechanism**: until a flow has **2 real samples** (`StaQos::samples >= 2`), the allocation is forced by EDCA priority (VO/VI → best link; BE/BK → 2nd-best link in tri-band, worst link in dual-band) and the cascade **does not even run**. The contaminated window is skipped; when the cascade starts, `curSat` already reflects reality and `STAY_SATISFIED` pins everyone in the right place.
+  - **Tri-band — why BE/BK on the 2nd-best link (5 GHz), not the worst (2.4 GHz)**: the 2.4 GHz link is the lowest-capacity one; starting the low-priority ACs there immediately under-utilised 5 GHz and overloaded 2.4 GHz. With the bootstrap on `m_linksByRank[1]` (=5 GHz), BE/BK start from a much higher-capacity link and 2.4 GHz is left available for the balancer/cascade to fill according to load.
 
-### 2. Vetos de prioridade (BE/BK nunca partilham link com VO/VI)
+### 2. Priority vetoes (BE/BK never share a link with VO/VI)
 
-> **Estes vetos não são um workaround temporário — são a modelação deliberada de uma física que o modelo analítico não consegue exprimir.** A fome do EDCA é um fenómeno de **acesso ao canal**, não de largura de banda: um BE que compete com um VO no mesmo link **não obtém oportunidades de transmissão** (o VO, com AIFSN=2/CWmin=3, reapanha o canal quase imediatamente; o AIFS+backoff do BE quase nunca expira), mesmo que haja airtime livre no agregado. Um BE que colapsa para 4.95 Mbps num link com ~57% de airtime "livre" prova-o. Nenhum modelo baseado em **capacidade ou airtime** (que é o que os motores 2–5 medem) captaria isto — só um modelo de saturação EDCA tipo Bianchi, que está fora do âmbito. Os vetos codificam essa física diretamente e são **permanentes**.
+> **These vetoes are not a temporary workaround — they are the deliberate modelling of a physical effect that the analytic model cannot express.** EDCA starvation is a **channel-access** phenomenon, not a bandwidth one: a BE competing with a VO on the same link **gets no transmission opportunities** (the VO, with AIFSN=2/CWmin=3, reacquires the channel almost immediately; the BE's AIFS+backoff almost never expires), even if there is free airtime in aggregate. A BE collapsing to 4.95 Mbps on a link with ~57% "free" airtime proves it. No model based on **capacity or airtime** (which is what engines 2–5 measure) would capture this — only a Bianchi-style EDCA saturation model, which is out of scope. The vetoes encode that physics directly and are **permanent**.
 
-A regra física: **BE/BK num link com VO/VI nunca têm oportunidade de transmissão** (EDCA). Ambos os lados são vetados, mas com rigor diferente.
+The physical rule: **BE/BK on a link with VO/VI never get a transmission opportunity** (EDCA). Both sides are vetoed, but with different strictness.
 
-**(a) Veto anti-downgrade VO/VI** — um VO/VI no link rápido não desce para o lento se:
-- for o **único do seu AC** no rápido (`CountCoResidents == 0`), **ou**
-- o link de destino tiver um **BE/BK residente** (`acIdx < AC_VI`),
+**(a) VO/VI anti-downgrade veto** — a VO/VI on the fast link does not go down to the slow one if:
+- it is the **only one of its AC** on the fast link (`CountCoResidents == 0`), **or**
+- the destination link has a **resident BE/BK** (`acIdx < AC_VI`),
 
-**exceto** se estiver genuinamente esfomeado (`currentSat < kStarvationFloor = 0.60`) — aí cede e pode descer, porque o VO tem prioridade sobre o BE.
+**except** if it is genuinely starved (`currentSat < kStarvationFloor = 0.60`) — then it yields and may go down, because VO has priority over BE.
 
-- **Sintoma**: um dos 2 VOs derivava para o link lento e ficava lá, esfomeando o BE que lá estava.
-- **Causa**: os dois links projetavam praticamente **igual** para o VO (`0.963223` vs `0.963183` — diferença de 0.00004!). O VO é dominado por delay (peso tp = 0.05), logo a capacidade é quase irrelevante e a decisão virava uma moeda ao ar.
-- **Nota**: o sinal de fome usa o `currentSat` **medido**, não a projeção. A projeção foi testada e falhava — colapsava no 6 GHz e abria a exceção por ruído.
+- **Symptom**: one of the 2 VOs drifted to the slow link and stayed there, starving the BE that was there.
+- **Cause**: both links projected almost **equal** for the VO (`0.963223` vs `0.963183` — a difference of 0.00004!). The VO is dominated by delay (tp weight = 0.05), so capacity is almost irrelevant and the decision became a coin flip.
+- **Note**: the starvation signal uses the **measured** `currentSat`, not the projection. The projection was tried and failed — it collapsed at 6 GHz and opened the exception through noise.
 
-**(b) Veto simétrico BE/BK** — um BE/BK **nunca** migra para um link onde residam VO/VI. **Sem exceção**.
+**(b) Symmetric BE/BK veto** — a BE/BK **never** migrates to a link where VO/VI reside. **No exception.**
 
-- **Sintoma**: no par 2.4+6 GHz, o BE estava perfeitamente bem no 2.4 GHz (`tp = 150`, `delay = 0.66 ms`) e mesmo assim migrou para o 6 GHz — e colapsou: **`tp` 150 → 4.95 Mbps, `delay` 647 ms, `loss` 22%**.
-- **Causa**: a projeção deu **0.9696** ao BE no 6 GHz. O modelo vê a capacidade bruta livre ("~700 Mbps disponíveis") e **ignora que o BE será esfomeado por EDCA** pelos VO/VI residentes. No 5 GHz a capacidade bruta é menor, a projeção deu 0.651 e o BE não se mexeu — **foi sorte, não lógica**.
-- **Porquê sem exceção**: para um BE/BK, ir para o link dos VO/VI **nunca ajuda** — seria mais esfomeado, não menos.
+- **Symptom**: on the 2.4+6 GHz pair, the BE was perfectly fine on 2.4 GHz (`tp = 150`, `delay = 0.66 ms`) and yet migrated to 6 GHz — and collapsed: **`tp` 150 → 4.95 Mbps, `delay` 647 ms, `loss` 22%**.
+- **Cause**: the projection gave **0.9696** to the BE on 6 GHz. The model sees the free raw capacity ("~700 Mbps available") and **ignores that the BE will be starved by EDCA** by the resident VO/VI. At 5 GHz the raw capacity is lower, the projection gave 0.651 and the BE did not move — **that was luck, not logic**.
+- **Why no exception**: for a BE/BK, going to the VO/VI link **never helps** — it would be more starved, not less.
 
-### 3. Debounce de migração (`kMigrationDwellSec = 1.0`)
+### 3. Migration debounce (`kMigrationDwellSec = 1.0`)
 
-- **Sintoma**: a meio de uma simulação estável (t≈11 s), o VI saltava para o link lento e perturbava o BE, recuperando 1–2 s depois.
-- **Causa**: **variância normal de partilha de airtime EDCA**. Numa janela de 1 s os VOs apanharam ligeiramente mais airtime e o VI mediu 144 em vez de 150 Mbps (os VOs, no mesmo link, não caíram — prova de que não era um evento físico do link). A migração daí resultante **auto-perturbava-se** e sustentava o estado mau na janela seguinte.
-- **Mecanismo**: quando a cascata quer migrar, a intenção é **registada** (`MIGRATE_PENDING`) mas não executada. Só migra se a mesma intenção (mesmo link alvo) persistir ≥ 1 s — ou seja, se sobreviver a pelo menos uma **nova janela de medição**. Se a intenção desaparecer, é limpa. Isto quebra o ciclo: ao não migrar na janela ruidosa, a seguinte fica limpa e a intenção evapora-se.
+- **Symptom**: midway through a stable simulation (t≈11 s), the VI jumped to the slow link and disturbed the BE, recovering 1–2 s later.
+- **Cause**: **normal EDCA airtime-sharing variance**. In a 1 s window the VOs grabbed slightly more airtime and the VI measured 144 instead of 150 Mbps (the VOs, on the same link, did not drop — proof that it was not a physical link event). The resulting migration **self-disturbed** and sustained the bad state in the following window.
+- **Mechanism**: when the cascade wants to migrate, the intent is **recorded** (`MIGRATE_PENDING`) but not executed. It only migrates if the same intent (same target link) persists for ≥ 1 s — that is, if it survives at least one **new measurement window**. If the intent disappears, it is cleared. This breaks the loop: by not migrating in the noisy window, the next one is clean and the intent evaporates.
 
-### 4. Exclusão de beacons (`IsRoutableSta`)
+### 4. Beacon exclusion (`IsRoutableSta`)
 
-Este é o mecanismo mais subtil, e vale a pena perceber em detalhe.
+This is the subtlest mechanism, and worth understanding in detail.
 
-- **Sintoma**: no cenário all-BE, os 4 STAs ficavam **presos no link lento** (`delay = 217 ms`, `loss = 58%`, `tp = 62 Mbps`) com o link rápido **vazio**. As métricas estavam corretas (`curSat = 0.157`) e o `improvement` era 0.45 (muito acima do threshold) — os BEs **queriam** migrar, mas alternavam eternamente entre `MIGRATE_PENDING` e `STAY_HYSTERESIS`, com **zero migrações**.
+- **Symptom**: in the all-BE scenario, the 4 STAs got **stuck on the slow link** (`delay = 217 ms`, `loss = 58%`, `tp = 62 Mbps`) with the fast link **empty**. The metrics were correct (`curSat = 0.157`) and `improvement` was 0.45 (well above the threshold) — the BEs **wanted** to migrate, but alternated endlessly between `MIGRATE_PENDING` and `STAY_HYSTERESIS`, with **zero migrations**.
 
-- **A pista**: os instantes dos `MIGRATE_PENDING` estavam espaçados **~102.4 ms** — exatamente o **intervalo de beacon do ns-3**.
+- **The clue**: the `MIGRATE_PENDING` timestamps were spaced **~102.4 ms** apart — exactly the **ns-3 beacon interval**.
 
-- **Causa**:
-  1. Beacons são frames **broadcast**. Em `GetLinkIds`, qualquer broadcast é chaveado como `(ff:ff:ff:ff:ff:ff, AC)` — com AC de alta prioridade.
-  2. Como cada beacon tem só **1 link elegível**, entra pelo *early return* de `DecideLinkMigration`, que **grava em `m_lastSelectedLink` mas não escreve no CSV** — daí só se ver AC=0 no ficheiro, apesar de existir uma entrada fantasma de alta prioridade.
-  3. Essa entrada saltava de link a cada beacon. Quando apontava para o link alvo, o **veto simétrico BE/BK** via "há um VO ali" → `bestLink = currentLink` → `STAY_HYSTERESIS`.
-  4. O ramo `STAY_HYSTERESIS` **apaga o `m_pendingMigration`** → o dwell reiniciava. Com o beacon a repetir **10×/segundo** e o dwell a precisar de 1 s, **nunca completava**.
+- **Cause**:
+  1. Beacons are **broadcast** frames. In `GetLinkIds`, any broadcast is keyed as `(ff:ff:ff:ff:ff:ff, AC)` — with a high-priority AC.
+  2. Since each beacon has only **1 eligible link**, it takes the *early return* of `DecideLinkMigration`, which **writes to `m_lastSelectedLink` but does not write to the CSV** — hence only AC=0 is seen in the file, despite a high-priority phantom entry existing.
+  3. That entry jumped from link to link with every beacon. When it pointed at the target link, the **symmetric BE/BK veto** saw "there is a VO there" → `bestLink = currentLink` → `STAY_HYSTERESIS`.
+  4. The `STAY_HYSTERESIS` branch **erases `m_pendingMigration`** → the dwell restarted. With the beacon repeating **10×/second** and the dwell needing 1 s, it **never completed**.
 
-- **Mecanismo**:
+- **Mechanism**:
   ```cpp
   static bool IsRoutableSta(const Mac48Address& a) { return !a.IsGroup(); }
   ```
-  `IsGroup()` cobre broadcast e multicast. O filtro `if (!IsRoutableSta(key.first)) continue;` é aplicado nos **5 scans de residência**:
-  1. penalidade altruísta (`ComputeExpectedQosSatisfaction`)
+  `IsGroup()` covers broadcast and multicast. The filter `if (!IsRoutableSta(key.first)) continue;` is applied in the **5 residency scans**:
+  1. altruistic penalty (`ComputeExpectedQosSatisfaction`)
   2. `CountCoResidents` (co-occupancy)
   3. `WouldHarmResident`
-  4. veto anti-downgrade VO/VI (`wouldStarveLowPrio`)
-  5. veto simétrico BE/BK (`highPrioOnTarget`) ← o que corrigia o bug
+  4. VO/VI anti-downgrade veto (`wouldStarveLowPrio`)
+  5. symmetric BE/BK veto (`highPrioOnTarget`) ← the one that fixed the bug
 
-  O **encaminhamento** dos beacons não muda — apenas deixam de contar como "residentes" de um link.
+  The **routing** of the beacons does not change — they simply stop counting as "residents" of a link.
 
-### 5. Balanceamento de links ociosos (`RebalanceIdleLinks`)
+### 5. Idle-link balancing (`RebalanceIdleLinks`)
 
-> **Nota de filosofia**: este mecanismo adiciona um **segundo objetivo** — até aqui o scheduler só *satisfazia QoS*; agora também *aproveita links ociosos*. É uma escolha deliberada.
+> **Philosophy note**: this mechanism adds a **second objective** — until now the scheduler only *satisfied QoS*; now it also *makes use of idle links*. It is a deliberate choice.
 
-- **Sintoma**: em cenários homogéneos (all-BE) ou onde vários fluxos cabem no melhor link (2VO+2VI), **todos os STAs acabam no mesmo link e o outro fica parado**. Espalhar a carga melhora as métricas (menos contenção, menos delay).
-- **Causa**: depois de a `UtilityFunction` dar ~0.99 a um fluxo bem servido, o `STAY_SATISFIED` trava-o e ele deixa de explorar o link vazio. O balanceamento tem de ser **explícito**.
-- **Mecanismo** (em `UpdatePeriodicMetrics`, um movimento por janela):
-  1. **Gate**: **todos** os fluxos routáveis satisfeitos (`curSat ≥ StayThreshold`). Se algum não está, o cascade está a resgatá-lo → não se balanceia.
-  2. **Alvo homogéneo**: só se move para um link **vazio** ou que **só contenha fluxos da mesma AC** do candidato.
-  3. Move o fluxo de **menor prioridade EDCA** (não-VO — voz pinada) de um link com ≥2 fluxos, **e apenas se reduzir o desequilíbrio** (`flows(source) > flows(target)+1`).
-  4. **Ordem dos alvos: melhor→pior.** Prefere-se **primeiro o link de melhor qualidade** (ex.: 5 GHz antes do 2.4 GHz); só quando esse enche é que se passa ao seguinte. (Antes era pior→melhor.)
-  5. **Teste de folga (encher até à capacidade real):** exige-se `folga ≥ targetThroughput` para **qualquer** candidato, com uma **capacidade fiável** por link — a **medida** quando o alvo já tem tráfego, e a **nominal por banda** (`NominalCapByFreq`: 2.4→150, 5→400, 6→500 Mbps) quando está **ocioso** (a capacidade de um link vazio não é medível). Como a nominal ≥ demanda em todas as bandas, o **1º fluxo entra sempre**; só o **excedente** é limitado — 2.4 GHz aguenta 1 VI, 5 GHz aguenta 2, etc.
+- **Symptom**: in homogeneous scenarios (all-BE), or where several flows fit on the best link (2VO+2VI), **all STAs end up on the same link and the other one sits idle**. Spreading the load improves the metrics (less contention, less delay).
+- **Cause**: after `UtilityFunction` gives ~0.99 to a well-served flow, `STAY_SATISFIED` pins it and it stops exploring the empty link. Balancing has to be **explicit**.
+- **Mechanism** (in `UpdatePeriodicMetrics`, one move per window):
+  1. **Gate**: **all** routable flows satisfied (`curSat ≥ StayThreshold`). If any is not, the cascade is rescuing it → do not balance.
+  2. **Homogeneous target**: a flow is only moved to a link that is **empty** or that **contains only flows of the same AC** as the candidate.
+  3. It moves the **lowest EDCA-priority** flow (non-VO — voice is pinned) from a link with ≥2 flows, **and only if it reduces the imbalance** (`flows(source) > flows(target)+1`).
+  4. **Target order: best → worst.** The **highest-quality link is preferred first** (e.g. 5 GHz before 2.4 GHz); only when it fills up is the next one considered. (It used to be worst → best.)
+  5. **Headroom test (fill up to real capacity):** `headroom ≥ targetThroughput` is required for **any** candidate, using a **reliable capacity** per link — the **measured** one when the target already carries traffic, and the **per-band nominal** (`NominalCapByFreq`: 2.4→150, 5→400, 6→500 Mbps) when it is **idle** (an empty link's capacity is not measurable). Since the nominal ≥ demand in every band, the **1st flow always enters**; only the **excess** is limited — 2.4 GHz holds 1 VI, 5 GHz holds 2, etc.
 
-  **A regra do alvo homogéneo é o núcleo de segurança** — substitui um "veto bidirecional" por algo mais forte: **o balanceador nunca mistura ACs**. Consequências:
-  - Nunca cria BE/BK com VO/VI (em nenhum sentido). *(Foi o bug de uma versão anterior: um VI era movido para cima de um BE. Aqui não acontece — o link do BE não é vazio nem "só-VI".)*
-  - Um grupo novo **só arranca num link vazio**; depois enche-se com a mesma AC enquanto houver folga → **iterativo**, o "quantos migram" emerge da capacidade (ex.: triband 2VO+2VI → os 2 VIs vão primeiro para o 5 GHz; com o 2.4 GHz ainda ocioso, um deles migra depois para lá — 5 GHz aguenta 2, 2.4 GHz aguenta 1).
-  - Impede a **consolidação inversa** (mover um VI de volta para o link dos VOs) → sem ping-pong.
+  **The homogeneous-target rule is the safety core** — it replaces a "bidirectional veto" with something stronger: **the balancer never mixes ACs**. Consequences:
+  - It never creates BE/BK together with VO/VI (in either direction). *(This was a bug in an earlier version: a VI was moved on top of a BE. It cannot happen here — the BE's link is neither empty nor "VI-only".)*
+  - A new group **only starts on an empty link**; it then fills up with the same AC while there is headroom → **iterative**, the "how many migrate" emerges from capacity (e.g. tri-band 2VO+2VI → both VIs first go to 5 GHz; with 2.4 GHz still idle, one of them then migrates there — 5 GHz holds 2, 2.4 GHz holds 1).
+  - It prevents **reverse consolidation** (moving a VI back to the VOs' link) → no ping-pong.
 
-  **Anti-oscilação**: cooldown global (`kRebalanceCooldownSec = 2 s`) + por-fluxo (`kFlowBalanceCooldownSec = 10 s`). Se um movimento degradar um fluxo, o cascade puxa-o de volta e o cooldown impede o re-empurrão.
+  **Anti-oscillation**: global cooldown (`kRebalanceCooldownSec = 2 s`) + per-flow (`kFlowBalanceCooldownSec = 10 s`). If a move degrades a flow, the cascade pulls it back and the cooldown prevents the re-push.
 
-  > **Importante — a decisão do balanceador é *consultiva*, não *vinculativa*.** Como o `RebalanceIdleLinks` só altera o `m_lastSelectedLink` (que enviesa o pedido de acesso ao canal no enqueue), o resultado observado no tráfego físico pode diferir da atribuição decidida. Ver [Conselho vs. execução](#conselho-enqueue-vs-execução-dequeue-porque-o-all-be-usa-os-dois-links).
+  > **Important — the balancer's decision is *advisory*, not *binding*.** Since `RebalanceIdleLinks` only alters `m_lastSelectedLink` (which biases the channel-access request at enqueue), the observed physical traffic may differ from the decided assignment. See [Advice vs. execution](#advice-enqueue-vs-execution-dequeue-why-all-be-uses-both-links).
 
 
-### 6. Poda de fluxos inativos (apps que param, ex.: antes de um *switch* de AC)
+### 6. Pruning of inactive flows (apps that stop, e.g. before an AC *switch*)
 
-- **Sintoma**: num cenário com *switch* (ex.: `be>vo`), as apps BB param a meio. As suas entradas ficavam eternamente em `m_lastSelectedLink` com **satisfação congelada** da fase 1 (`ComputeQosSatisfaction` usa `m_staQos`, que deixa de ser alimentado). Como esse valor costuma ser `< StayThreshold`, envenenava o **gate do balanceador** (nunca mais espalhava) e os fluxos obsoletos "residiam" como **fantasmas** na cascata (`WouldHarmResident`/co-ocupação), impedindo os fluxos ativos de migrar para links ociosos.
-- **Mecanismo** (início de `UpdatePeriodicMetrics`): cada `(STA,AC)` regista o instante do último enqueue (`m_lastActivitySec`, atualizado em `DecideLinkMigration`). Um fluxo sem enqueues há `> kInactivityTimeoutSec` (1 s ≈ 2 janelas) é **podado**: limpam-se as máscaras de binding (`UnblockQueues` em todos os links) e apaga-se de `m_lastSelectedLink`, `m_currentSatisfaction`, `m_boundLink`, `m_hasMeasuredSat`, `m_pendingMigration`, `m_lastFlowBalanceSec`, `m_staQos`.
-- **Fiável**: uma app *esfomeada mas ativa* continua a enfileirar → não é podada; só apps genuinamente paradas o são.
+- **Symptom**: in a *switch* scenario (e.g. `be>vo`), the BE apps stop midway. Their entries lingered forever in `m_lastSelectedLink` with **frozen phase-1 satisfaction** (`ComputeQosSatisfaction` uses `m_staQos`, which stops being fed). Since that value is usually `< StayThreshold`, it poisoned the **balancer's gate** (it never spread again) and the stale flows "resided" as **phantoms** in the cascade (`WouldHarmResident`/co-occupancy), preventing the active flows from migrating to idle links.
+- **Mechanism** (start of `UpdatePeriodicMetrics`): each `(STA,AC)` records the timestamp of its last enqueue (`m_lastActivitySec`, updated in `DecideLinkMigration`). A flow with no enqueues for `> kInactivityTimeoutSec` (1 s ≈ 2 windows) is **pruned**: its binding masks are cleared (`UnblockQueues` on all links) and it is erased from `m_lastSelectedLink`, `m_currentSatisfaction`, `m_boundLink`, `m_hasMeasuredSat`, `m_pendingMigration`, `m_lastFlowBalanceSec`, `m_staQos`.
+- **Reliable**: a *starved-but-active* app keeps enqueuing → it is not pruned; only genuinely stopped apps are.
 
 ---
 
-## Conselho (enqueue) vs. execução (dequeue): porque o all-BE usa os dois links
+## Advice (enqueue) vs. execution (dequeue): why all-BE uses both links
 
-Esta secção explica um comportamento que **surpreende**: apesar de o scheduler decidir **um link por (STA, AC)**, no cenário **all-BE** cada STA acaba a transmitir nos **dois** links em simultâneo (~28% no 2.4GHz / ~72% no 5GHz em 2+5; ~50/50 em 5+6). **Isto não é uma decisão do scheduler** — é uma consequência da arquitetura do ns-3 por baixo dele.
+This section explains a behaviour that **surprises**: although the scheduler decides **one link per (STA, AC)**, in the **all-BE** scenario each STA ends up transmitting on **both** links simultaneously (~28% on 2.4 GHz / ~72% on 5 GHz in 2+5; ~50/50 in 5+6). **This is not a scheduler decision** — it is a consequence of the ns-3 architecture underneath it.
 
-### A decisão do scheduler só actua no *enqueue*
+### The scheduler's decision only acts at *enqueue*
 
-`GetLinkIds(ac, mpdu)` é chamado quando o MAC tem um MPDU pronto a **enfileirar** (`Txop::Queue`). Devolve **1 link** (via `DecideLinkMigration`), mas esse valor só serve para decidir **em que link se pede acesso ao canal**. **Não fixa o frame a esse link.**
+`GetLinkIds(ac, mpdu)` is called when the MAC has an MPDU ready to **enqueue** (`Txop::Queue`). It returns **1 link** (via `DecideLinkMigration`), but that value only decides **which link the channel-access request is made on**. **It does not pin the frame to that link.**
 
-### O *dequeue* é feito pelo delegate Fcfs, que ignora a decisão
+### The *dequeue* is done by the Fcfs delegate, which ignores the decision
 
-A parte crítica está em quem serve a fila no momento da transmissão. Ao fazer `m_delegate->SetWifiMac(mac)`, é o **delegate `FcfsWifiQueueScheduler`** que se regista como scheduler de cada `WifiMacQueue` (`WifiMacQueueSchedulerImpl::SetWifiMac` → `queue->SetScheduler(this)`). O `QosWeightedMloScheduler` estende `WifiMacQueueScheduler` **diretamente** e não faz esse wiring. Logo:
+The critical part is who serves the queue at transmission time. When `m_delegate->SetWifiMac(mac)` is called, it is the **`FcfsWifiQueueScheduler` delegate** that registers as the scheduler of each `WifiMacQueue` (`WifiMacQueueSchedulerImpl::SetWifiMac` → `queue->SetScheduler(this)`). `QosWeightedMloScheduler` extends `WifiMacQueueScheduler` **directly** and does not do that wiring. Therefore:
 
-- **`WifiMacQueue::m_scheduler == delegate` (Fcfs)**, não o nosso scheduler.
-- No caminho de transmissão, `Peek`/`PeekFirstAvailable(linkId)` chamam `GetNext` do **delegate** — **Fcfs puro** sobre a fila partilhada da AC, que serve **qualquer** STA a **qualquer** link com acesso. O nosso override de `GetNext` **nunca é chamado pela fila**, e o `m_lastSelectedLink` **nunca** é consultado no dequeue.
+- **`WifiMacQueue::m_scheduler == delegate` (Fcfs)**, not our scheduler.
+- On the transmission path, `Peek`/`PeekFirstAvailable(linkId)` call the **delegate's** `GetNext` — **pure Fcfs** over the AC's shared queue, which serves **any** STA on **any** link with access. Our `GetNext` override is **never called by the queue**, and `m_lastSelectedLink` is **never** consulted at dequeue.
 
-### Porque isto espalha o tráfego
+### Why this spreads the traffic
 
-O acesso ao canal é **por-AC** (há um `Txop` por AC), não por-STA. No all-BE, o balanceador aconselha 1 BE ao 2.4GHz e 3 ao 5GHz → **ambos** os links passam a pedir acesso para a AC BE → **ambos** os `Txop`-BE ganham acesso → cada um, ao transmitir, puxa da fila BE partilhada **o próximo frame de qualquer STA** (Fcfs). Resultado: os frames de cada STA saem pelos dois links.
+Channel access is **per-AC** (there is one `Txop` per AC), not per-STA. In all-BE, the balancer advises 1 BE to 2.4 GHz and 3 to 5 GHz → **both** links start requesting access for AC BE → **both** BE `Txop`s win access → each, when transmitting, pulls from the shared BE queue **the next frame of any STA** (Fcfs). Result: each STA's frames go out on both links.
 
-### Evidência medida (prova *bound-vs-real*)
+### Measured evidence (*bound-vs-real* proof)
 
-Instrumentámos temporariamente cada frame **confirmado (ACKed)** a comparar o link **decidido** (`m_lastSelectedLink`) com o link **real** (lido do endereço do AP em `Addr2`). No **all-BE 2+5**, o scheduler decidiu **exatamente o 1-3 pretendido — STA0→2.4GHz, STA1/2/3→5GHz** — mas fisicamente:
+We temporarily instrumented each **acknowledged (ACKed)** frame to compare the **decided** link (`m_lastSelectedLink`) with the **real** link (read from the AP's address in `Addr2`). In **all-BE 2+5**, the scheduler decided **exactly the intended 1-3 split — STA0→2.4 GHz, STA1/2/3→5 GHz** — but physically:
 
-| STA | decidido | 2.4GHz (real) | 5GHz (real) |
+| STA | decided | 2.4 GHz (real) | 5 GHz (real) |
 |-----|----------|---------------|-------------|
-| 0 | 2.4GHz | 829 | **732** (≠ decidido) |
-| 1 | 5GHz | **807** (≠ decidido) | 752 |
-| 2 | 5GHz | **836** (≠ decidido) | 807 |
-| 3 | 5GHz | **804** (≠ decidido) | 791 |
+| 0 | 2.4 GHz | 829 | **732** (≠ decided) |
+| 1 | 5 GHz | **807** (≠ decided) | 752 |
+| 2 | 5 GHz | **836** (≠ decided) | 807 |
+| 3 | 5 GHz | **804** (≠ decided) | 791 |
 
-Ou seja: **intenção = 1-3 limpo; execução = ~50/50**. O STA0, decidido para o 2.4GHz, enviou quase metade dos frames no 5GHz; os STA1/2/3, decididos para o 5GHz, enviaram quase metade no 2.4GHz.
+That is: **intent = clean 1-3; execution = ~50/50**. STA0, decided for 2.4 GHz, sent almost half its frames on 5 GHz; STA1/2/3, decided for 5 GHz, sent almost half on 2.4 GHz.
 
-### Porque os cenários de prioridade (2VO+2VI, …) *parecem* limpos
+### Why the priority scenarios (2VO+2VI, …) *look* clean
 
-O espalhamento só acontece quando fluxos da **mesma AC** estão separados por links diferentes. Nos cenários de prioridade, cada AC fica **junta** num link (os 2 VO juntos no rápido, os 2 VI juntos no 5GHz) → o outro link **nunca** contende por essa AC → praticamente **sem espalhamento**. O 73/27 residual dos VI é apenas o **transiente de bootstrap** (o VI arranca no link rápido e assenta no 5GHz), não partilha em regime.
+Spreading only happens when flows of the **same AC** are separated across different links. In the priority scenarios, each AC stays **together** on one link (the 2 VOs together on the fast link, the 2 VIs together on 5 GHz) → the other link **never** contends for that AC → practically **no spreading**. The residual 73/27 of the VIs is just the **bootstrap transient** (the VI starts on the fast link and settles on 5 GHz), not steady-state sharing.
 
-Da mesma forma, o **bootstrap parece "vinculativo"** (link rápido a 0% para os BE) só porque **todos** os fluxos aconselham o **mesmo** link — o outro nunca pede acesso a essa AC. A "regra" vem da ausência de contenção, não de o binding ser aplicado.
+Likewise, the **bootstrap looks "binding"** (fast link at 0% for the BEs) only because **all** flows advise the **same** link — the other one never requests access for that AC. The "rule" comes from the absence of contention, not from binding being enforced.
 
-### O espalhamento é uma interação natural do MLO em modo STR
+### Spreading is a natural interaction of MLO in STR mode
 
-Antes de o ver como um "defeito", vale a pena reconhecer que este espalhamento é um **comportamento natural e importante do MLO em modo STR** (Simultaneous Transmit and Receive). Com **filas partilhadas por-AC** e **CSMA independente por link**, qualquer link livre pode servir o frame *head-of-line* dessa AC — distribuindo naturalmente o tráfego de um mesmo fluxo pelos vários links disponíveis. É, na prática, **agregação de links legítima**: satisfaz todos os STAs e aproveita a capacidade agregada. O contraste **VO (100% num link) vs VI (50/50)** explica-se só por isto: o VO aconselha sempre o mesmo link → o outro nunca ativa o loop de acesso à AC VO; os VI ficaram separados por links → **ambos** os `Txop`-VI ativos → o Fcfs alimenta os dois.
+Before viewing this as a "defect", it is worth recognising that this spreading is a **natural and important behaviour of MLO in STR mode** (Simultaneous Transmit and Receive). With **per-AC shared queues** and **independent per-link CSMA**, any free link can serve that AC's *head-of-line* frame — naturally distributing a single flow's traffic across the available links. It is, in practice, **legitimate link aggregation**: it satisfies all STAs and exploits the aggregate capacity. The contrast **VO (100% on one link) vs VI (50/50)** is explained solely by this: the VO always advises the same link → the other never activates the VO AC's access loop; the VIs ended up separated across links → **both** VI `Txop`s active → Fcfs feeds both.
 
-### Como se tornou vinculativo (implementado — binding por queue-blocking)
+### How it became binding (implemented — queue-blocking binding)
 
-Para os cenários em que **queremos** que a decisão seja uma **ordem** (sem espalhamento), o scheduler amarra fisicamente cada fluxo ao link decidido através de **máscaras de bloqueio no delegate** — o único mecanismo que o `GetNext` do delegate respeita:
+For scenarios where we **want** the decision to be an **order** (no spreading), the scheduler physically pins each flow to the decided link via **block masks on the delegate** — the only mechanism the delegate's `GetNext` respects:
 
-- **`EnforceRouting(ac, dest, chosenLink)`** (`mlo-qos-weighted-scheduler.h`), chamado no fim de `GetLinkIds`: para o (STA, AC), faz `m_delegate->BlockQueues(WIFI_SCHEDULER_ROUTING, …)` em **todos os links exceto** o escolhido e `UnblockQueues` no escolhido. A fila desse (STA, AC) fica com um bit de máscara ativo nos links errados → `GetNext(ac, linkId)` **salta-a** aí → o frame só é servido no link decidido. Sem espalhamento.
-- Usa um **reason novo, `WIFI_SCHEDULER_ROUTING`**, adicionado ao enum `WifiQueueBlockedReason` do **core** do ns-3 (todas as razões existentes são geridas pela MAC e seriam limpas por ela). Ver a secção [Alterações ao core do ns-3](#alterações-ao-core-do-ns-3).
-- Detalhes que fazem isto funcionar: o container de QoS data unicast é chaveado por `(WIFI_QOSDATA_QUEUE, UNICAST, RA=endereço-MLD-do-STA, tid)` — coincide com o `dest` que o scheduler já usa; o `BlockQueues` é chamado com `txAddress = GetMac()->GetAddress()` (endereço MLD do AP), **condição para o `InitQueueInfo` popular a máscara por-link**; e bloqueiam-se os 2 TIDs da AC.
-- Para não congelar a migração, o `GetLinkIds` apura os links elegíveis **ignorando o próprio `WIFI_SCHEDULER_ROUTING`** — a decisão continua a "ver" todos os links; o binding só restringe o **dequeue físico**, não a decisão.
-- `m_boundLink[(STA,AC)]` guarda o link amarrado; só se re-bloqueia quando a decisão **muda** (evita trabalho por-frame). Numa migração, reamarra no mesmo passo (bloqueia o antigo, desbloqueia o novo).
+- **`EnforceRouting(ac, dest, chosenLink)`** (`mlo-qos-weighted-scheduler.h`), called at the end of `GetLinkIds`: for the (STA, AC), it calls `m_delegate->BlockQueues(WIFI_SCHEDULER_ROUTING, …)` on **all links except** the chosen one and `UnblockQueues` on the chosen one. That (STA, AC)'s queue gets a mask bit set on the wrong links → `GetNext(ac, linkId)` **skips it** there → the frame is only served on the decided link. No spreading.
+- It uses a **new reason, `WIFI_SCHEDULER_ROUTING`**, added to the ns-3 **core** `WifiQueueBlockedReason` enum (all existing reasons are managed by the MAC and would be cleared by it). See the [Changes to the ns-3 core](#changes-to-the-ns-3-core) section.
+- Details that make this work: the unicast QoS-data container is keyed by `(WIFI_QOSDATA_QUEUE, UNICAST, RA=STA-MLD-address, tid)` — matching the `dest` the scheduler already uses; `BlockQueues` is called with `txAddress = GetMac()->GetAddress()` (the AP's MLD address), **the condition for `InitQueueInfo` to populate the per-link mask**; and both TIDs of the AC are blocked.
+- To avoid freezing migration, `GetLinkIds` determines the eligible links **while ignoring `WIFI_SCHEDULER_ROUTING` itself** — the decision still "sees" all links; the binding only restricts the **physical dequeue**, not the decision.
+- `m_boundLink[(STA,AC)]` stores the pinned link; it is only re-blocked when the decision **changes** (avoiding per-frame work). On a migration, it re-pins in the same step (blocking the old link, unblocking the new one).
 
-> **Trabalho futuro — reexplorar o espalhamento.** O binding elimina o espalhamento por defeito, mas o espalhamento STR é um mecanismo **desejável** a explorar (aproveitamento de capacidade agregada por-fluxo). Fica como trabalho futuro poder **reativá-lo seletivamente** (ex.: por AC, ou quando o link-alvo está saturado) — existe um plano próprio para essa interação.
+> **Future work — revisiting spreading.** Binding removes spreading by default, but STR spreading is a **desirable** mechanism to explore (exploiting per-flow aggregate capacity). It remains future work to be able to **re-enable it selectively** (e.g. per AC, or when the target link is saturated) — there is a dedicated plan for that interaction.
 
 ---
 
-## Tabela de todas as variáveis configuráveis
+## Table of all configurable variables
 
-### Atributos ns-3 (via `SetAttribute`)
+### ns-3 attributes (via `SetAttribute`)
 
-| Atributo | Variável C++ | Valor efetivo | O que controla |
+| Attribute | C++ variable | Effective value | What it controls |
 |----------|--------------|-------------|------------------|
-| `StayThreshold` | `m_stayThreshold` | **0.75** | Satisfação mínima para nem avaliar alternativas. Mais alto → reavalia mais; mais baixo → mais "preguiçoso". |
-| `MigrationThreshold` | `m_migrationThreshold` | **0.25** | Ganho mínimo para justificar migração. Mais alto → mais estável; mais baixo → mais reativo, risco de oscilação. |
-| `MetricsInterval` | `m_metricsIntervalSec` | **0.5 s** | Frequência de recálculo dos Motores 1–4. |
-| `OwnGoalsThreshold` | `m_ownGoalsThreshold` | **0.90** | Score mínimo para um link contar como "cumpro os meus objetivos" (Cat1/Cat2). |
-| `HarmThreshold` | `m_harmThreshold` | **0.70** | Satisfação abaixo da qual um residente é considerado "prejudicado". |
+| `StayThreshold` | `m_stayThreshold` | **0.75** | Minimum satisfaction to not even evaluate alternatives. Higher → re-evaluates more; lower → "lazier". |
+| `MigrationThreshold` | `m_migrationThreshold` | **0.25** | Minimum gain to justify a migration. Higher → more stable; lower → more reactive, oscillation risk. |
+| `MetricsInterval` | `m_metricsIntervalSec` | **0.5 s** | Recomputation frequency of Engines 1–4. |
+| `OwnGoalsThreshold` | `m_ownGoalsThreshold` | **0.90** | Minimum score for a link to count as "I meet my objectives" (Cat1/Cat2). |
+| `HarmThreshold` | `m_harmThreshold` | **0.70** | Satisfaction below which a resident is considered "harmed". |
 
-> Os valores de `StayThreshold` / `MigrationThreshold` são **impostos pelo script** (`g_stayThreshold` / `g_migrationThreshold` no `.cc`, também expostos na CLI via `--stayThreshold` / `--migrationThreshold`). Os defaults do header são iguais (0.75 / 0.25).
+> The `StayThreshold` / `MigrationThreshold` values are **imposed by the script** (`g_stayThreshold` / `g_migrationThreshold` in the `.cc`, also exposed on the CLI via `--stayThreshold` / `--migrationThreshold`). The header defaults are the same (0.75 / 0.25).
 
-### Constantes hardcoded (não são atributos ns-3)
+### Hardcoded constants (not ns-3 attributes)
 
-| Constante | Valor | Local | Significado | Justificação |
+| Constant | Value | Location | Meaning | Rationale |
 |-----------|-------|-------|-------------|--------------|
-| `kWarmupSamples` | 2 | `UpdatePeriodicMetrics` | Janelas de medição antes de libertar o bootstrap | **(P)** A 1ª janela vem contaminada pelo ramp-up; é preciso saltá-la e usar a 2ª (limpa). 2 é o **mínimo** para haver uma janela limpa antes de libertar — 1 não saltaria nada, mais alto atrasaria a convergência sem ganho. |
-| `kMigrationDwellSec` | 1.0 s | `DecideLinkMigration` | Persistência exigida a uma intenção de migração | **(P)** Igual à cadência do `FeedStaQos` (1 s). Garante que a intenção sobrevive a **≥1 janela de medição nova** antes de executar → filtra blips de 1 janela. Menor não veria medição fresca; maior atrasaria migrações genuínas. |
-| `kStarvationFloor` | 0.60 | `DecideLinkMigration` | `currentSat` abaixo do qual um VO/VI é "esfomeado" (abre a exceção do veto) | **(P/E)** Fronteiras lógicas: **< `StayThreshold` (0.75)** (senão um fluxo satisfeito abriria o veto) e **> degradação transitória**. 0.60 fica na banda "claramente mal, mas não catastrófico"; o dígito exato não é crítico dentro dela. |
-| `kRebalanceCooldownSec` | 2.0 s | `RebalanceIdleLinks` | Intervalo mínimo entre movimentos de balanceamento | **(E)** Deixa as métricas estabilizar entre movimentos. Conservador; qualquer valor de alguns segundos serve. |
-| `kFlowBalanceCooldownSec` | 10.0 s | `RebalanceIdleLinks` | Tempo mínimo antes de re-mexer no mesmo fluxo | **(E)** Anti-ping-pong: se o cascade puxar um fluxo de volta, não o re-empurramos logo. Valor folgado, não crítico. |
-| `perAlpha` | 0.3 | `UpdatePeriodicMetrics` | Suavização EWMA do PER proxy | **(E)** Fator EWMA convencional: 30% amostra nova / 70% histórico. Equilibra reatividade e estabilidade. Mais alto = mais ruidoso; mais baixo = mais lento a reagir. Não crítico. |
-| Blend final | 0.65 / 0.25 / 0.10 | `ComputeExpectedQosSatisfaction` | `baseSat` / `capabilityScore` / `perPenalty` | **(E)** Afinado (era 0.8/0.1/0.1). A satisfação QoS **domina** (0.65, sinal primário); a capacidade do link é um **secundário forte** (0.25, subido para dar mais peso a links capazes/com folga); o PER é um empurrão menor (0.10). **Soma 1.** Importa a *proporção*, não os dígitos. |
-| Limiar "esfomeado" (altruísta A) | 0.45 | idem | Residente tratado como esfomeado | **(P/E)** Abaixo do ponto médio 0.5 → o residente está claramente na **metade insatisfeita**. Marca "este AC já sofre" para disparar a penalidade reativa. |
-| Penalidade base (altruísta A) | 0.6 | idem | `(0.6 − otherSat)`, máx. 0.6 | **(E)** Define a magnitude: penalidade máx. 0.6 (residente a 0), mín. 0.15 (residente a 0.45). Forte para afastar candidatos de um residente esfomeado, sem aniquilar o score (em [0,1]). |
-| Limiar headroom (altruísta B) | 0.75 | idem | Satisfação abaixo da qual a preventiva pode disparar | **(P/E)** Coincide com o antigo `StayThreshold`: **acima de 0.75** o residente está confortável e um recém-chegado não é ameaça; **abaixo**, é. Fronteira "confortável vs apertado". |
-| Teto da preventiva (B) | 0.5 | idem | Máximo que (B) subtrai | **(P)** Salvaguarda: a preventiva nunca corta mais de **metade** do score → sozinha não decide uma migração de forma catastrófica. |
-| Carga proxy em cold-start | 0.15 | idem | `NormalisedLoad` assumida sem medição | **(E)** Sem medição, assume-se ~15% de carga para a preventiva **não ser nula só por falta de dados**. Pequeno e conservador. |
-| Fator pressão → delay | 0.3 | idem | `delay × (1 + pressure×0.3)` | **(P/E)** O delay é **diretamente** agravado pela contenção (mais competição → mais espera na fila) → fator maior. Subido de 0.2 → 0.3 empiricamente. |
-| Fator pressão → jitter | 0.2 | idem | `jitter × (1 + pressure×0.2)` | **(P/E)** O jitter (variação do delay) sofre com a contenção mas de forma **menos direta** que o delay médio → fator **menor** (0.2 < 0.3). |
-| `m_edcaWeights[4][4]` | ver Motor 4 | construtor | Matriz de pressão de contenção | **(P/E)** Codifica a assimetria real do EDCA (AIFS/CW): VO (AIFSN=2/CWmin=3) sente pouco os de baixo; BE/BK (AIFS/CW longos) sentem muito os de cima. A **ordem de grandeza** (VO/VI ≫ BK/BE na coluna) é física; os valores exatos (8.0, 6.0…) são afinados. |
+| `kWarmupSamples` | 2 | `UpdatePeriodicMetrics` | Measurement windows before releasing the bootstrap | **(P)** The 1st window is contaminated by the ramp-up; it must be skipped and the 2nd (clean) one used. 2 is the **minimum** to have one clean window before releasing — 1 would skip nothing, higher would delay convergence for no gain. |
+| `kMigrationDwellSec` | 1.0 s | `DecideLinkMigration` | Persistence required of a migration intent | **(P)** Equal to the `FeedStaQos` cadence (1 s). Guarantees the intent survives **≥1 new measurement window** before executing → filters 1-window blips. Smaller would not see fresh measurement; larger would delay genuine migrations. |
+| `kStarvationFloor` | 0.60 | `DecideLinkMigration` | `currentSat` below which a VO/VI is "starved" (opens the veto exception) | **(P/E)** Logical bounds: **< `StayThreshold` (0.75)** (otherwise a satisfied flow would open the veto) and **> transient degradation**. 0.60 sits in the "clearly bad, but not catastrophic" band; the exact digit is not critical within it. |
+| `kRebalanceCooldownSec` | 2.0 s | `RebalanceIdleLinks` | Minimum interval between balancing moves | **(E)** Lets the metrics settle between moves. Conservative; any few-seconds value works. |
+| `kFlowBalanceCooldownSec` | 10.0 s | `RebalanceIdleLinks` | Minimum time before touching the same flow again | **(E)** Anti-ping-pong: if the cascade pulls a flow back, we do not immediately re-push it. Generous value, not critical. |
+| `perAlpha` | 0.3 | `UpdatePeriodicMetrics` | EWMA smoothing of the PER proxy | **(E)** Conventional EWMA factor: 30% new sample / 70% history. Balances reactivity and stability. Higher = noisier; lower = slower to react. Not critical. |
+| Final blend | 0.65 / 0.25 / 0.10 | `ComputeExpectedQosSatisfaction` | `baseSat` / `capabilityScore` / `perPenalty` | **(E)** Tuned (was 0.8/0.1/0.1). QoS satisfaction **dominates** (0.65, primary signal); link capability is a **strong secondary** (0.25, raised to give more weight to capable/spare links); the PER is a minor nudge (0.10). **Sums to 1.** The *proportion* matters, not the digits. |
+| "Starved" threshold (altruistic A) | 0.45 | idem | Resident treated as starved | **(P/E)** Below the 0.5 midpoint → the resident is clearly in the **unsatisfied half**. Marks "this AC already suffers" to trigger the reactive penalty. |
+| Base penalty (altruistic A) | 0.6 | idem | `(0.6 − otherSat)`, max 0.6 | **(E)** Sets the magnitude: max penalty 0.6 (resident at 0), min 0.15 (resident at 0.45). Strong enough to steer candidates away from a starved resident, without annihilating the score (in [0,1]). |
+| Headroom threshold (altruistic B) | 0.75 | idem | Satisfaction below which the preventive branch may fire | **(P/E)** Coincides with the old `StayThreshold`: **above 0.75** the resident is comfortable and a newcomer is no threat; **below**, it is. The "comfortable vs tight" boundary. |
+| Preventive cap (B) | 0.5 | idem | Maximum that (B) subtracts | **(P)** Safeguard: the preventive branch never cuts more than **half** the score → it alone cannot catastrophically decide a migration. |
+| Proxy load at cold-start | 0.15 | idem | `NormalisedLoad` assumed without measurement | **(E)** Without measurement, ~15% load is assumed so the preventive branch **is not null just from a lack of data**. Small and conservative. |
+| Pressure → delay factor | 0.3 | idem | `delay × (1 + pressure×0.3)` | **(P/E)** Delay is **directly** worsened by contention (more competition → more queue waiting) → larger factor. Raised from 0.2 → 0.3 empirically. |
+| Pressure → jitter factor | 0.2 | idem | `jitter × (1 + pressure×0.2)` | **(P/E)** Jitter (delay variation) suffers from contention but **less directly** than the mean delay → **smaller** factor (0.2 < 0.3). |
+| `m_edcaWeights[4][4]` | see Engine 4 | constructor | Contention-pressure matrix | **(P/E)** Encodes the real EDCA asymmetry (AIFS/CW): VO (AIFSN=2/CWmin=3) barely feels those below it; BE/BK (long AIFS/CW) feel those above them strongly. The **order of magnitude** (VO/VI ≫ BK/BE in the column) is physical; the exact values (8.0, 6.0…) are tuned. |
 
-> **P = princípio** (o valor deriva de algo concreto — cadência, fronteira lógica, soma = 1; defensável com rigor) · **E = empírico** (afinado por observação; o que importa é a *banda*, não o dígito). A distinção é deliberada: um scheduler heurístico assume que várias constantes são afinadas dentro de uma gama razoável, e o comportamento é robusto a pequenas variações delas.
+> **P = principle** (the value derives from something concrete — a cadence, a logical boundary, a sum = 1; defensible rigorously) · **E = empirical** (tuned by observation; what matters is the *band*, not the digit). The distinction is deliberate: a heuristic scheduler assumes several constants are tuned within a reasonable range, and the behaviour is robust to small variations of them.
 
-Para alterar qualquer uma destas é preciso editar o `.h` e recompilar.
+Changing any of these requires editing the `.h` and recompiling.
 
-### Pesos e objetivos por AC
+### Per-AC weights and objectives
 
-| Estrutura | Campos | Como configurar |
+| Structure | Fields | How to configure |
 |-----------|--------|------------------|
-| `AcGoals` | `targetThroughputMbps`, `maxDelayMs`, `maxJitterMs`, `maxPacketLoss` | `SetGoals(ac, tp, delay, jitter, loss)` — **não é chamado atualmente**; valem os defaults do construtor |
-| `AcWeights` | `delayWeight`, `jitterWeight`, `lossWeight`, `throughputWeight` | `SetWeights(ac, delay, jitter, loss, tp)` — chamado pelo `.cc`; cada peso tem CLI própria (ex: `--voDelayWeight`) |
+| `AcGoals` | `targetThroughputMbps`, `maxDelayMs`, `maxJitterMs`, `maxPacketLoss` | `SetGoals(ac, tp, delay, jitter, loss)` — **not currently called**; the constructor defaults apply |
+| `AcWeights` | `delayWeight`, `jitterWeight`, `lossWeight`, `throughputWeight` | `SetWeights(ac, delay, jitter, loss, tp)` — called by the `.cc`; each weight has its own CLI flag (e.g. `--voDelayWeight`) |
 
 ---
 
-## APIs de alimentação externa
+## External feed APIs
 
-O scheduler não lê diretamente do PHY/MAC — o script de simulação liga *traces* e chama:
+The scheduler does not read directly from the PHY/MAC — the simulation script wires up *traces* and calls:
 
-| Função | Quando chamar | Alimenta |
+| Function | When to call | Feeds |
 |--------|----------------|----------|
-| `FeedStaQos(sta, ac, tp, delay, jitter, loss)` | periodicamente (1 s, em `CalculateStats`) | **`m_staQos`** — as métricas que definem `currentSat` (por defeito estimadas pelo AP na camada TC; sinks só com `--decisionMetrics=sink`) |
-| `FeedLinkPhyState(linkId, txVector, per)` | `PhyTxPsduBegin` | EWMA de data rate e PER (Motor 2) |
-| `FeedLinkTxAttempt(linkId, ac, nFrames)` | `PhyTxPsduBegin` | `txAttempts` (denominador do PER proxy) |
-| `FeedLinkDrop(linkId, ac)` | drops de fila/MAC | `dropFrames` (numerador do PER proxy) |
-| `FeedLinkMetrics(linkId, ac, bytes, frames, drops)` | `AckedMpdu` | `txBytes` (diagnóstico) e `dropFrames`. **`frames` é ignorado** (ver nota) |
-| `FeedPacketTransmitted(linkId, ac, bytes, airtime, peer, tid)` | `PhyTxPsduBegin` (SU) | Motor 3 (throughput/airtime/flows) |
-| `FeedLinkTxStart` / `FeedLinkTxEnd` | `PhyTxBegin` / `PhyTxEnd` | Tempo ocupado (`channelUtilization`, `freeAirtime`) |
+| `FeedStaQos(sta, ac, tp, delay, jitter, loss)` | periodically (1 s, in `CalculateStats`) | **`m_staQos`** — the metrics that define `currentSat` (by default estimated by the AP at the TC layer; sinks only with `--decisionMetrics=sink`) |
+| `FeedLinkPhyState(linkId, txVector, per)` | `PhyTxPsduBegin` | EWMA of data rate and PER (Engine 2) |
+| `FeedLinkTxAttempt(linkId, ac, nFrames)` | `PhyTxPsduBegin` | `txAttempts` (denominator of the PER proxy) |
+| `FeedLinkDrop(linkId, ac)` | queue/MAC drops | `dropFrames` (numerator of the PER proxy) |
+| `FeedLinkMetrics(linkId, ac, bytes, frames, drops)` | `AckedMpdu` | `txBytes` (diagnostics) and `dropFrames`. **`frames` is ignored** (see note) |
+| `FeedPacketTransmitted(linkId, ac, bytes, airtime, peer, tid)` | `PhyTxPsduBegin` (SU) | Engine 3 (throughput/airtime/flows) |
+| `FeedLinkTxStart` / `FeedLinkTxEnd` | `PhyTxBegin` / `PhyTxEnd` | Occupied time (`channelUtilization`, `freeAirtime`) |
 
-> **Nota sobre `FeedLinkMetrics`**: o parâmetro `txFrames` deixou de ser usado. Alimentava o antigo `txSuccess` do PER, que subcontava ~5% dos MPDUs. O parâmetro mantém-se apenas para não quebrar a assinatura pública.
+> **Note on `FeedLinkMetrics`**: the `txFrames` parameter is no longer used. It fed the old PER `txSuccess`, which under-counted ~5% of the MPDUs. The parameter is kept only so as not to break the public signature.
 
 ---
 
-## Logging e diagnóstico
+## Logging and diagnostics
 
-`EnableDecisionCsv(filename, nodeContext)` gera um CSV com uma linha por decisão:
+`EnableDecisionCsv(filename, nodeContext)` produces a CSV with one row per decision:
 
 ```
 Timestamp, NodeContext, AC, SelectedLink, Decision, CurrentSat, ExpectedSat,
@@ -602,84 +602,84 @@ CompetitionPressure, EffectiveCapMbps, CapabilityScore, AvgDelayMs, AvgJitterMs,
 PER, ChannelUtil, Throughput, ProjCurrentLink
 ```
 
-As colunas `AvgDelayMs`, `AvgJitterMs`, `PER` e `Throughput` mostram as **métricas reais por-STA** (de `m_staQos`) quando disponíveis, com fallback aos proxies por-link.
+The `AvgDelayMs`, `AvgJitterMs`, `PER`, and `Throughput` columns show the **real per-STA metrics** (from `m_staQos`) when available, falling back to the per-link proxies.
 
-A coluna **`ProjCurrentLink`** é a projeção (`ComputeExpectedQosSatisfaction`) do link **onde o fluxo está**. Serve de teste de consistência interna: deve aproximar-se de `CurrentSat` (a satisfação medida no mesmo link). Se divergirem muito, a projeção está errada — e é a mesma projeção que julga os *outros* links. É a melhor métrica para avaliar a correção da capacidade (limitação #1).
+The **`ProjCurrentLink`** column is the projection (`ComputeExpectedQosSatisfaction`) of the link **where the flow currently is**. It serves as an internal-consistency check: it should be close to `CurrentSat` (the measured satisfaction on the same link). If they diverge greatly, the projection is wrong — and it is the same projection that judges the *other* links. It is the best metric for assessing the correctness of the capacity estimate (limitation #1).
 
-Valores possíveis de `Decision`:
+Possible `Decision` values:
 
-| Decisão | Significado |
+| Decision | Meaning |
 |---|---|
-| `BOOTSTRAP_PRIORITY` | Alocação forçada por prioridade (ainda em warmup) |
-| `STAY_SATISFIED` | `currentSat >= StayThreshold` — nem avaliou alternativas |
-| `MIGRATE_CONSIDERATE_EVICT` | VO/VI satisfeito saiu de um link partilhado com BE/BK para um link limpo com capacidade (ver [Passo 2](#passo-2--stay_satisfied--expulsão-considerada)) |
-| `STAY_HYSTERESIS` | Avaliou, mas o ganho não compensa (ou o melhor link é o atual) |
-| `STAY_BEST` | Ficou no melhor link, sem âncora prévia |
-| `MIGRATE_PENDING` | **Quer** migrar; a aguardar confirmação do dwell (1 s) |
-| `MIGRATE_CAT1_CLEAN` | Migrou: cumpre objetivos sem prejudicar ninguém |
-| `MIGRATE_CAT2_PRIORITY_OVERRIDE` | Migrou: cumpre objetivos, mas prejudica um residente |
-| `MIGRATE_CAT3_BEST_EFFORT` | Migrou: não cumpre em lado nenhum, foi para o menos mau |
+| `BOOTSTRAP_PRIORITY` | Allocation forced by priority (still in warmup) |
+| `STAY_SATISFIED` | `currentSat >= StayThreshold` — did not even evaluate alternatives |
+| `MIGRATE_CONSIDERATE_EVICT` | A satisfied VO/VI left a link shared with BE/BK for a clean link with capacity (see [Step 2](#step-2--stay_satisfied-and-considerate-eviction)) |
+| `STAY_HYSTERESIS` | Evaluated, but the gain does not pay off (or the best link is the current one) |
+| `STAY_BEST` | Stayed on the best link, with no prior anchor |
+| `MIGRATE_PENDING` | **Wants** to migrate; awaiting dwell confirmation (1 s) |
+| `MIGRATE_CAT1_CLEAN` | Migrated: meets objectives without harming anyone |
+| `MIGRATE_CAT2_PRIORITY_OVERRIDE` | Migrated: meets objectives, but harms a resident |
+| `MIGRATE_CAT3_BEST_EFFORT` | Migrated: meets them nowhere, went to the least-bad option |
 
-> Um `MIGRATE_PENDING` que nunca é seguido de um `MIGRATE_*` significa que o dwell filtrou ruído — comportamento **esperado**.
+> A `MIGRATE_PENDING` never followed by a `MIGRATE_*` means the dwell filtered noise — **expected** behaviour.
 
-`PrintFinalScores()` imprime, no fim, a pontuação projetada e a satisfação atual de cada fluxo em cada link.
+`PrintFinalScores()` prints, at the end, the projected score and current satisfaction of each flow on each link.
 
 ---
 
-## Limitações conhecidas
+## Known limitations
 
-Análise honesta do estado atual. Nada aqui impede os cenários testados de convergir, mas são fraquezas estruturais reais.
+An honest analysis of the current state. Nothing here prevents the tested scenarios from converging, but they are real structural weaknesses.
 
-1. **A projeção mede capacidade/airtime, não *acesso* — e por isso não modela a fome do EDCA.** Este é o limite de fundo: os motores 2–5 estimam *quanto do meio está ocupado*, não *quem consegue aceder ao canal*. A fome do BE junto a VO/VI (colapso para 4.95 Mbps com 57% de airtime livre) é um fenómeno de acesso que **nenhum modelo de capacidade capta** — só um modelo de saturação EDCA tipo Bianchi (fora do âmbito).
-   > **O que impede o colapso do BE é o veto, não a capacidade.** Historicamente (antes do veto simétrico existir), a projeção do BE dava ~0.97 num link com VO/VI e o BE migrava para lá e colapsava. Hoje o **veto simétrico** impede o BE/BK de migrar para um link com VO/VI **independentemente de qualquer número de capacidade** — é a única representação viável da fome de acesso e é **permanente** (ver §2 dos mecanismos).
-   > **O que a correção da capacidade faz (separado do acima)**: torna a projeção honesta nas *outras* decisões (cascata Cat1/2/3, `MeetsOwnGoals`, co-occupancy), que **não** têm um veto a protegê-las. O `estimatedCapacityMbps` deixou de ser a taxa PHY nominal (que **sobrestimava** ~5×: 3722 Mbps) e passa a ser **medido** (subestimação conservadora, ~655–982 conforme a carga — ver Motor 2). O `NormalisedLoad` passou de "mistura entre ACs" (somava sempre 1) para "utilização real". A projeção do link atual convergiu com a satisfação medida para VO/VI (erro ~0.11, ver coluna `ProjCurrentLink` do CSV).
+1. **The projection measures capacity/airtime, not *access* — and therefore does not model EDCA starvation.** This is the underlying limit: engines 2–5 estimate *how much of the medium is occupied*, not *who can access the channel*. BE starvation next to VO/VI (collapse to 4.95 Mbps with 57% free airtime) is an access phenomenon that **no capacity model captures** — only a Bianchi-style EDCA saturation model (out of scope).
+   > **What prevents the BE collapse is the veto, not the capacity.** Historically (before the symmetric veto existed), the BE projection gave ~0.97 on a link with VO/VI and the BE migrated there and collapsed. Today the **symmetric veto** prevents BE/BK from migrating to a link with VO/VI **regardless of any capacity number** — it is the only viable representation of access starvation and is **permanent** (see §2 of the mechanisms).
+   > **What the capacity fix does (separate from the above)**: it makes the projection honest in the *other* decisions (Cat1/2/3 cascade, `MeetsOwnGoals`, co-occupancy), which have **no** veto protecting them. `estimatedCapacityMbps` is no longer the nominal PHY rate (which **overestimated** by ~5×: 3722 Mbps) and is now **measured** (a conservative underestimate, ~655–982 depending on load — see Engine 2). `NormalisedLoad` went from "mixture between ACs" (always summed to 1) to "real utilisation". The current-link projection converged with the measured satisfaction for VO/VI (error ~0.11, see the CSV's `ProjCurrentLink` column).
 
-2. **Assimetria medido-vs-projetado + `effCap` mede *o que sobra*, não *o que eu receberia*.** Dois defeitos da projeção que coexistem:
-   - *Assimetria*: o `currentSat` (link atual) vem de métricas reais por-STA; a projeção dos *outros* links usa proxies por-(link,AC). Comparar os dois em `improvement = bestScore − currentSat` é comparar grandezas diferentes.
-   - *effCap residual*: a projeção pergunta *"quanto sobra aqui?"* em vez de *"quanto é que EU receberia aqui?"*. Um fluxo **bem servido**, que usa tudo o que precisa, vê "nada a sobrar" no seu próprio link e projeta-se mal lá.
-   - *capacidade subestimada*: `estimatedCapacity` é o rate efetivo à carga atual (limitado pela agregação A-MPDU), que **subestima o máximo saturado** (~655–982 medidos vs ~1600 reais no 6 GHz — ver Motor 2). É conservador (nunca sobrestima), logo a projeção de "quanto caberia aqui" é **pessimista** — o que é seguro, mas significa que o scheduler acha os links mais cheios do que estão.
-   > **Impacto medido — real mas inofensivo**: a projeção do BE no seu próprio link diverge da satisfação medida (projetado **0.46** vs medido **0.99**) em links de **baixa capacidade** (2.4GHz, onde o BE consome quase tudo); no 5GHz, com folga, converge (erro 0.07). Não causa decisão errada porque o `STAY_SATISFIED` (0.99) dispara sempre e a projeção má nunca chega a ser usada. Corrigi-lo exigiria um modelo de partilha de airtime — não vale o esforço.
+2. **Measured-vs-projected asymmetry + `effCap` measures *what is left over*, not *what I would receive*.** Two coexisting projection defects:
+   - *Asymmetry*: `currentSat` (current link) comes from real per-STA metrics; the projection of the *other* links uses per-(link,AC) proxies. Comparing the two in `improvement = bestScore − currentSat` compares different quantities.
+   - *residual effCap*: the projection asks *"how much is left over here?"* instead of *"how much would I receive here?"*. A **well-served** flow, using everything it needs, sees "nothing left over" on its own link and projects poorly there.
+   - *underestimated capacity*: `estimatedCapacity` is the effective rate at the current load (limited by A-MPDU aggregation), which **underestimates the saturated maximum** (~655–982 measured vs ~1600 real at 6 GHz — see Engine 2). It is conservative (never overestimates), so the "how much would fit here" projection is **pessimistic** — which is safe, but means the scheduler thinks the links are fuller than they are.
+   > **Measured impact — real but harmless**: the BE projection on its own link diverges from the measured satisfaction (projected **0.46** vs measured **0.99**) on **low-capacity** links (2.4 GHz, where the BE consumes almost everything); at 5 GHz, with headroom, it converges (error 0.07). It causes no wrong decision because `STAY_SATISFIED` (0.99) always fires and the bad projection is never used. Fixing it would require an airtime-sharing model — not worth the effort.
 
-3. **O `avgQueueDelayMs` proxy (por-link) é ≈ 0 mesmo sob congestão.** Só conta pacotes que chegam ao dequeue; os que ficam presos ou são dropados por fila cheia nunca entram na estatística. Só o caminho per-STA foi corrigido — o proxy que a projeção usa continua cego à congestão.
+3. **The `avgQueueDelayMs` proxy (per-link) is ≈ 0 even under congestion.** It only counts packets that reach the dequeue; those stuck or dropped by a full queue never enter the statistic. Only the per-STA path was fixed — the proxy the projection uses remains blind to congestion.
 
-4. **~~`UtilityFunction` dá 0.5 no alvo~~ — CORRIGIDO e VALIDADO.** *Problema original*: para throughput, cumprir exatamente o alvo dava só 0.5 (era preciso ~2× o alvo para saturar), o que fazia VO/VI estabilizarem em ~0.69–0.75, colados ao `StayThreshold`, dependentes dos vetos em vez do `STAY_SATISFIED`. *Correção*: (a) no ramo *higher-is-better* a inflexão passou para 50% do alvo (`1/(1+e^{10(0.5−ratio)})`) → cumprir o alvo ≈ 0.99; (b) as metas de jitter de VO/VI (`maxJitterMs`) subiram de 0.1 ms (inatingível) para 5/10 ms. *Resultado medido*: VO/VI/BE bem servidos passaram a ~**0.99** e o `STAY_SATISFIED` voltou a dominar (zero migrações no steady state). O `StayThreshold=0.75` **não** precisou de mudar — com os satisfeitos a ~0.99, continua a separar bem servido de esfomeado.
+4. **~~`UtilityFunction` gives 0.5 at the target~~ — FIXED and VALIDATED.** *Original problem*: for throughput, meeting the target exactly gave only 0.5 (~2× the target was needed to saturate), which made VO/VI stabilise at ~0.69–0.75, glued to `StayThreshold`, dependent on the vetoes rather than on `STAY_SATISFIED`. *Fix*: (a) in the *higher-is-better* branch the inflection moved to 50% of the target (`1/(1+e^{10(0.5−ratio)})`) → meeting the target ≈ 0.99; (b) the VO/VI jitter goals (`maxJitterMs`) were raised from 0.1 ms (unattainable) to 5/10 ms. *Measured result*: well-served VO/VI/BE moved to ~**0.99** and `STAY_SATISFIED` dominated again (zero migrations in steady state). `StayThreshold=0.75` **did not** need to change — with the satisfied ones at ~0.99, it still separates well-served from starved.
 
-5. **Métricas estimadas pelo próprio AP** *(RESOLVIDO — antes era uma limitação)*. O scheduler já **não depende do feedback dos STAs**: estima as 4 métricas na sua própria **camada de traffic-control** (`Enqueue`/`Dequeue`/`DropBeforeEnqueue` do queue-disc do AP), seguindo cada pacote do TC-enqueue até ao ACK no MAC. Validado quase na perfeição vs os sinks (ver [Métricas por-STA](#métricas-por-sta--estimadas-pelo-próprio-ap-sem-feedback-dos-stas)): loss erro 0.0001, delay erro 0.19 ms, throughput exato. Como usa apenas informação que um AP **real também tem** (a sua própria pilha), é **transponível para hardware**. Os sinks ficam só como referência de validação (`--decisionMetrics=sink` para A/B; CSV `metric_comparison`). *Caveat residual:* o jitter estimado fica ligeiramente acima do real (mesma ordem de grandeza).
+5. **Metrics estimated by the AP itself** *(RESOLVED — it used to be a limitation)*. The scheduler **no longer depends on STA feedback**: it estimates the 4 metrics at its own **traffic-control layer** (the AP queue-disc's `Enqueue`/`Dequeue`/`DropBeforeEnqueue`), tracking each packet from TC enqueue to MAC ACK. Validated almost perfectly against the sinks (see [Per-STA metrics](#per-sta-metrics--estimated-by-the-ap-itself-no-sta-feedback)): loss error 0.0001, delay error 0.19 ms, throughput exact. Since it uses only information a **real** AP also has (its own stack), it is **portable to hardware**. The sinks remain only as a validation reference (`--decisionMetrics=sink` for A/B; the `metric_comparison` CSV). *Residual caveat:* the estimated jitter is slightly above the real one (same order of magnitude).
 
-6. **A loss acumulada é estável mas lenta.** Uma degradação súbita demora a refletir-se, e depois de um fluxo melhorar o histórico mau só se dilui gradualmente. Foi uma troca deliberada (estabilidade > reatividade).
+6. **Cumulative loss is stable but slow.** A sudden degradation takes time to be reflected, and after a flow improves, the bad history only dilutes gradually. It was a deliberate trade-off (stability > reactivity).
 
-7. **O veto BE/BK é absoluto e não olha para o airtime real do link dos VO/VI.** Os dois vetos não são simétricos no rigor: o do VO/VI tem exceção de fome (`currentSat < 0.60`); o do BE/BK **bloqueia sempre**. A regra assume que os VO/VI **saturam** o seu link — verdade nos cenários testados. Mas **nunca verifica se há airtime livre**. Caso onde falharia: 1 VO sozinho num 6 GHz a usar 150 de ~1000 Mbps (~85% livre) e 4 BEs entupidos no 2.4 GHz com 58% de perdas — fisicamente os BEs beneficiariam de partilhar o 6 GHz, mas ficariam presos sem escape. É uma **heurística de prioridade, não uma decisão baseada em capacidade**.
+7. **The BE/BK veto is absolute and does not look at the real airtime of the VO/VI link.** The two vetoes are not symmetric in strictness: the VO/VI one has a starvation exception (`currentSat < 0.60`); the BE/BK one **always blocks**. The rule assumes VO/VI **saturate** their link — true in the tested scenarios. But it **never checks whether there is free airtime**. Case where it would fail: 1 VO alone on a 6 GHz link using 150 of ~1000 Mbps (~85% free) and 4 BEs jammed on 2.4 GHz with 58% loss — physically the BEs would benefit from sharing the 6 GHz, but they would be stuck with no escape. It is a **priority heuristic, not a capacity-based decision**.
 
-8. **Muitas constantes críticas estão hardcoded** e não expostas como atributos ns-3: blend `0.65/0.25/0.10`, `kMigrationDwellSec`, `kWarmupSamples`, `kStarvationFloor`, `perAlpha`, `m_edcaWeights`. Afinar exige recompilar.
+8. **Many critical constants are hardcoded** and not exposed as ns-3 attributes: the `0.65/0.25/0.10` blend, `kMigrationDwellSec`, `kWarmupSamples`, `kStarvationFloor`, `perAlpha`, `m_edcaWeights`. Tuning requires recompiling.
 
-9. **`WouldHarmResident` continua reativo.** Usa a satisfação *atual* dos residentes, não projeta o impacto da chegada do candidato. Deteta "alguém já está mal", não "vou piorar alguém que está bem". Os vetos de prioridade cobrem os casos críticos; a penalidade preventiva (B) do Motor 5 cobre parcialmente o resto.
+9. **`WouldHarmResident` remains reactive.** It uses the *current* satisfaction of the residents, not a projection of the candidate's arrival impact. It detects "someone is already doing badly", not "I am going to worsen someone who is doing well". The priority vetoes cover the critical cases; Engine 5's preventive penalty (B) partially covers the rest.
 
-10. **O dwell de 1 s está acoplado ao intervalo de medição.** Foi escolhido para garantir que uma intenção sobrevive a ≥ 1 janela nova. Se o `MetricsInterval` ou a cadência do `FeedStaQos` (1 s) mudarem, o dwell tem de ser reavaliado.
+10. **The 1 s dwell is coupled to the measurement interval.** It was chosen to guarantee an intent survives ≥ 1 new window. If `MetricsInterval` or the `FeedStaQos` cadence (1 s) changes, the dwell must be re-evaluated.
 
-11. **Balanceamento — voz pinada.** O `RebalanceIdleLinks` **nunca move VO** (voz fica no melhor link, por ser a mais sensível a delay). Consequência: num cenário all-VO os VOs não se espalham por um link vazio. Escolha conservadora; relaxá-la é trivial (remover o guard `acIdx == AC_VO`).
+11. **Balancing — voice pinned.** `RebalanceIdleLinks` **never moves VO** (voice stays on the best link, being the most delay-sensitive). Consequence: in an all-VO scenario the VOs do not spread to an empty link. A conservative choice; relaxing it is trivial (remove the `acIdx == AC_VO` guard).
 
-12. **Balanceamento — link vazio recebe o 1º fluxo incondicionalmente.** A capacidade de um link ocioso **não é medível** (`estimatedCapacity = goodput/airtime` precisa de tráfego → fica 0 se nunca foi usado, ou estagnada se o foi cedo). Por isso o 1º fluxo entra sem teste de capacidade — fica com o link todo — e confia-se na **medição da janela seguinte** (para decidir sobre um 2º) e na **auto-correção do cascade** (que o puxa de volta se o link for mesmo fraco). Sem isto, o teste `folga ≥ target` bloqueava sempre a 1ª migração.
+12. **Balancing — an empty link receives the 1st flow unconditionally.** An idle link's capacity **is not measurable** (`estimatedCapacity = goodput/airtime` needs traffic → it is 0 if never used, or stale if used early). Hence the 1st flow enters with no capacity test — it takes the whole link — and reliance is placed on the **next window's measurement** (to decide on a 2nd) and on the **cascade's self-correction** (which pulls it back if the link really is weak). Without this, the `headroom ≥ target` test would always block the 1st migration.
 
-13. **Cobertura de teste.** Validado em cenários de **4 STAs** (2VO+1VI+1BE, 2VO+2VI, 1VO+1VI+1BE+1BK, all-BE) × **3 pares de frequências** (2.4+5, 2.4+6, 5+6), com tráfego UDP saturante de 150 Mbps por STA e STAs estáticos. Fora deste envelope — mais links, mais STAs, mobilidade, tráfego variável, TCP — não há garantias. Vários mecanismos (bootstrap, vetos, balanceamento) assumem implicitamente **exatamente 2 links**.
+13. **Test coverage.** Validated on **4-STA** scenarios (2VO+1VI+1BE, 2VO+2VI, 1VO+1VI+1BE+1BK, all-BE) × **3 frequency pairs** (2.4+5, 2.4+6, 5+6), with saturating 150 Mbps-per-STA UDP traffic and static STAs. Outside this envelope — more links, more STAs, mobility, variable traffic, TCP — there are no guarantees. Several mechanisms (bootstrap, vetoes, balancing) implicitly assume **exactly 2 links**.
 
-14. **~~O binding é consultivo, não vinculativo.~~ RESOLVIDO — binding vinculativo via queue-blocking.** Historicamente, a decisão por (STA, AC) só enviesava o **pedido de acesso ao canal** no enqueue e o **dequeue** (delegate Fcfs) servia qualquer STA em qualquer link com acesso → a distribuição física por-fluxo **usava ambos os links** (o espalhamento STR, medido no all-BE e nos VI do S5). **Agora** o `EnforceRouting` amarra cada (STA, AC) ao link decidido, bloqueando a sua fila nos outros links (reason `WIFI_SCHEDULER_ROUTING`) → as decisões são **ordens** e não há espalhamento. Ver [Conselho vs. execução → Como se tornou vinculativo](#como-se-tornou-vinculativo-implementado--binding-por-queue-blocking) e [Alterações ao core do ns-3](#alterações-ao-core-do-ns-3).
+14. **~~The binding is advisory, not binding.~~ RESOLVED — binding enforced via queue-blocking.** Historically, the per-(STA, AC) decision only biased the **channel-access request** at enqueue and the **dequeue** (Fcfs delegate) served any STA on any link with access → the physical per-flow distribution **used both links** (STR spreading, measured in all-BE and in the S5 VIs). **Now** `EnforceRouting` pins each (STA, AC) to the decided link, blocking its queue on the other links (reason `WIFI_SCHEDULER_ROUTING`) → decisions are **orders** and there is no spreading. See [Advice vs. execution → How it became binding](#how-it-became-binding-implemented--queue-blocking-binding) and [Changes to the ns-3 core](#changes-to-the-ns-3-core).
 
-    > **Nota histórica (mudar a decisão NÃO mudava o físico).** Antes do binding, **alterar** o `m_lastSelectedLink` (via migração, balanceador, etc.) **não** alterava a distribuição física se o outro link estivesse ativo para essa AC. Caso concreto: no *switch* 2VO+2VI→2BE+2VI (fase 2), a "expulsão considerada" (mover o VI que partilhava o 2.4GHz com os BEs para o 5GHz) deu **decisão** perfeita mas **físico com VI ~40% no 2.4GHz** (BE esfomeado a ~19 Mbps), porque o 2.4GHz continuava a puxar VI da fila partilhada. Com o binding atual este problema deixa de existir — a fila de VI fica bloqueada no 2.4GHz e o dequeue só ocorre no 5GHz. **A expulsão considerada foi por isso reintroduzida** (ver [Passo 2](#passo-2--stay_satisfied--expulsão-considerada)) e **agora converge fisicamente**: o VI que partilha o 2.4GHz com os BEs migra para o 5GHz (onde cabe com o outro VI) e o 2.4GHz fica livre para os 2 BEs.
+    > **Historical note (changing the decision did NOT change the physical distribution).** Before binding, **changing** `m_lastSelectedLink` (via migration, balancer, etc.) did **not** change the physical distribution if the other link was active for that AC. Concrete case: in the *switch* 2VO+2VI→2BE+2VI (phase 2), the "considerate eviction" (moving the VI that shared 2.4 GHz with the BEs to 5 GHz) gave a perfect **decision** but a **physical distribution with the VI ~40% on 2.4 GHz** (BE starved at ~19 Mbps), because 2.4 GHz kept pulling VI from the shared queue. With the current binding this problem no longer exists — the VI queue is blocked on 2.4 GHz and the dequeue only occurs on 5 GHz. **The considerate eviction was therefore reintroduced** (see [Step 2](#step-2--stay_satisfied-and-considerate-eviction)) and **now converges physically**: the VI sharing 2.4 GHz with the BEs migrates to 5 GHz (where it fits with the other VI) and 2.4 GHz is freed for the 2 BEs.
     >
-    > **O espalhamento STR continua a ser desejável** enquanto mecanismo de agregação por-fluxo; fica como trabalho futuro poder reativá-lo seletivamente (ver a nota "Trabalho futuro" na secção de binding).
+    > **STR spreading remains desirable** as a per-flow aggregation mechanism; re-enabling it selectively remains future work (see the "Future work" note in the binding section).
 
 ---
 
-## Alterações ao core do ns-3
+## Changes to the ns-3 core
 
-Este projeto vive quase inteiramente em `scratch/`, mas o **binding vinculativo** (limitação #14, resolvida) obrigou a **uma** alteração ao core do ns-3. Todas as linhas alteradas estão marcadas com o comentário **`// I CHANGED HERE`** para fácil rastreio.
+This project lives almost entirely in `scratch/`, but the **enforced binding** (limitation #14, resolved) required **one** change to the ns-3 core. Every changed line is marked with the comment **`// I CHANGED HERE`** for easy tracking.
 
-| Ficheiro | O quê | Porquê |
+| File | What | Why |
 |---|---|---|
-| `src/wifi/model/wifi-mac-queue-scheduler.h` | Novo valor `WIFI_SCHEDULER_ROUTING` no `enum class WifiQueueBlockedReason` (antes de `REASONS_COUNT`) + o `case` correspondente no `operator<<`. | O `EnforceRouting` precisa de uma **razão de bloqueio própria** para amarrar cada (STA, AC) a um link. Todas as razões existentes (`WAITING_ADDBA_RESP`, `POWER_SAVE_MODE`, `USING_OTHER_EMLSR_LINK`, `WAITING_EMLSR_TRANSITION_DELAY`, `TID_NOT_MAPPED`) são **geridas pela MAC**, que as poria/limparia por conta própria, entrando em conflito com o nosso uso. A razão nova é gerida **exclusivamente** pelo scheduler. |
+| `src/wifi/model/wifi-mac-queue-scheduler.h` | New value `WIFI_SCHEDULER_ROUTING` in the `enum class WifiQueueBlockedReason` (before `REASONS_COUNT`) + the corresponding `case` in `operator<<`. | `EnforceRouting` needs its **own block reason** to pin each (STA, AC) to a link. All existing reasons (`WAITING_ADDBA_RESP`, `POWER_SAVE_MODE`, `USING_OTHER_EMLSR_LINK`, `WAITING_EMLSR_TRANSITION_DELAY`, `TID_NOT_MAPPED`) are **managed by the MAC**, which would set/clear them on its own, conflicting with our use. The new reason is managed **exclusively** by the scheduler. |
 
-**Impacto**: acrescentar um valor ao enum aumenta em 1 bit a `Mask = std::bitset<REASONS_COUNT>` de cada container-queue — obriga a **recompilar o módulo wifi** (`./ns3 build`), sem alterar comportamento de nenhum mecanismo existente.
+**Impact**: adding a value to the enum grows each container-queue's `Mask = std::bitset<REASONS_COUNT>` by 1 bit — it requires **recompiling the wifi module** (`./ns3 build`), without changing the behaviour of any existing mechanism.
 
-**Como reverter**: remover as 3 linhas marcadas com `// I CHANGED HERE` em `src/wifi/model/wifi-mac-queue-scheduler.h` e o `EnforceRouting`/`WIFI_SCHEDULER_ROUTING` no `scratch/mlo-qos-weighted-scheduler.h`. Sem a razão nova, o scheduler volta ao modo consultivo (com espalhamento STR).
+**How to revert**: remove the 3 lines marked `// I CHANGED HERE` in `src/wifi/model/wifi-mac-queue-scheduler.h` and the `EnforceRouting`/`WIFI_SCHEDULER_ROUTING` in `scratch/mlo-qos-weighted-scheduler.h`. Without the new reason, the scheduler reverts to advisory mode (with STR spreading).
 
-**Localizar as alterações**: `grep -rn "I CHANGED HERE" src/`.
+**Locate the changes**: `grep -rn "I CHANGED HERE" src/`.
