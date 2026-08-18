@@ -285,12 +285,6 @@ class QosWeightedMloScheduler : public WifiMacQueueScheduler
     /// "Espalhamento STR e binding".
     void EnforceRouting(AcIndex ac, const Mac48Address& dest, uint8_t chosenLink);
 
-    /// Capacidade NOMINAL por banda (Mbps) — fiável para links OCIOSOS, cuja
-    /// capacidade medida não existe. Mesma escala do cold-start (UpdateLinkCapability).
-    static double NominalCapByFreq(int freq) {
-        return (freq <= 2) ? 150.0 : (freq >= 6 ? 500.0 : 400.0);
-    }
-
     /// TIDs 802.11e associados a cada AC (BlockQueues de QoS data exige TIDs).
     static std::set<uint8_t> AcToTids(AcIndex ac) {
         switch (ac) {
@@ -1714,12 +1708,7 @@ QosWeightedMloScheduler::RebalanceIdleLinks()
         int cls = targetAcClass(T);
         if (cls == -2) continue;  // alvo misto → nunca mistura ACs
         bool targetEmpty = flowsByLink[T].empty();
-        // Capacidade FIÁVEL: medida quando o alvo já tem tráfego; NOMINAL por banda
-        // quando ocioso (a capacidade de um link vazio não é medível).
-        int freqT = (T < m_freqs.size()) ? m_freqs[T] : 5;
-        double capT = targetEmpty ? NominalCapByFreq(freqT)
-                                  : m_linkCapability[T].estimatedCapacityMbps;
-        double spare = capT - linkLoad(T);
+        double spare = m_linkCapability[T].estimatedCapacityMbps - linkLoad(T);  // capacidade MEDIDA
         // Escolhe o fluxo de MENOR prioridade EDCA GLOBALMENTE — varre todas as
         // fontes válidas antes de decidir. Assim o VO (rank 3) só é movido quando
         // nenhum AC de menor prioridade (VI/BE/BK) pode preencher o link ocioso;
@@ -1742,11 +1731,11 @@ QosWeightedMloScheduler::RebalanceIdleLinks()
                 if (now - lastBal < kFlowBalanceCooldownSec) continue;  // anti-ping-pong
                 double tgt = m_goals.count(acIdx)
                                  ? m_goals.at(acIdx).targetThroughputMbps : 150.0;
-                // Enche cada link só até à sua capacidade (fiável): a 1ª migração
-                // entra sempre (nominal ≥ demanda em todas as bandas), mas o
-                // excedente é limitado — 2.4 GHz aguenta 1 VI (150), 5 GHz aguenta
-                // 2 (400), etc. Aplica-se a QUALQUER AC (inclui alvo vazio).
-                if (spare < tgt) continue;
+                // Link VAZIO recebe sempre o 1º fluxo (um link ocioso não tem
+                // capacidade medível). A capacidade MEDIDA só limita o 2º+ → enche
+                // cada link até à sua capacidade real (2.4 GHz aguenta 1 VI, 5 GHz
+                // aguenta 2, etc.), sem o fio-da-navalha de um nominal == procura.
+                if (!targetEmpty && spare < tgt) continue;
                 int r = edcaRank(acIdx);
                 if (r < bestRank) { bestRank = r; best = key; found = true; }
             }
