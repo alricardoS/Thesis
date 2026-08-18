@@ -55,6 +55,10 @@ On top of these engines sits a **stability layer**, built from real bugs observe
 - **VO/VI anti-downgrade veto** (with a starvation exception)
 - **Symmetric BE/BK veto**
 - **Exclusion of broadcast/beacon frames** from residency checks
+- **Idle-link balancing** (spreads flows to unused links, one move per window)
+- **Pruning of inactive flows** (removes stopped apps, e.g. after an AC switch)
+
+Two further mechanisms live inside the decision path: the **considerate eviction** (a satisfied VO/VI leaves a link shared with BE/BK for a clean one — Engine 6, Step 2) and the **queue-blocking binding** that makes each decision physically effective (`EnforceRouting` — see [Advice vs. execution](#advice-enqueue-vs-execution-dequeue-why-all-be-uses-both-links)).
 
 Engines 1–4 are recomputed every `MetricsInterval` (0.5 s). Engines 5–6 run **per packet** (in `GetLinkIds`), but use the values already computed in that window — they do not recompute PHY/traffic for every packet.
 
@@ -70,7 +74,7 @@ This is the exact order of the code in `DecideLinkMigration`:
 4. **Shortcuts**: if there is only 1 eligible link, it records the anchor and returns it (this is the path beacons take — see [beacon exclusion](#4-beacon-exclusion-isroutablesta)).
 5. It determines the **current link** (anchor) and `currentSat` (the **measured** satisfaction, from `m_staQos`).
 6. **Priority bootstrap** — if the flow does not yet have 2 measured samples (`m_hasMeasuredSat`), it forces VO/VI → best link; BE/BK → in **tri-band** (≥3 links) the **2nd-best** link (e.g. 5 GHz, leaving 2.4 GHz free), in **dual-band** the worst link. And it **stops here**.
-7. **`STAY_SATISFIED`** — if `currentSat >= StayThreshold` and there is an anchor, it stays without evaluating anything else.
+7. **`STAY_SATISFIED`** — if `currentSat >= StayThreshold` and there is an anchor, it stays without evaluating anything else — **except** for the *considerate eviction* case (a satisfied VO/VI sharing its link with BE/BK moves to a clean link with capacity; see Engine 6, Step 2).
 8. **Cat1/Cat2/Cat3 cascade** — it evaluates all eligible links and picks the best link of the best category.
 9. **VO/VI anti-downgrade veto** — may revert `bestLink` to the current link.
 10. **Symmetric BE/BK veto** — likewise, for low-priority ACs.
@@ -150,7 +154,7 @@ if busyFrac > 0.05 and occupied > 0:
 else if PHY data exists:
     estimatedCapacityMbps = dataRate_PHY × (1 − PER)   // fallback
 else:
-    estimatedCapacityMbps = 400 (fast) or 150 (slow)   // cold-start
+    estimatedCapacityMbps = NominalByFreq(m_freqs[link])  // cold-start: 2.4→150, 5→400, 6→500
 ```
 
 > **What this value IS (and what it is NOT).** `occupied / busyFrac` measures the **effective rate at the current operating point** — how much goodput the link delivers per unit of airtime, at the load it is seeing *now*. It is **not** the link's saturated maximum.
@@ -170,7 +174,7 @@ else:
 
 > **⚠️ Per-AC A-MPDU aggregation (`.cc` config).** All four ACs now use `MaxAmpduSize = 65535` — including **BK** (`bkMaxAmpduBytes = 65535`; previously `0`/disabled). With aggregation disabled, BK sent frame by frame and was limited to **~50 Mbps even when alone on a link** (each frame pays the full MAC overhead: preamble, AIFS, backoff, SIFS, BlockAck), saturating the TC queue → multi-second delay and high loss. With A-MPDU enabled, BK keeps up with the other ACs up to the offered rate. Tunable via CLI: `--bkMaxAmpdu=<bytes>` (`0` disables it again). This aggregation ceiling is a **MAC** characteristic, independent of the scheduler's link decision.
 
-`ConfigureForPair` orders the two links by `GetFrequencyRank` (6 GHz > 5 GHz > 2.4 GHz) and sets `m_fastLinkId` / `m_slowLinkId`.
+`ConfigureForLinks` orders the **N** links by `GetFrequencyRank` (6 GHz > 5 GHz > 2.4 GHz) into `m_linksByRank` (best first) and derives the aliases `m_fastLinkId` (best) / `m_slowLinkId` (worst). `ConfigureForPair(f1, f2)` is a two-link wrapper around it.
 
 ### `availableCapacityPerAcMbps` — priority-aware
 
@@ -269,7 +273,7 @@ Applied after `expectedScore`, to protect already-resident ACs:
 - **(A) Reactive** — if a resident AC is already starved (`currentSat < 0.45`), it adds `(0.6 − currentSat)`.
 - **(B) Preventive** — even without being starved, if the resident's `headroomRatio` (`effectiveAvailableCapacity / targetThroughput`) is < 1.0 **and** `currentSat < 0.75`, it applies a penalty proportional to the load the candidate would bring (`min(0.5, tightness × candidateLoad × 2)`).
 
-The final penalty is the `max` of (A) and (B) per resident (not the sum), subtracted from the score, never below 0.
+The reactive term (A) **accumulates** across starved residents (`+=`), while the preventive term (B) is folded in as a `max` (`penalty = max(penalty, B)`); the result is subtracted from the score, never below 0.
 
 ---
 
@@ -279,7 +283,9 @@ The final penalty is the `max` of (A) and (B) per resident (not the sum), subtra
 
 ```cpp
 if (m_hasMeasuredSat.count(staAcKey) == 0) {
-    bootLink = (acIdx >= AC_VI) ? m_fastLinkId : m_slowLinkId;   // VO/VI → fast; BE/BK → slow
+    // BE/BK → 2nd-best link in tri-band (leaving 2.4 GHz free), worst link in dual-band.
+    uint8_t lowPrioBoot = (m_linksByRank.size() >= 3) ? m_linksByRank[1] : m_slowLinkId;
+    bootLink = (acIdx >= AC_VI) ? m_fastLinkId : lowPrioBoot;   // VO/VI → best link
     decision = "BOOTSTRAP_PRIORITY";
     // stops here — the cascade does not run
 }
@@ -460,7 +466,7 @@ This is the subtlest mechanism, and worth understanding in detail.
 
   **Anti-oscillation**: global cooldown (`kRebalanceCooldownSec = 2 s`) + per-flow (`kFlowBalanceCooldownSec = 10 s`). If a move degrades a flow, the cascade pulls it back and the cooldown prevents the re-push.
 
-  > **Important — the balancer's decision is *advisory*, not *binding*.** Since `RebalanceIdleLinks` only alters `m_lastSelectedLink` (which biases the channel-access request at enqueue), the observed physical traffic may differ from the decided assignment. See [Advice vs. execution](#advice-enqueue-vs-execution-dequeue-why-all-be-uses-both-links).
+  > **Enforcement.** `RebalanceIdleLinks` only alters `m_lastSelectedLink`; that change becomes physically effective on the moved flow's **next enqueue**, when `GetLinkIds`→`EnforceRouting` re-pins its queue to the new link (binding, limitation #14 resolved). Historically, before binding existed, the balancer was merely advisory and the physical traffic could differ from the decided assignment — see [Advice vs. execution](#advice-enqueue-vs-execution-dequeue-why-all-be-uses-both-links).
 
 
 ### 6. Pruning of inactive flows (apps that stop, e.g. before an AC *switch*)
@@ -624,6 +630,18 @@ Possible `Decision` values:
 
 `PrintFinalScores()` prints, at the end, the projected score and current satisfaction of each flow on each link.
 
+### Per-flow state CSV (`EnableStateCsv`)
+
+`EnableStateCsv(filename, runLabel)` produces a **per-flow time series**, sampled at each `UpdatePeriodicMetrics` tick (every `MetricsInterval` = 0.5 s), with one row per active `(STA, AC)`:
+
+```
+run_label, time_s, sta_id, ac, link_id, link_freq, score
+```
+
+- `score` = the flow's **measured** satisfaction (`m_currentSatisfaction[...].index`); `link_id`/`link_freq` = the **decided** link.
+- `SetStaIndexMap(map<Mac48Address,uint32_t>)` supplies the address→STA-index map (MLD and link addresses) so rows are keyed by STA index rather than MAC; flows without a known index are skipped.
+- This CSV feeds the score-over-time and link-in-use-over-time plots. Inactive flows are pruned (see prevention mechanism #6), so a stopped app disappears from it ~1 s after it stops.
+
 ---
 
 ## Known limitations
@@ -660,7 +678,7 @@ An honest analysis of the current state. Nothing here prevents the tested scenar
 
 12. **Balancing — an empty link receives the 1st flow unconditionally.** An idle link's capacity **is not measurable** (`estimatedCapacity = goodput/airtime` needs traffic → it is 0 if never used, or stale if used early). Hence the 1st flow enters with no capacity test — it takes the whole link — and reliance is placed on the **next window's measurement** (to decide on a 2nd) and on the **cascade's self-correction** (which pulls it back if the link really is weak). Without this, the `headroom ≥ target` test would always block the 1st migration.
 
-13. **Test coverage.** Validated on **4-STA** scenarios (2VO+1VI+1BE, 2VO+2VI, 1VO+1VI+1BE+1BK, all-BE) × **3 frequency pairs** (2.4+5, 2.4+6, 5+6), with saturating 150 Mbps-per-STA UDP traffic and static STAs. Outside this envelope — more links, more STAs, mobility, variable traffic, TCP — there are no guarantees. Several mechanisms (bootstrap, vetoes, balancing) implicitly assume **exactly 2 links**.
+13. **Test coverage.** Validated on **4-STA** scenarios (2VO+1VI+1BE, 2VO+2VI, 1VO+1VI+1BE+1BK, all-BE, plus AC-switch scenarios) across **dual-band** (2.4+5, 2.4+6, 5+6) **and tri-band** (2.4+5+6) configurations, with saturating 150 Mbps-per-STA UDP traffic and static STAs. All decision mechanisms (bootstrap, vetoes, cascade, balancing, cold-start) are now **N-link** — they iterate `m_linksByRank` rather than assuming exactly 2 links (Phase B). Outside this envelope — more than 3 links, many more STAs, mobility, variable traffic, TCP — there are still no guarantees.
 
 14. **~~The binding is advisory, not binding.~~ RESOLVED — binding enforced via queue-blocking.** Historically, the per-(STA, AC) decision only biased the **channel-access request** at enqueue and the **dequeue** (Fcfs delegate) served any STA on any link with access → the physical per-flow distribution **used both links** (STR spreading, measured in all-BE and in the S5 VIs). **Now** `EnforceRouting` pins each (STA, AC) to the decided link, blocking its queue on the other links (reason `WIFI_SCHEDULER_ROUTING`) → decisions are **orders** and there is no spreading. See [Advice vs. execution → How it became binding](#how-it-became-binding-implemented--queue-blocking-binding) and [Changes to the ns-3 core](#changes-to-the-ns-3-core).
 
